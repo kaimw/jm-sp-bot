@@ -1,0 +1,5 @@
+interface:
+  display_name: "JM-SP Test Validation"
+  short_description: "Validate workflow and integration safety"
+  default_prompt: "Use $jm-sp-test-validation to verify the JM-SP change across tests, workflow behavior, and integration safety."
+

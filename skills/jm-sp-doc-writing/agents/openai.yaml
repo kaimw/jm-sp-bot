@@ -1,0 +1,5 @@
+interface:
+  display_name: "JM-SP Doc Writing"
+  short_description: "Write JM-SP product and tech docs"
+  default_prompt: "Use $jm-sp-doc-writing to write or update review-ready JM-SP PRD, technical, database, or workflow documentation."
+

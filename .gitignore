@@ -1,1 +1,11 @@
 .DS_Store
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/attachments/
+data/backups/
+*.egg-info/

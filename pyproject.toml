@@ -1,0 +1,22 @@
+[project]
+name = "jm-sp-bot"
+version = "0.1.0"
+description = "商务生产任务单智能体 MVP"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.109.0",
+  "uvicorn>=0.27.0",
+  "SQLAlchemy>=2.0.0",
+  "pydantic>=2.5.0",
+  "httpx>=0.26.0",
+  "openpyxl>=3.1.0",
+  "python-docx>=1.1.0",
+  "pypdf>=4.0.0"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

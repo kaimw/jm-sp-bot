@@ -1,0 +1,5 @@
+interface:
+  display_name: "JM-SP Feature Design"
+  short_description: "Design production-order agent features"
+  default_prompt: "Use $jm-sp-feature-design to design the requested JM production-order agent feature with scope, workflow impact, and validation criteria."
+

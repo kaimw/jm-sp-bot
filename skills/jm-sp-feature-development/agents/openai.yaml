@@ -1,0 +1,5 @@
+interface:
+  display_name: "JM-SP Feature Development"
+  short_description: "Implement JM-SP backend and UI changes"
+  default_prompt: "Use $jm-sp-feature-development to implement the requested JM-SP feature with scoped backend/UI edits and validation."
+

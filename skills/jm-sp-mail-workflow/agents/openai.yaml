@@ -1,0 +1,5 @@
+interface:
+  display_name: "JM-SP Mail Workflow"
+  short_description: "Handle email ingestion and queues"
+  default_prompt: "Use $jm-sp-mail-workflow to work on Tencent email ingestion, attachment parsing, queues, and outbound mail behavior."
+

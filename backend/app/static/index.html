@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>商务生产任务单智能体 MVP</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <section id="login-screen" class="login-screen" hidden>
+      <form id="login-form" class="login-panel">
+        <span class="mark">J</span>
+        <h1>市场部小J</h1>
+        <p>商务生产任务单工作台</p>
+        <label>用户名 <input name="username" value="admin" autocomplete="username" /></label>
+        <label>密码 <input name="password" type="password" placeholder="默认 admin" autocomplete="current-password" /></label>
+        <button type="submit" class="button">登录</button>
+      </form>
+    </section>
+
+    <aside class="sidebar auth-required">
+      <div class="brand">
+        <span class="mark">J</span>
+        <div>
+          <strong>市场部小J</strong>
+          <small>生产任务单工作台</small>
+        </div>
+      </div>
+      <nav>
+        <a href="#dashboard" data-page-link="dashboard">工作台</a>
+        <a href="#tasks" data-page-link="tasks">任务</a>
+        <a href="#orders" data-page-link="orders">模拟订单</a>
+        <a href="#review-rules" data-page-link="review-rules">初审规则</a>
+        <a href="#mails" data-page-link="mails">邮件</a>
+        <a href="#outbound" data-page-link="outbound">外发</a>
+        <a href="#exceptions" data-page-link="exceptions">异常</a>
+        <a href="#reports" data-page-link="reports">周报</a>
+        <a href="#integration" data-page-link="integration">接入</a>
+        <a href="#departments" data-page-link="departments">生产邮箱</a>
+        <a href="#templates" data-page-link="templates">模板</a>
+        <a href="#ops" data-page-link="ops">运维</a>
+      </nav>
+    </aside>
+
+    <main class="auth-required">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">工作台</h1>
+          <p id="page-subtitle">核心状态、队列水位和待处理风险。</p>
+        </div>
+        <div class="top-actions">
+          <button id="sync-mailbox" type="button" class="icon-button" title="同步邮箱">↻</button>
+          <button id="run-jobs" type="button" class="icon-button" title="运行入库队列">▶</button>
+          <button id="send-pending" type="button" class="icon-button" title="发送待发邮件">✉</button>
+          <button id="logout" type="button" class="button ghost">退出</button>
+        </div>
+      </header>
+
+      <section class="page is-active" data-page="dashboard" data-title="工作台" data-subtitle="核心状态、队列水位和待处理风险。">
+        <div id="dashboard" class="metrics"></div>
+      </section>
+
+      <section class="page" data-page="reports" data-title="周报" data-subtitle="统计摘要、收件人和导出文件。">
+        <div class="section-head">
+          <h2>周报发送</h2>
+          <p>周报邮件进入外发队列后由 SMTP 发送。</p>
+        </div>
+        <div class="actions toolbar">
+          <button id="preview-weekly-report" type="button" class="button ghost">周报预览</button>
+          <button id="enqueue-weekly-report" type="button" class="button">生成周报邮件</button>
+          <a class="button ghost" href="/api/reports/weekly/export.pdf" target="_blank">导出 PDF</a>
+          <a class="button ghost" href="/api/reports/weekly/export.csv" target="_blank">导出 CSV</a>
+        </div>
+        <form id="weekly-report-recipients-form" class="form-grid">
+          <label>周报主送 <input name="to" placeholder="finance@jimuyida.com, sales-director@jimuyida.com" /></label>
+          <label>周报抄送 <input name="cc" placeholder="dingyong@jimuyida.com, jinlei@jimuyida.com" /></label>
+          <button type="submit" class="button">保存周报收件人</button>
+        </form>
+      </section>
+
+      <section class="page" data-page="orders" data-title="模拟订单" data-subtitle="本地流程验证入口。">
+        <div class="section-head">
+          <h2>模拟销售订单邮件</h2>
+          <p>用于本地验证订单识别和任务单草稿。</p>
+        </div>
+        <form id="order-form" class="form-grid">
+          <label>销售邮箱 <input name="from_address" value="bot.sales@jimuyida.com" /></label>
+          <label>邮件主题 <input name="subject" value="生产订单需求 - 测试客户" /></label>
+          <label class="wide">邮件正文
+            <textarea name="body_text">客户名称：测试客户
+产品：积木展示架 A1
+数量：120 套
+期望交期：2026-05-20
+订单号：SO-TEST-001</textarea>
+          </label>
+          <button type="submit" class="button">生成任务单草稿</button>
+        </form>
+      </section>
+
+      <section class="page" data-page="review-rules" data-title="初审规则" data-subtitle="定义销售订单邮件进入任务草稿前的自动审查条件。">
+        <div class="section-head">
+          <h2>初审开关与必填项</h2>
+          <p>未通过初审的销售邮件会自动回复销售，并停留在异常队列等待补充。</p>
+        </div>
+        <form id="initial-review-form" class="form-grid">
+          <label class="switch-line">
+            <input name="enabled" type="checkbox" />
+            <span>启用销售订单初审</span>
+          </label>
+          <div id="initial-review-required-fields" class="check-grid wide"></div>
+          <button type="submit" class="button">保存初审规则</button>
+        </form>
+
+        <div class="section-head">
+          <h2>自定义规则</h2>
+          <p>规则按顺序执行，任意一条未通过都会回复销售说明原因。</p>
+        </div>
+        <form id="initial-review-rule-form" class="form-grid compact-form">
+          <label>规则名称 <input name="name" placeholder="例如：禁止加急订单自动通过" /></label>
+          <label>审查字段 <select name="field"></select></label>
+          <label>判断方式 <select name="operator"></select></label>
+          <label>规则值 <input name="value" placeholder="例如：加急、50、2026-10-01 或正则" /></label>
+          <label class="wide">未通过原因 <input name="message" placeholder="例如：加急订单需要商务人工确认后再下达生产。" /></label>
+          <button type="submit" class="button ghost">添加规则</button>
+        </form>
+        <form id="initial-review-rules-filter-form" class="table-filter-bar" data-table-filter="reviewRules">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索初审规则" placeholder="规则名称 / 字段 / 规则值 / 原因" />
+          </div>
+          <select name="status" aria-label="启用状态">
+            <option value="">全部状态</option>
+            <option value="enabled">启用</option>
+            <option value="disabled">停用</option>
+          </select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="initial-review-rules-list" class="list rule-list"></div>
+        <div id="initial-review-rules-pagination" class="pagination" data-table-pagination="reviewRules"></div>
+      </section>
+
+      <section class="page" data-page="integration" data-title="接入配置" data-subtitle="腾讯企业邮箱、队列、SMTP 和模型服务。">
+        <div class="section-head">
+          <h2>腾讯企业邮箱与模型接入</h2>
+          <p>运行期配置不会在页面回显密钥。</p>
+        </div>
+        <div class="actions toolbar">
+          <button id="test-model" type="button" class="button ghost">测试模型</button>
+        </div>
+        <form id="runtime-mail-form" class="form-grid">
+          <label>机器人邮箱 <input name="bot_email" /></label>
+          <label>邮箱密码 <input name="bot_email_password" type="password" placeholder="留空不修改" /></label>
+          <label>显示名称 <input name="bot_display_name" /></label>
+          <label>默认签名 <input name="bot_signature" /></label>
+          <label>IMAP 主机 <input name="imap_host" /></label>
+          <label>IMAP 端口 <input name="imap_port" type="number" /></label>
+          <label>SMTP 主机 <input name="smtp_host" /></label>
+          <label>SMTP 端口 <input name="smtp_port" type="number" /></label>
+          <label>心跳间隔秒数 <input name="mail_auto_worker_interval_seconds" type="number" min="300" step="60" /></label>
+          <label>CEO 邮箱 <input name="ceo_email" /></label>
+          <label>商务抄送邮箱 <input name="ops_cc_email" /></label>
+          <label>ZIP 最大字节 <input name="zip_max_bytes" type="number" /></label>
+          <label>ZIP 解压层级 <input name="zip_max_depth" type="number" /></label>
+          <label>最大沟通轮数 <input name="conversation_max_rounds" type="number" min="1" /></label>
+          <label class="switch-line">
+            <input name="llm_fallback_enabled" type="checkbox" />
+            <span>启用 LLM 兜底识别</span>
+          </label>
+          <button type="submit" class="button">保存邮箱配置</button>
+        </form>
+        <form id="e2e-mail-form" class="form-grid compact-form">
+          <label>销售测试邮箱 <input name="e2e_sales_email" value="bot.sales@jimuyida.com" /></label>
+          <label>销售邮箱密码 <input name="e2e_sales_password" type="password" placeholder="留空不修改" /></label>
+          <label>生产测试邮箱 <input name="e2e_production_email" value="bot.production@jimuyida.com" /></label>
+          <label>生产邮箱密码 <input name="e2e_production_password" type="password" placeholder="留空不修改" /></label>
+          <button type="submit" class="button">保存测试账号</button>
+          <button id="run-e2e-mail" type="button" class="button ghost">运行端到端测试</button>
+        </form>
+        <pre id="e2e-mail-result" class="test-result"></pre>
+        <form id="model-form" class="form-grid compact-form">
+          <label>模型标题 <input name="title" /></label>
+          <label>服务类型 <input name="provider" /></label>
+          <label>模型名称 <input name="model_name" /></label>
+          <label>API Base <input name="api_base" /></label>
+          <label class="wide">API Key <input name="api_key" type="password" placeholder="留空不修改" /></label>
+          <button type="submit" class="button">保存模型配置</button>
+        </form>
+        <div class="section-head">
+          <h2>模型对话测试</h2>
+          <p>直接调用当前启用的模型配置。</p>
+        </div>
+        <div class="chat-shell">
+          <div id="model-chat-log" class="chat-log">
+            <div class="chat-message assistant">
+              <small>模型</small>
+              <p>输入一句测试内容，系统会用当前 API Base、模型名称和 API Key 发起一次真实对话请求。</p>
+            </div>
+          </div>
+          <form id="model-chat-form" class="chat-input">
+            <textarea name="message" rows="3" placeholder="例如：请用一句话说明你是否可用。"></textarea>
+            <button type="submit" class="button">发送测试</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="page" data-page="departments" data-title="生产邮箱" data-subtitle="生产部门主送、抄送和启用状态。">
+        <div class="section-head">
+          <h2>生产部门邮箱</h2>
+          <p>任务单下达使用当前启用的生产部门邮箱。</p>
+        </div>
+        <form id="department-form" class="form-grid">
+          <label>部门编码 <input name="department_code" value="default" /></label>
+          <label>部门名称 <input name="department_name" value="默认生产部门" /></label>
+          <label>主送邮箱 <input name="mail_to" placeholder="production@jimuyida.com" /></label>
+          <label>抄送邮箱 <input name="mail_cc" placeholder="可选，多个用逗号分隔" /></label>
+          <button type="submit" class="button">保存生产邮箱</button>
+        </form>
+        <form id="departments-filter-form" class="table-filter-bar" data-table-filter="departments">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索生产邮箱" placeholder="部门 / 邮箱 / 状态" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="departments-list" class="list"></div>
+        <div id="departments-pagination" class="pagination" data-table-pagination="departments"></div>
+      </section>
+
+      <section class="page" data-page="mails" data-title="邮件" data-subtitle="入库邮件、分类结果和任务关联。">
+        <div class="section-head">
+          <h2>邮件入库</h2>
+          <p>原始 EML 和附件会保存在本地存储目录。</p>
+        </div>
+        <form id="mails-filter-form" class="table-filter-bar" data-table-filter="mails">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索邮件" placeholder="主题 / 发件人 / 分类 / 任务" />
+          </div>
+          <select name="classification" aria-label="分类"><option value="">全部分类</option></select>
+          <select name="direction" aria-label="方向"><option value="">全部方向</option></select>
+          <input name="from_address" aria-label="发件人" placeholder="发件人" />
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="mails-list" class="list"></div>
+        <div id="mails-pagination" class="pagination" data-table-pagination="mails"></div>
+      </section>
+
+      <section class="page" data-page="tasks" data-title="任务" data-subtitle="分页、搜索、过滤和工作流查看。">
+        <div class="section-head">
+          <h2>任务列表</h2>
+          <p>查询任务流转状态和历史记录。</p>
+        </div>
+        <form id="task-filter-form" class="task-filter-bar">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="全文搜索" placeholder="任务号 / 客户 / 产品 / 订单号 / 销售邮箱" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <input name="customer" aria-label="客户" placeholder="客户" />
+          <input name="product" aria-label="产品" placeholder="产品" />
+          <input name="salesperson" aria-label="销售邮箱" placeholder="销售邮箱" />
+          <input name="order_no" aria-label="订单号" placeholder="订单号" />
+          <input name="delivery" aria-label="交期" placeholder="交期" />
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button id="task-filter-reset" type="button" class="icon-button filter-action" title="重置" aria-label="重置">↺</button>
+        </form>
+        <div id="tasks" class="list"></div>
+        <div id="task-pagination" class="pagination"></div>
+      </section>
+
+      <section class="page" data-page="templates" data-title="模板" data-subtitle="生产任务单主题和正文版本。">
+        <div class="section-head">
+          <h2>生产任务单模板</h2>
+          <p>保存后生成新模板版本。</p>
+        </div>
+        <form id="template-form" class="form-grid">
+          <label class="wide">主题模板 <input name="subject_template" /></label>
+          <label class="wide">正文模板 <textarea name="body_template" rows="8"></textarea></label>
+          <button type="submit" class="button">保存新模板版本</button>
+        </form>
+      </section>
+
+      <section class="page" data-page="outbound" data-title="外发" data-subtitle="待发送、已发送和失败重试。">
+        <div class="section-head">
+          <h2>外发队列</h2>
+          <p>失败邮件可重新加入队列。</p>
+        </div>
+        <form id="outbound-filter-form" class="table-filter-bar" data-table-filter="outbound">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索外发邮件" placeholder="主题 / 类型 / 状态 / 收件人" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <select name="mail_type" aria-label="类型"><option value="">全部类型</option></select>
+          <input name="recipient" aria-label="收件人" placeholder="收件人" />
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="outbound-list" class="list"></div>
+        <div id="outbound-pagination" class="pagination" data-table-pagination="outbound"></div>
+      </section>
+
+      <section class="page" data-page="exceptions" data-title="异常" data-subtitle="缺字段、路由、附件和答复异常。">
+        <div class="section-head">
+          <h2>异常队列</h2>
+          <p>异常处理后流程可回到任务草稿。</p>
+        </div>
+        <form id="exceptions-filter-form" class="table-filter-bar" data-table-filter="exceptions">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索异常" placeholder="异常 / 任务 / 详情" />
+          </div>
+          <select name="status" aria-label="状态">
+            <option value="Open">Open</option>
+            <option value="__all__">全部状态</option>
+          </select>
+          <select name="severity" aria-label="级别"><option value="">全部级别</option></select>
+          <select name="exception_type" aria-label="类型"><option value="">全部类型</option></select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="exceptions-list" class="list"></div>
+        <div id="exceptions-pagination" class="pagination" data-table-pagination="exceptions"></div>
+      </section>
+
+      <section class="page" data-page="ops" data-title="运维" data-subtitle="入库队列、附件解析、清理、备份和审计。">
+        <div class="section-head">
+          <h2>入库队列</h2>
+          <p>队列执行邮件识别、解析和任务单生成。</p>
+        </div>
+        <form id="jobs-filter-form" class="table-filter-bar" data-table-filter="jobs">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索入库队列" placeholder="任务类型 / 状态 / 错误" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <select name="job_type" aria-label="类型"><option value="">全部类型</option></select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="jobs-list" class="list"></div>
+        <div id="jobs-pagination" class="pagination" data-table-pagination="jobs"></div>
+
+        <div class="section-head">
+          <h2>附件解析</h2>
+          <p>Word、Excel、PDF、ZIP 解析结果。</p>
+        </div>
+        <form id="attachments-filter-form" class="table-filter-bar" data-table-filter="attachments">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索附件" placeholder="文件名 / 邮件 / 摘要 / 错误" />
+          </div>
+          <select name="parse_status" aria-label="解析状态"><option value="">全部状态</option></select>
+          <select name="content_type" aria-label="文件类型"><option value="">全部类型</option></select>
+          <input name="mail_id" aria-label="邮件ID" placeholder="邮件ID" />
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="attachments-list" class="list"></div>
+        <div id="attachments-pagination" class="pagination" data-table-pagination="attachments"></div>
+
+        <div class="section-head">
+          <h2>运维与审计</h2>
+          <p>有效订单邮件默认永久保留。</p>
+        </div>
+        <div class="actions toolbar">
+          <button id="cleanup-preview" type="button" class="button ghost">清理预览</button>
+          <button id="cleanup-run" type="button" class="button warn">执行清理</button>
+          <button id="backup-run" type="button" class="button">立即备份</button>
+        </div>
+        <div id="storage-usage" class="list"></div>
+        <form id="audit-filter-form" class="table-filter-bar" data-table-filter="audit">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索审计" placeholder="事件 / 操作人 / 对象 / 详情" />
+          </div>
+          <select name="event_type" aria-label="事件类型"><option value="">全部事件</option></select>
+          <select name="related_object_type" aria-label="对象类型"><option value="">全部对象</option></select>
+          <input name="actor" aria-label="操作人" placeholder="操作人" />
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="audit-list" class="list"></div>
+        <div id="audit-pagination" class="pagination" data-table-pagination="audit"></div>
+        <form id="backups-filter-form" class="table-filter-bar" data-table-filter="backups">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索备份" placeholder="备份类型 / 状态 / 路径" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <select name="backup_type" aria-label="类型"><option value="">全部类型</option></select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="backup-list" class="list"></div>
+        <div id="backups-pagination" class="pagination" data-table-pagination="backups"></div>
+      </section>
+    </main>
+
+    <div id="workflow-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="workflow-title">
+        <div class="modal-head">
+          <div>
+            <small id="workflow-task-no">生产任务</small>
+            <h2 id="workflow-title">工作流</h2>
+          </div>
+          <button id="workflow-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div id="workflow-steps" class="workflow-steps"></div>
+        <div id="workflow-timeline" class="workflow-timeline"></div>
+      </section>
+    </div>
+
+    <div id="weekly-preview-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="weekly-preview-title">
+        <div class="modal-head">
+          <div>
+            <small id="weekly-preview-time">周报草稿</small>
+            <h2 id="weekly-preview-title">商务生产任务单周报</h2>
+          </div>
+          <button id="weekly-preview-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div id="weekly-preview-meta" class="report-preview-meta"></div>
+        <pre id="weekly-preview-body" class="report-preview-body"></pre>
+      </section>
+    </div>
+
+    <div id="toast" role="status"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
