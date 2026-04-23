@@ -104,16 +104,17 @@ def create_valid_task(session, order_no="SO-001"):
 def test_seed_defaults_omit_plaintext_secrets():
     session = make_session()
     assert session.get(SystemConfig, "bot_email").value == "bot.market@jimuyida.com"
-    assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "300"
+    assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "60"
+    assert session.get(SystemConfig, "mail_rate_limit_interval_seconds").value == "60"
     model = session.query(ModelProviderConfig).one()
     assert model.title == "Dify deepseekV3"
     assert model.credential_ref == "env:MODEL_API_KEY"
 
 
-def test_mail_heartbeat_interval_is_clamped_to_five_minutes():
-    assert clamp_mail_interval_seconds(60) == 300
-    assert clamp_mail_interval_seconds("120") == 300
-    assert clamp_mail_interval_seconds(600) == 600
+def test_mail_rate_limit_interval_is_clamped_to_one_minute():
+    assert clamp_mail_interval_seconds(30) == 60
+    assert clamp_mail_interval_seconds("45") == 60
+    assert clamp_mail_interval_seconds(120) == 120
 
 
 def test_auth_token_roundtrip_and_tamper_detection():
@@ -251,6 +252,28 @@ def test_production_email_can_confirm_current_task_by_reply_subject():
     assert mail.related_task_id == task.id
     assert mail.classification == "ProductionScheduleConfirmation"
     assert task.status == "Closed"
+    assert session.query(OutboundMailJob).filter_by(mail_type="ProductionConfirmed", related_task_id=task.id).count() == 1
+
+
+def test_production_reply_agree_schedule_confirms_current_task():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-PROD-AGREE-SCHEDULE")
+    session.commit()
+    mail = create_inbound_mail(
+        session,
+        from_address="production@jimuyida.com",
+        subject=f"Re: [生产任务单][{task.task_no}][江西大学][G200][V1]",
+        body_text="收到任务单，同意排产",
+    )
+
+    process_mail_direct(session, mail)
+    session.commit()
+
+    assert mail.related_task_id == task.id
+    assert mail.classification == "ProductionScheduleConfirmation"
+    assert task.status == "Closed"
+    assert task.closed_reason == "ScheduledConfirmed"
     assert session.query(OutboundMailJob).filter_by(mail_type="ProductionConfirmed", related_task_id=task.id).count() == 1
 
 
@@ -670,15 +693,36 @@ def test_weekly_report_enqueue_uses_configured_recipients_and_is_idempotent():
     assert as_list(first.to_json) == ["finance@jimuyida.com", "sales-director@jimuyida.com"]
     assert as_list(first.cc_json) == ["dingyong@jimuyida.com"]
     assert "一、任务统计" in first.body
+    assert "本次上报周期：本周" in first.body
+    assert "生成时间：" in first.body
+    assert "统计周期：" in first.body
+    assert "北京时间" in first.body
     assert "二、已确认产品订单统计（分产品）" in first.body
     assert "三、未确认产品订单统计（分产品）" in first.body
     assert "四、销售 Top10 统计（需求总数和已确认总数）" in first.body
     assert "待处理异常" not in first.body
     assert "待发送邮件" not in first.body
+    assert recipients["to"] == ["finance@jimuyida.com", "sales-director@jimuyida.com"]
+
+
+def test_manual_weekly_report_enqueue_creates_new_outbound_each_click():
+    session = make_session()
+    set_weekly_report_recipients(session, ["finance@jimuyida.com"], ["dingyong@jimuyida.com"])
+    session.commit()
+
+    first = enqueue_weekly_report(session, force_new=True)
+    second = enqueue_weekly_report(session, force_new=True)
+    session.commit()
+
+    assert first.id != second.id
+    assert first.status == "Pending"
+    assert second.status == "Pending"
+    assert session.query(OutboundMailJob).filter_by(mail_type="WeeklyReport").count() == 2
+    assert "本次上报周期：本周" in first.body
+    assert "北京时间" in first.body
     assert "发送失败邮件" not in first.body
     assert "变更/取消待确认" not in first.body
     assert "风险/异常摘要" not in first.body
-    assert recipients["to"] == ["finance@jimuyida.com", "sales-director@jimuyida.com"]
 
 
 def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
@@ -1328,6 +1372,49 @@ def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeyp
     assert production_confirmed.status == "Pending"
     assert confirmation_receipt.status == "Pending"
     assert FakeSMTP.sent_subjects == ["Re: 生产订单需求"]
+
+
+def test_pending_auto_workflow_sender_includes_production_rejected(monkeypatch):
+    session = make_session()
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    rejected = OutboundMailJob(
+        mail_type="ProductionRejected",
+        to_json=dumps(["sales@jimuyida.com"]),
+        cc_json=dumps(["jinlei@jimuyida.com"]),
+        subject="[生产驳回][PT-20260422-0001] 需补充确认",
+        body="生产部驳回",
+        idempotency_key="production-rejected-auto",
+        status="Pending",
+    )
+    session.add(rejected)
+    session.commit()
+
+    class FakeSMTP:
+        sent_subjects = []
+
+        def __init__(self, host, port):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def login(self, username, password):
+            assert password == "runtime-secret"
+
+        def send_message(self, msg, from_addr, to_addrs):
+            self.sent_subjects.append(msg["Subject"])
+
+    monkeypatch.setattr("backend.app.services.mail_adapter.smtplib.SMTP_SSL", FakeSMTP)
+
+    result = send_pending_auto_workflow_mails_smtp(session, limit=10)
+    session.commit()
+
+    assert result == {"sent": 1, "failed": 0, "total": 1}
+    assert rejected.status == "Sent"
+    assert FakeSMTP.sent_subjects == [rejected.subject]
 
 
 def test_order_change_and_cancel_are_routed_to_correct_flow():

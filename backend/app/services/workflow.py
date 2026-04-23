@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -36,14 +36,15 @@ REQUIREMENT_NO_PATTERN = re.compile(r"REQ-\d{8}-\d{4}", re.IGNORECASE)
 INCOMPLETE_REPLY_KEYWORDS = ["待确认", "不确定", "稍后", "无法确认", "再确认"]
 QUESTION_INDICATORS = ["?", "？", "疑问", "请确认", "信息不足", "未写明", "没有写明", "不明确", "哪个", "哪一", "国内", "海外"]
 PRODUCTION_PENDING_QUERY_KEYWORDS = ["查询待确认", "待确认任务", "待确认生产任务", "未确认任务", "待排产任务", "当前待确认"]
-PRODUCTION_CONFIRM_KEYWORDS = ["确认", "确认排产", "可以生产", "已排产", "安排生产", "同意生产", "确认生产"]
-PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS = ["确认排产", "可以生产", "已排产", "安排生产", "同意生产", "确认生产"]
+PRODUCTION_CONFIRM_KEYWORDS = ["确认", "确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
+PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS = ["确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 SALES_ACK_CLASSIFICATIONS = {
     "SalesOrderRequirement",
     "SalesClarificationReply",
     "OrderChangeRequest",
     "OrderCancelRequest",
 }
+REPORT_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def get_config(session: Session, key: str, fallback: str = "") -> str:
@@ -201,6 +202,8 @@ def looks_like_pending_task_query(text: str) -> bool:
 def looks_like_production_confirmation(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if any(keyword in compact for keyword in PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS):
+        return True
+    if "同意" in compact and any(keyword in compact for keyword in ["排产", "生产", "安排"]):
         return True
     if compact in {"确认", "已确认", "确认了", "可以", "可以的", "没问题"}:
         return True
@@ -1862,6 +1865,7 @@ def record_production_feedback(session: Session, task_id: str, feedback_type: st
         task.status = "Closed"
         task.confirmed_at = now_utc()
         task.closed_reason = "ScheduledConfirmed"
+        task.updated_at = now_utc()
         cc = [ceo_email, ops_email]
         if salesperson_email:
             cc.insert(1, salesperson_email)
@@ -1871,6 +1875,7 @@ def record_production_feedback(session: Session, task_id: str, feedback_type: st
         mail_type = "ProductionConfirmed"
     elif feedback_type == "rejected":
         task.status = "ProductionQuestioned"
+        task.updated_at = now_utc()
         cc = [ops_email]
         to_addresses = [salesperson_email] if salesperson_email else []
         subject = f"[生产驳回][{task.task_no}] 需补充确认"
@@ -1917,14 +1922,33 @@ def dashboard(session: Session) -> dict:
     }
 
 
+def report_local_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(REPORT_TIMEZONE)
+
+
+def format_report_time(value: datetime) -> str:
+    return report_local_time(value).strftime("%Y-%m-%d %H:%M")
+
+
+def format_report_period(start_at: datetime, end_at: datetime) -> str:
+    return f"{format_report_time(start_at)} 至 {format_report_time(end_at)}（北京时间）"
+
+
 def weekly_report_periods(generated_at: datetime) -> dict[str, dict[str, object]]:
-    week_start = (generated_at - timedelta(days=generated_at.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    month_start = generated_at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    year_start = generated_at.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    generated_local = report_local_time(generated_at)
+    week_start_local = (generated_local - timedelta(days=generated_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start_local = generated_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start_local = generated_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    week_start = week_start_local.astimezone(timezone.utc)
+    month_start = month_start_local.astimezone(timezone.utc)
+    year_start = year_start_local.astimezone(timezone.utc)
     return {
-        "week": {"label": "本周", "start_at": week_start, "end_at": generated_at},
-        "month": {"label": "本月", "start_at": month_start, "end_at": generated_at},
-        "year": {"label": "本年", "start_at": year_start, "end_at": generated_at},
+        "week": {"label": "本周", "start_at": week_start, "end_at": generated_at, "range_label": format_report_period(week_start, generated_at)},
+        "month": {"label": "本月", "start_at": month_start, "end_at": generated_at, "range_label": format_report_period(month_start, generated_at)},
+        "year": {"label": "本年", "start_at": year_start, "end_at": generated_at, "range_label": format_report_period(year_start, generated_at)},
     }
 
 
@@ -1971,6 +1995,7 @@ def weekly_report(session: Session) -> dict:
             "label": period["label"],
             "start_at": start_at.isoformat(),
             "end_at": generated_at.isoformat(),
+            "range_label": period["range_label"],
             "task_stats": {
                 "demand_total": len(tasks),
                 "confirmed_total": confirmed_total,
@@ -1982,6 +2007,13 @@ def weekly_report(session: Session) -> dict:
         }
     return {
         "generated_at": generated_at.isoformat(),
+        "generated_at_label": f"{format_report_time(generated_at)}（北京时间）",
+        "reporting_period": {
+            "label": periods["week"]["label"],
+            "start_at": periods["week"]["start_at"],
+            "end_at": periods["week"]["end_at"],
+            "range_label": periods["week"]["range_label"],
+        },
         "periods": periods,
     }
 
@@ -2012,7 +2044,7 @@ def set_weekly_report_recipients(session: Session, to_addresses: list[str], cc_a
 
 
 def weekly_report_subject(generated_at: datetime) -> str:
-    iso = generated_at.isocalendar()
+    iso = report_local_time(generated_at).isocalendar()
     return f"[商务生产任务单周报][{iso.year}-W{iso.week:02d}]"
 
 
@@ -2033,38 +2065,44 @@ def _format_sales_stats(rows: list[dict[str, object]]) -> list[str]:
 
 def weekly_report_mail_body(report_data: dict) -> str:
     periods = report_data["periods"]
+    reporting_period = report_data.get("reporting_period") or periods["week"]
     period_order = ["week", "month", "year"]
     lines = [
         "各位好，",
         "",
         "以下为商务生产任务单统计周报：",
+        f"本次上报周期：{reporting_period['label']}，{reporting_period['range_label']}",
+        f"生成时间：{report_data.get('generated_at_label', report_data['generated_at'])}",
+        "",
+        "统计周期：",
+        *[f"- {periods[key]['label']}：{periods[key]['range_label']}" for key in period_order],
         "",
         "一、任务统计",
     ]
     for key in period_order:
         period = periods[key]
         stats = period["task_stats"]
-        lines.append(f"- {period['label']}：需求 {stats['demand_total']} 单，已确认 {stats['confirmed_total']} 单，未确认 {stats['unconfirmed_total']} 单")
+        lines.append(f"- {period['label']}：{period['range_label']}，需求 {stats['demand_total']} 单，已确认 {stats['confirmed_total']} 单，未确认 {stats['unconfirmed_total']} 单")
 
     lines.append("")
     lines.append("二、已确认产品订单统计（分产品）")
     for key in period_order:
         period = periods[key]
-        lines.append(f"{period['label']}：")
+        lines.append(f"{period['label']}：{period['range_label']}")
         lines.extend(_format_product_stats(period["confirmed_products"]))
 
     lines.append("")
     lines.append("三、未确认产品订单统计（分产品）")
     for key in period_order:
         period = periods[key]
-        lines.append(f"{period['label']}：")
+        lines.append(f"{period['label']}：{period['range_label']}")
         lines.extend(_format_product_stats(period["unconfirmed_products"]))
 
     lines.append("")
     lines.append("四、销售 Top10 统计（需求总数和已确认总数）")
     for key in period_order:
         period = periods[key]
-        lines.append(f"{period['label']}：")
+        lines.append(f"{period['label']}：{period['range_label']}")
         lines.extend(_format_sales_stats(period["sales_top10"]))
 
     lines.extend(
@@ -2076,7 +2114,7 @@ def weekly_report_mail_body(report_data: dict) -> str:
     return "\n".join(lines)
 
 
-def enqueue_weekly_report(session: Session) -> OutboundMailJob:
+def enqueue_weekly_report(session: Session, *, force_new: bool = False) -> OutboundMailJob:
     generated_at = now_utc()
     recipients = weekly_report_recipients(session)
     to_addresses = recipients["to"]
@@ -2084,11 +2122,14 @@ def enqueue_weekly_report(session: Session) -> OutboundMailJob:
     if not to_addresses:
         raise ValueError("weekly report recipients are not configured")
 
-    iso = generated_at.isocalendar()
+    iso = report_local_time(generated_at).isocalendar()
     idem = f"weekly-report:{iso.year}-W{iso.week:02d}:{recipient_hash(to_addresses, cc_addresses)}"
-    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
-    if existing is not None:
-        return existing
+    if force_new:
+        idem = f"{idem}:manual:{generated_at.timestamp():.6f}"
+    else:
+        existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+        if existing is not None:
+            return existing
 
     report_data = weekly_report(session)
     job = OutboundMailJob(

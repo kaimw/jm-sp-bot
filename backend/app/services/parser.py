@@ -66,7 +66,7 @@ def classify_mail(subject: str, body: str, from_address: str = "") -> tuple[str,
         return "OrderCancelRequest", 92
     if any(word in text for word in ["变更", "更改", "修改订单"]):
         return "OrderChangeRequest", 88
-    if any(word in text for word in ["确认排产", "安排生产", "可以生产", "已排产"]):
+    if any(word in text for word in ["确认排产", "安排生产", "可以生产", "已排产", "同意排产", "同意生产", "同意安排生产"]):
         return "ProductionScheduleConfirmation", 90
     if any(word in text for word in ["答复", "回复如下", "确认如下", "补充如下", "补充确认"]):
         return "SalesClarificationReply", 82

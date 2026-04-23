@@ -50,6 +50,7 @@ from backend.app.schemas import (
     TemplateUpdate,
     WeeklyReportRecipientsUpdate,
 )
+from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_INTERVAL_SECONDS
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token
 from backend.app.services.bootstrap import seed_defaults, set_config
 from backend.app.services.e2e_mail import run_tencent_mail_e2e
@@ -57,9 +58,8 @@ from backend.app.services.initial_review import FIELD_LABELS, OPERATOR_OPTIONS, 
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.jobs import run_pending_jobs
 from backend.app.services.mail_adapter import send_pending_smtp, sync_imap_mailbox
-from backend.app.services.mail_worker import run_mail_auto_worker_once
-from backend.app.services.mail_worker import configured_mail_worker_interval_seconds
-from backend.app.services.mail_throttle import MAIL_LOGIN_MIN_INTERVAL_SECONDS, clamp_mail_interval_seconds
+from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, run_mail_auto_worker_once
+from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
@@ -102,6 +102,8 @@ async def add_request_id_and_auth(request: Request, call_next):
         request.state.username = username
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -156,6 +158,7 @@ async def shutdown() -> None:
 
 
 async def mail_auto_worker_loop() -> None:
+    await asyncio.sleep(await asyncio.to_thread(configured_mail_worker_interval_seconds))
     while True:
         try:
             result = await asyncio.to_thread(run_mail_auto_worker_once)
@@ -228,9 +231,14 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
     values = payload.model_dump(exclude_unset=True)
     if "mail_auto_worker_interval_seconds" in values and values["mail_auto_worker_interval_seconds"] not in (None, ""):
         requested_interval = int(values["mail_auto_worker_interval_seconds"])
+        if requested_interval < MAIL_WORKER_MIN_INTERVAL_SECONDS:
+            raise HTTPException(status_code=400, detail=f"worker 执行周期不能低于 {MAIL_WORKER_MIN_INTERVAL_SECONDS} 秒")
+        values["mail_auto_worker_interval_seconds"] = requested_interval
+    if "mail_rate_limit_interval_seconds" in values and values["mail_rate_limit_interval_seconds"] not in (None, ""):
+        requested_interval = int(values["mail_rate_limit_interval_seconds"])
         if requested_interval < MAIL_LOGIN_MIN_INTERVAL_SECONDS:
-            raise HTTPException(status_code=400, detail=f"邮件心跳间隔不能低于 {MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒")
-        values["mail_auto_worker_interval_seconds"] = clamp_mail_interval_seconds(requested_interval)
+            raise HTTPException(status_code=400, detail=f"邮箱登录/发信间隔不能低于 {MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒")
+        values["mail_rate_limit_interval_seconds"] = clamp_mail_interval_seconds(requested_interval)
     secret_keys = {"bot_email_password", "e2e_sales_password", "e2e_production_password"}
     for key, value in values.items():
         if value in (None, ""):
@@ -1007,10 +1015,12 @@ def weekly_report_preview(session: Session = Depends(get_session)) -> dict:
     recipients = weekly_report_recipients(session)
     return {
         "generated_at": report_data["generated_at"],
+        "generated_at_label": report_data.get("generated_at_label", report_data["generated_at"]),
         "subject": weekly_report_subject(generated_at),
         "body": weekly_report_mail_body(report_data),
         "to": recipients["to"],
         "cc": recipients["cc"],
+        "reporting_period": report_data.get("reporting_period"),
         "periods": report_data["periods"],
     }
 
@@ -1034,7 +1044,7 @@ def update_weekly_report_recipients(payload: WeeklyReportRecipientsUpdate, sessi
 @app.post("/api/reports/weekly/enqueue")
 def enqueue_report(session: Session = Depends(get_session)) -> dict:
     try:
-        job = enqueue_weekly_report(session)
+        job = enqueue_weekly_report(session, force_new=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()

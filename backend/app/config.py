@@ -4,7 +4,8 @@ import os
 from dataclasses import dataclass
 
 
-MAIL_LOGIN_MIN_INTERVAL_SECONDS = 300
+MAIL_WORKER_MIN_INTERVAL_SECONDS = 60
+MAIL_LOGIN_MIN_INTERVAL_SECONDS = 60
 
 
 def int_env(name: str, default: int) -> int:
@@ -27,9 +28,14 @@ class Settings:
     auth_session_seconds: int = int_env("AUTH_SESSION_SECONDS", 28800)
     mail_auto_worker_enabled: bool = os.getenv("MAIL_AUTO_WORKER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     mail_login_min_interval_seconds: int = MAIL_LOGIN_MIN_INTERVAL_SECONDS
+    mail_worker_min_interval_seconds: int = MAIL_WORKER_MIN_INTERVAL_SECONDS
     mail_auto_worker_interval_seconds: int = max(
-        MAIL_LOGIN_MIN_INTERVAL_SECONDS,
+        MAIL_WORKER_MIN_INTERVAL_SECONDS,
         int_env("MAIL_AUTO_WORKER_INTERVAL_SECONDS", MAIL_LOGIN_MIN_INTERVAL_SECONDS),
+    )
+    mail_rate_limit_interval_seconds: int = max(
+        MAIL_LOGIN_MIN_INTERVAL_SECONDS,
+        int_env("MAIL_RATE_LIMIT_INTERVAL_SECONDS", MAIL_LOGIN_MIN_INTERVAL_SECONDS),
     )
     mail_auto_worker_limit: int = int_env("MAIL_AUTO_WORKER_LIMIT", 20)
 

@@ -70,6 +70,7 @@ class MailRuntimeConfigUpdate(BaseModel):
     smtp_host: str | None = None
     smtp_port: int | None = None
     mail_auto_worker_interval_seconds: int | None = None
+    mail_rate_limit_interval_seconds: int | None = None
     ceo_email: str | None = None
     ops_cc_email: str | None = None
     zip_max_bytes: int | None = None

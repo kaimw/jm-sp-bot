@@ -340,6 +340,7 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "ProductionPendingTasksQueryReply",
     "ProductionConfirmationReceipt",
     "ProductionConfirmed",
+    "ProductionRejected",
     "ConversationClosedMaxRounds",
     "SalesReplyTaskReissue",
     "SalesReplyReissueReceipt",

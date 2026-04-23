@@ -17,21 +17,21 @@ _last_send_attempts: dict[str, float] = {}
 
 def clamp_mail_interval_seconds(value: int | str | None) -> int:
     try:
-        parsed = int(value) if value is not None else settings.mail_auto_worker_interval_seconds
+        parsed = int(value) if value is not None else settings.mail_rate_limit_interval_seconds
     except (TypeError, ValueError):
-        parsed = settings.mail_auto_worker_interval_seconds
+        parsed = settings.mail_rate_limit_interval_seconds
     return max(MAIL_LOGIN_MIN_INTERVAL_SECONDS, parsed)
 
 
 def mail_login_interval_seconds(session: Session) -> int:
     return clamp_mail_interval_seconds(
-        get_config(session, "mail_auto_worker_interval_seconds", str(settings.mail_auto_worker_interval_seconds))
+        get_config(session, "mail_rate_limit_interval_seconds", str(settings.mail_rate_limit_interval_seconds))
     )
 
 
 def reserve_mail_login(protocol: str, username: str, *, interval_seconds: int | None = None) -> None:
     interval = clamp_mail_interval_seconds(interval_seconds)
-    key = f"{protocol.lower()}:{username.lower()}"
+    key = username.lower()
     now = time.monotonic()
     with _lock:
         previous = _last_login_attempts.get(key)

@@ -37,6 +37,47 @@ function toast(message) {
   setTimeout(() => node.classList.remove("show"), 2600);
 }
 
+function noticeTrail(parts, message, variant = "info") {
+  const node = $("#notice-trail");
+  if (!node) return;
+  const item = document.createElement("div");
+  item.className = `notice-crumb ${variant === "error" ? "is-error" : ""}`;
+  item.innerHTML = `
+    ${(parts || ["系统"]).map((part) => `<span>${h(part)}</span>`).join("<b>/</b>")}
+    <b>/</b>
+    <strong>${h(message)}</strong>
+  `;
+  node.prepend(item);
+  while (node.children.length > 4) {
+    node.lastElementChild.remove();
+  }
+  setTimeout(() => item.remove(), 9000);
+}
+
+function messageFromError(error) {
+  return error?.message || String(error || "操作失败");
+}
+
+function notifyError(error, parts = ["系统", "操作异常"]) {
+  const message = messageFromError(error);
+  noticeTrail(parts, message, "error");
+  toast(message);
+}
+
+async function guardedAction(parts, action) {
+  try {
+    return await action();
+  } catch (error) {
+    notifyError(error, parts);
+    return null;
+  }
+}
+
+window.addEventListener("unhandledrejection", (event) => {
+  event.preventDefault();
+  notifyError(event.reason, ["系统", "未处理异常"]);
+});
+
 function h(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -640,11 +681,13 @@ function closeWorkflow() {
 async function openWeeklyReportPreview() {
   const data = await api("/api/reports/weekly/preview");
   const periods = data.periods || {};
+  const reportingPeriod = data.reporting_period || periods.week || {};
   const weekStats = periods.week?.task_stats || {};
   const monthStats = periods.month?.task_stats || {};
-  $("#weekly-preview-time").textContent = `生成时间：${formatTime(data.generated_at)}`;
+  $("#weekly-preview-time").textContent = `生成时间：${h(data.generated_at_label || formatTime(data.generated_at))}`;
   $("#weekly-preview-title").textContent = data.subject || "商务生产任务单周报";
   $("#weekly-preview-meta").innerHTML = `
+    <div><small>上报周期</small><strong>${h(reportingPeriod.range_label || "未识别")}</strong></div>
     <div><small>主送</small><strong>${h((data.to || []).join(", ") || "未配置")}</strong></div>
     <div><small>抄送</small><strong>${h((data.cc || []).join(", ") || "无")}</strong></div>
     <div><small>本周需求</small><strong>${h(weekStats.demand_total ?? 0)}</strong></div>
@@ -886,8 +929,12 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
   const form = new FormData(event.currentTarget);
   const values = Object.fromEntries(form.entries());
   if (!values.bot_email_password) delete values.bot_email_password;
-  if (values.mail_auto_worker_interval_seconds && Number(values.mail_auto_worker_interval_seconds) < 300) {
-    toast("邮件心跳间隔不能低于 300 秒");
+  if (values.mail_auto_worker_interval_seconds && Number(values.mail_auto_worker_interval_seconds) < 60) {
+    toast("Worker 执行周期不能低于 60 秒");
+    return;
+  }
+  if (values.mail_rate_limit_interval_seconds && Number(values.mail_rate_limit_interval_seconds) < 60) {
+    toast("邮箱登录/发信间隔不能低于 60 秒");
     return;
   }
   values.llm_fallback_enabled = $("#runtime-mail-form [name=llm_fallback_enabled]").checked;
@@ -918,7 +965,7 @@ $("#run-e2e-mail").addEventListener("click", async (event) => {
   const resultNode = $("#e2e-mail-result");
   button.disabled = true;
   resultNode.classList.add("show");
-  resultNode.textContent = "正在运行真实腾讯企业邮箱端到端测试。IMAP/SMTP 登录和单账号发信都已限制为至少 5 分钟一次，必要时测试会等待下一次窗口...";
+  resultNode.textContent = "正在运行真实腾讯企业邮箱端到端测试。IMAP/SMTP 登录和单账号发信都已限制为至少 60 秒一次，必要时测试会等待下一次窗口...";
   try {
     const result = await api("/api/e2e/tencent-mail/run", { method: "POST" });
     resultNode.textContent = formatE2EResult(result);
@@ -962,41 +1009,53 @@ $("#weekly-report-recipients-form").addEventListener("submit", async (event) => 
 $("#preview-weekly-report").addEventListener("click", openWeeklyReportPreview);
 
 $("#enqueue-weekly-report").addEventListener("click", async () => {
-  const result = await api("/api/reports/weekly/enqueue", { method: "POST" });
-  toast(`周报邮件已进入外发队列：${result.status}`);
-  await refreshAll();
+  await guardedAction(["周报", "生成邮件"], async () => {
+    const result = await api("/api/reports/weekly/enqueue", { method: "POST" });
+    toast(`周报邮件已进入外发队列：${result.status}`);
+    await refreshAll();
+  });
 });
 
 $("#sync-mailbox").addEventListener("click", async () => {
-  const result = await api("/api/mailbox/sync", { method: "POST" });
-  toast(`已同步 ${result.imported} 封邮件，入队 ${result.queued} 条`);
-  await refreshAll();
+  await guardedAction(["邮箱", "同步"], async () => {
+    const result = await api("/api/mailbox/sync", { method: "POST" });
+    toast(`已同步 ${result.imported} 封邮件，入队 ${result.queued} 条`);
+    await refreshAll();
+  });
 });
 
 $("#run-jobs").addEventListener("click", async () => {
-  const result = await api("/api/jobs/run-pending", { method: "POST" });
-  toast(`队列完成 ${result.completed} 条，失败 ${result.failed} 条`);
-  await refreshAll();
+  await guardedAction(["队列", "运行入库"], async () => {
+    const result = await api("/api/jobs/run-pending", { method: "POST" });
+    toast(`队列完成 ${result.completed} 条，失败 ${result.failed} 条`);
+    await refreshAll();
+  });
 });
 
 $("#send-pending").addEventListener("click", async () => {
-  const result = await api("/api/outbound-mails/send-pending", { method: "POST" });
-  toast(`已发送 ${result.sent} 封邮件，失败 ${result.failed || 0} 封`);
-  await refreshAll();
+  await guardedAction(["外发", "发送待发邮件"], async () => {
+    const result = await api("/api/outbound-mails/send-pending", { method: "POST" });
+    toast(`已发送 ${result.sent} 封邮件，失败 ${result.failed || 0} 封`);
+    await refreshAll();
+  });
 });
 
 $("#outbound-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");
   if (!target || target.dataset.action !== "retry-outbound") return;
-  await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
-  toast("已重新加入外发队列");
-  await refreshAll();
+  await guardedAction(["外发", "重新入队"], async () => {
+    await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
+    toast("已重新加入外发队列");
+    await refreshAll();
+  });
 });
 
 $("#test-model").addEventListener("click", async () => {
-  await api("/api/model-providers/test", { method: "POST" });
-  toast("模型服务连通性正常");
-  await refreshAll();
+  await guardedAction(["接入", "测试模型"], async () => {
+    await api("/api/model-providers/test", { method: "POST" });
+    toast("模型服务连通性正常");
+    await refreshAll();
+  });
 });
 
 $("#model-chat-form").addEventListener("submit", async (event) => {

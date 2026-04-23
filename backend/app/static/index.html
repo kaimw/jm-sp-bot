@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>商务生产任务单智能体 MVP</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260423-3" />
   </head>
   <body>
     <section id="login-screen" class="login-screen" hidden>
@@ -55,6 +55,7 @@
           <button id="logout" type="button" class="button ghost">退出</button>
         </div>
       </header>
+      <div id="notice-trail" class="notice-trail" role="status" aria-live="polite"></div>
 
       <section class="page is-active" data-page="dashboard" data-title="工作台" data-subtitle="核心状态、队列水位和待处理风险。">
         <div id="dashboard" class="metrics"></div>
@@ -157,7 +158,8 @@
           <label>IMAP 端口 <input name="imap_port" type="number" /></label>
           <label>SMTP 主机 <input name="smtp_host" /></label>
           <label>SMTP 端口 <input name="smtp_port" type="number" /></label>
-          <label>心跳间隔秒数 <input name="mail_auto_worker_interval_seconds" type="number" min="300" step="60" /></label>
+          <label>Worker 周期秒数 <input name="mail_auto_worker_interval_seconds" type="number" min="60" step="60" /></label>
+          <label>邮箱限频秒数 <input name="mail_rate_limit_interval_seconds" type="number" min="60" step="60" /></label>
           <label>CEO 邮箱 <input name="ceo_email" /></label>
           <label>商务抄送邮箱 <input name="ops_cc_email" /></label>
           <label>ZIP 最大字节 <input name="zip_max_bytes" type="number" /></label>
@@ -430,6 +432,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260423-3"></script>
   </body>
 </html>

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 
-from backend.app.config import settings
+from sqlalchemy.orm import Session
+
+from backend.app.config import MAIL_WORKER_MIN_INTERVAL_SECONDS, settings
 from backend.app.database import SessionLocal
 from backend.app.models import OutboundMailJob
 from backend.app.services.jobs import run_pending_jobs
-from backend.app.services.mail_adapter import send_pending_auto_workflow_mails_smtp, sync_imap_mailbox
-from backend.app.services.mail_throttle import mail_login_interval_seconds
+from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, send_pending_auto_workflow_mails_smtp, sync_imap_mailbox
 from backend.app.services.workflow import get_config
 
 
@@ -26,26 +27,31 @@ def run_mail_auto_worker_once() -> dict:
             "auto_workflow_mails": {"sent": 0, "failed": 0, "total": 0},
         }
         try:
-            result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
-            session.commit()
-        except Exception as exc:
-            session.rollback()
-            logger.exception("mail auto worker sync failed")
-            result["synced"] = {"imported": 0, "queued": 0, "error": str(exc)}
-        try:
             result["processed"] = run_pending_jobs(session, limit=settings.mail_auto_worker_limit)
             session.commit()
         except Exception as exc:
             session.rollback()
             logger.exception("mail auto worker processing failed")
             result["processed"] = {"completed": 0, "failed": 0, "total": 0, "error": str(exc)}
+
+        if pending_auto_workflow_mail_count(session) > 0:
+            try:
+                result["auto_workflow_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.exception("mail auto worker auto workflow send failed")
+                result["auto_workflow_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
+            result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
+            return result
+
         try:
-            result["auto_workflow_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
+            result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
             session.commit()
         except Exception as exc:
             session.rollback()
-            logger.exception("mail auto worker auto workflow send failed")
-            result["auto_workflow_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
+            logger.exception("mail auto worker sync failed")
+            result["synced"] = {"imported": 0, "queued": 0, "error": str(exc)}
         return result
 
 
@@ -54,6 +60,21 @@ def pending_receipt_ack_count() -> int:
         return session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck", status="Pending").count()
 
 
+def pending_auto_workflow_mail_count(session: Session | None = None) -> int:
+    if session is not None:
+        return (
+            session.query(OutboundMailJob)
+            .filter(OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES), OutboundMailJob.status == "Pending")
+            .count()
+        )
+    with SessionLocal() as owned_session:
+        return pending_auto_workflow_mail_count(owned_session)
+
+
 def configured_mail_worker_interval_seconds() -> int:
     with SessionLocal() as session:
-        return mail_login_interval_seconds(session)
+        try:
+            value = int(get_config(session, "mail_auto_worker_interval_seconds", str(settings.mail_auto_worker_interval_seconds)))
+        except ValueError:
+            value = settings.mail_auto_worker_interval_seconds
+        return max(MAIL_WORKER_MIN_INTERVAL_SECONDS, value)
