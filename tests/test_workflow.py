@@ -209,6 +209,84 @@ def test_production_email_can_query_pending_confirmation_tasks():
     assert "如需确认指定任务" in reply.body
 
 
+def test_sales_email_can_query_own_demand_status_with_llm(monkeypatch):
+    session = make_session()
+    configure_department(session)
+    own_task = create_valid_task(session, order_no="SO-SALES-QUERY")
+    other_mail = create_inbound_mail(
+        session,
+        from_address="other.sales@jimuyida.com",
+        subject="生产订单需求 - 其他客户",
+        body_text="\n".join(
+            [
+                "客户名称：其他客户",
+                "产品：G200",
+                "数量：10 套",
+                "期望交期：2026-06-01",
+                "订单号：SO-OTHER-QUERY",
+            ]
+        ),
+    )
+    create_task_from_mail(session, other_mail)
+    session.commit()
+    query_mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="查询需求状态",
+        body_text="请查询我提交过的需求状态及统计。",
+    )
+    captured = {}
+
+    def fake_call_model(session, config, *, task_type, messages, related_object_type=None, related_object_id=None):
+        captured["task_type"] = task_type
+        captured["prompt"] = messages[-1]["content"]
+        return {"choices": [{"message": {"content": "销售同事好，您当前有 1 条生产任务，均已下达生产。"}}]}
+
+    monkeypatch.setattr("backend.app.services.workflow.call_model", fake_call_model)
+
+    result = process_mail_direct(session, query_mail)
+    session.commit()
+
+    reply = session.query(OutboundMailJob).filter_by(mail_type="SalesDemandStatusQueryReply").one()
+    assert result == reply
+    assert query_mail.classification == "SalesDemandStatusQuery"
+    assert as_list(reply.to_json) == ["sales@jimuyida.com"]
+    assert "销售同事好" in reply.body
+    assert own_task.task_no in captured["prompt"]
+    assert "SO-OTHER-QUERY" not in captured["prompt"]
+    assert captured["task_type"] == "MailStatusQueryReply"
+
+
+def test_production_email_can_query_accepted_demand_status_with_llm(monkeypatch):
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-PROD-STATUS")
+    session.commit()
+    query_mail = create_inbound_mail(
+        session,
+        from_address="production@jimuyida.com",
+        subject="查询受理需求统计",
+        body_text="请查询生产侧受理需求的状态和统计。",
+    )
+    captured = {}
+
+    def fake_call_model(session, config, *, task_type, messages, related_object_type=None, related_object_id=None):
+        captured["prompt"] = messages[-1]["content"]
+        return {"choices": [{"message": {"content": "生产部同事好，当前受理任务 1 条，待确认 1 条。"}}]}
+
+    monkeypatch.setattr("backend.app.services.workflow.call_model", fake_call_model)
+
+    result = process_mail_direct(session, query_mail)
+    session.commit()
+
+    reply = session.query(OutboundMailJob).filter_by(mail_type="ProductionDemandStatusQueryReply").one()
+    assert result == reply
+    assert query_mail.classification == "ProductionDemandStatusQuery"
+    assert as_list(reply.to_json) == ["production@jimuyida.com"]
+    assert "生产部同事好" in reply.body
+    assert task.task_no in captured["prompt"]
+
+
 def test_production_email_can_confirm_specified_task():
     session = make_session()
     configure_department(session)

@@ -14,6 +14,7 @@ from backend.app.models import (
     ExtractionEvidence,
     MailMessage,
     MailTemplate,
+    ModelProviderConfig,
     OrderRequirement,
     OutboundMailJob,
     ProcessingJob,
@@ -27,6 +28,7 @@ from backend.app.models import (
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.initial_review import evaluate_initial_review, serialize_review_failures
 from backend.app.services.llm_fallback import LLMMailClassification, classify_mail_with_llm, extract_requirement_with_llm
+from backend.app.services.model_provider import call_model, extract_chat_content
 from backend.app.services.parser import ExtractedRequirement, classify_mail, extract_requirement
 from backend.app.services.templates import render_template
 
@@ -36,6 +38,8 @@ REQUIREMENT_NO_PATTERN = re.compile(r"REQ-\d{8}-\d{4}", re.IGNORECASE)
 INCOMPLETE_REPLY_KEYWORDS = ["待确认", "不确定", "稍后", "无法确认", "再确认"]
 QUESTION_INDICATORS = ["?", "？", "疑问", "请确认", "信息不足", "未写明", "没有写明", "不明确", "哪个", "哪一", "国内", "海外"]
 PRODUCTION_PENDING_QUERY_KEYWORDS = ["查询待确认", "待确认任务", "待确认生产任务", "未确认任务", "待排产任务", "当前待确认"]
+STATUS_QUERY_KEYWORDS = ["查询", "查一下", "查看", "统计", "状态", "进度", "处理到哪", "到哪了", "需求", "订单", "任务"]
+STATUS_QUERY_INTENT_KEYWORDS = ["状态", "进度", "处理到哪", "到哪了", "统计", "汇总", "列表", "明细", "多少", "有哪些", "查询", "查看"]
 PRODUCTION_CONFIRM_KEYWORDS = ["确认", "确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS = ["确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 SALES_ACK_CLASSIFICATIONS = {
@@ -1181,6 +1185,286 @@ def pending_confirmation_tasks_for_production(session: Session, production_email
     ]
 
 
+def looks_like_status_query(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if looks_like_pending_task_query(compact):
+        return False
+    has_query_word = any(keyword in compact for keyword in STATUS_QUERY_KEYWORDS)
+    has_intent_word = any(keyword in compact for keyword in STATUS_QUERY_INTENT_KEYWORDS)
+    has_business_word = any(keyword in compact for keyword in ["需求", "订单", "任务", "排产", "生产"])
+    return has_query_word and has_intent_word and has_business_word
+
+
+def active_model_provider(session: Session) -> ModelProviderConfig | None:
+    return session.query(ModelProviderConfig).filter_by(status="Active").first()
+
+
+def status_label(status: str | None) -> str:
+    labels = {
+        "ReviewPending": "待初审",
+        "ReviewFailed": "初审未通过/待补充",
+        "ReviewPassed": "初审通过",
+        "TaskDrafted": "任务草稿",
+        "TaskIssued": "已下达生产",
+        "ProductionQuestioned": "生产疑问/待销售补充",
+        "ReissueDrafted": "重发草稿",
+        "Reissued": "已重新下达",
+        "CancelReview": "变更/取消待确认",
+        "Closed": "已关闭",
+    }
+    return labels.get(status or "", status or "未知")
+
+
+def task_brief(task: ProductionTask) -> dict[str, object]:
+    requirement = task.requirement
+    return {
+        "task_no": task.task_no,
+        "customer": requirement.customer_name or "未识别客户",
+        "product": requirement.product_summary or "未识别产品",
+        "quantity": requirement.quantity_text or "未识别数量",
+        "expected_delivery": requirement.expected_delivery_date or "未识别交期",
+        "external_order_no": requirement.external_order_no or "未识别订单号",
+        "salesperson": requirement.salesperson_email or requirement.salesperson_name or "未知销售",
+        "status": task.status,
+        "status_label": status_label(task.status),
+        "issued_at": task.issued_at.isoformat() if task.issued_at else "",
+        "confirmed_at": task.confirmed_at.isoformat() if task.confirmed_at else "",
+        "closed_reason": task.closed_reason or "",
+    }
+
+
+def requirement_brief(requirement: OrderRequirement, task: ProductionTask | None = None) -> dict[str, object]:
+    return {
+        "requirement_no": requirement.internal_order_no,
+        "task_no": task.task_no if task else "",
+        "customer": requirement.customer_name or "未识别客户",
+        "product": requirement.product_summary or "未识别产品",
+        "quantity": requirement.quantity_text or "未识别数量",
+        "expected_delivery": requirement.expected_delivery_date or "未识别交期",
+        "external_order_no": requirement.external_order_no or "未识别订单号",
+        "requirement_status": requirement.status,
+        "requirement_status_label": status_label(requirement.status),
+        "task_status": task.status if task else "",
+        "task_status_label": status_label(task.status) if task else "未生成生产任务",
+        "created_at": requirement.created_at.isoformat(),
+    }
+
+
+def status_counts(rows: list[dict[str, object]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw = str(row.get(key) or "Unknown")
+        label = status_label(raw)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def tasks_for_production_query(session: Session, production_email: str) -> list[ProductionTask]:
+    sender = (production_email or "").lower().strip()
+    production_addresses = production_department_addresses(session)
+    rows = (
+        session.query(ProductionTask)
+        .join(OrderRequirement, OrderRequirement.id == ProductionTask.requirement_id)
+        .order_by(ProductionTask.created_at.desc())
+        .all()
+    )
+    if not sender or sender in production_addresses:
+        return rows
+    return [
+        task
+        for task in rows
+        if sender in {address.lower() for address in as_list(task.target_mail_to_json) + as_list(task.target_mail_cc_json)}
+    ]
+
+
+def query_requested_task_nos(text: str) -> set[str]:
+    return {task_no.upper() for task_no in TASK_NO_PATTERN.findall(text)}
+
+
+def filter_tasks_by_requested_nos(tasks: list[ProductionTask], requested_task_nos: set[str]) -> list[ProductionTask]:
+    if not requested_task_nos:
+        return tasks
+    return [task for task in tasks if task.task_no.upper() in requested_task_nos]
+
+
+def build_sales_query_data(session: Session, source_mail: MailMessage, query_text: str) -> dict[str, object]:
+    sender = (source_mail.from_address or "").lower().strip()
+    requirements = (
+        session.query(OrderRequirement)
+        .filter(func.lower(OrderRequirement.salesperson_email) == sender)
+        .order_by(OrderRequirement.created_at.desc())
+        .all()
+    )
+    tasks = (
+        session.query(ProductionTask)
+        .join(OrderRequirement, OrderRequirement.id == ProductionTask.requirement_id)
+        .filter(func.lower(OrderRequirement.salesperson_email) == sender)
+        .order_by(ProductionTask.created_at.desc())
+        .all()
+    )
+    requested_task_nos = query_requested_task_nos(query_text)
+    tasks = filter_tasks_by_requested_nos(tasks, requested_task_nos)
+    task_by_requirement = {task.requirement_id: task for task in tasks}
+    requirement_rows = [
+        requirement_brief(requirement, task_by_requirement.get(requirement.id))
+        for requirement in requirements
+        if not requested_task_nos or (task_by_requirement.get(requirement.id) and task_by_requirement[requirement.id].task_no.upper() in requested_task_nos)
+    ]
+    task_rows = [task_brief(task) for task in tasks]
+    return {
+        "role": "sales",
+        "sender": source_mail.from_address,
+        "query": query_text,
+        "requested_task_nos": sorted(requested_task_nos),
+        "summary": {
+            "submitted_requirements": len(requirement_rows),
+            "production_tasks": len(task_rows),
+            "task_status_counts": status_counts(task_rows, "status"),
+            "requirement_status_counts": status_counts(requirement_rows, "requirement_status"),
+        },
+        "latest_requirements": requirement_rows[:10],
+        "latest_tasks": task_rows[:10],
+    }
+
+
+def build_production_query_data(session: Session, source_mail: MailMessage, query_text: str) -> dict[str, object]:
+    tasks = tasks_for_production_query(session, source_mail.from_address)
+    requested_task_nos = query_requested_task_nos(query_text)
+    tasks = filter_tasks_by_requested_nos(tasks, requested_task_nos)
+    task_rows = [task_brief(task) for task in tasks]
+    return {
+        "role": "production",
+        "sender": source_mail.from_address,
+        "query": query_text,
+        "requested_task_nos": sorted(requested_task_nos),
+        "summary": {
+            "accepted_tasks": len(task_rows),
+            "task_status_counts": status_counts(task_rows, "status"),
+            "pending_confirmation": sum(1 for row in task_rows if row.get("status") in {"TaskIssued", "Reissued"}),
+            "confirmed": sum(1 for row in task_rows if row.get("status") == "Closed" and row.get("closed_reason") == "ScheduledConfirmed"),
+            "questioned": sum(1 for row in task_rows if row.get("status") == "ProductionQuestioned"),
+        },
+        "latest_tasks": task_rows[:10],
+    }
+
+
+def fallback_status_query_body(role: str, data: dict[str, object]) -> str:
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    latest_tasks = data.get("latest_tasks") if isinstance(data.get("latest_tasks"), list) else []
+    title = "您提交的需求状态及统计" if role == "sales" else "生产侧受理需求状态及统计"
+    count_label = "提交需求数" if role == "sales" else "受理任务数"
+    total_key = "submitted_requirements" if role == "sales" else "accepted_tasks"
+    status_counts_text = "，".join(f"{key} {value}" for key, value in dict(summary.get("task_status_counts") or {}).items()) or "暂无"
+    lines = [
+        "您好，",
+        "",
+        f"以下为{title}：",
+        f"- {count_label}：{summary.get(total_key, 0)}",
+        f"- 生产任务数：{summary.get('production_tasks', summary.get('accepted_tasks', 0))}",
+        f"- 状态分布：{status_counts_text}",
+        "",
+        "最近任务：",
+    ]
+    if latest_tasks:
+        for index, row in enumerate(latest_tasks, start=1):
+            lines.append(
+                f"{index}. {row.get('task_no') or '未生成任务'} | {row.get('customer')} | {row.get('product')} | "
+                f"{row.get('quantity')} | 交期 {row.get('expected_delivery')} | {row.get('status_label')}"
+            )
+    else:
+        lines.append("- 暂无匹配记录。")
+    return "\n".join(lines)
+
+
+def render_status_query_body_with_llm(session: Session, role: str, data: dict[str, object], source_mail: MailMessage) -> str:
+    config = active_model_provider(session)
+    if config is None:
+        return fallback_status_query_body(role, data)
+    role_label = "销售人员" if role == "sales" else "生产部门"
+    try:
+        output = call_model(
+            session,
+            config,
+            task_type="MailStatusQueryReply",
+            related_object_type="MailMessage",
+            related_object_id=source_mail.id,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是商务生产任务单智能体，负责把结构化订单/生产任务查询结果组织成中文邮件正文。"
+                        "只能依据输入数据回答，不要编造不存在的任务、数量、状态或日期。"
+                        "语气简洁、商务化。输出邮件正文即可，不要输出主题，不要使用 Markdown 表格。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"收件人角色：{role_label}\n"
+                        f"原始查询：{source_mail.body_text}\n"
+                        f"结构化查询结果 JSON：{dumps(data)}\n"
+                        "请回复：1）先概述统计；2）列出最近或指定任务明细；3）如无记录，明确说明未查询到。"
+                    ),
+                },
+            ],
+        )
+        content = extract_chat_content(output).strip()
+        if content:
+            return content
+    except Exception as exc:
+        add_audit(session, "LLMStatusQueryReplyFailed", "MailMessage", source_mail.id, {"error": str(exc)[:1000]})
+    return fallback_status_query_body(role, data)
+
+
+def enqueue_status_query_reply(session: Session, source_mail: MailMessage, *, role: str) -> OutboundMailJob | None:
+    to_address = (source_mail.from_address or "").strip()
+    if not to_address:
+        return None
+    query_text = f"{source_mail.subject}\n{source_mail.body_text}"
+    data = build_sales_query_data(session, source_mail, query_text) if role == "sales" else build_production_query_data(session, source_mail, query_text)
+    body = render_status_query_body_with_llm(session, role, data, source_mail)
+    signature = get_config(session, "bot_signature", "积木易搭AI机器人")
+    if signature and signature not in body:
+        body = f"{body.rstrip()}\n\n{signature}"
+    to_addresses = [to_address]
+    cc_addresses: list[str] = []
+    idem = f"{role}-status-query:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    mail_type = "SalesDemandStatusQueryReply" if role == "sales" else "ProductionDemandStatusQueryReply"
+    subject = f"Re: {'需求状态和统计查询' if role == 'sales' else '受理需求状态和统计查询'}"
+    job = OutboundMailJob(
+        mail_type=mail_type,
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=subject,
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    source_mail.classification = "SalesDemandStatusQuery" if role == "sales" else "ProductionDemandStatusQuery"
+    source_mail.classification_confidence = max(source_mail.classification_confidence, 93)
+    add_audit(session, f"{mail_type}Queued", "MailMessage", source_mail.id, {"to": to_addresses, "summary": data.get("summary")})
+    return job
+
+
+def handle_status_query_mail_command(session: Session, mail: MailMessage) -> OutboundMailJob | None:
+    text = f"{mail.subject}\n{mail.body_text}"
+    if not looks_like_status_query(text):
+        return None
+    sender = (mail.from_address or "").lower().strip()
+    if not sender:
+        return None
+    if sender in production_department_addresses(session):
+        return enqueue_status_query_reply(session, mail, role="production")
+    bot_email = get_config(session, "bot_email", "bot.market@jimuyida.com").lower()
+    if sender == bot_email:
+        return None
+    return enqueue_status_query_reply(session, mail, role="sales")
+
+
 def enqueue_production_pending_tasks_reply(session: Session, source_mail: MailMessage) -> OutboundMailJob | None:
     to_address = (source_mail.from_address or "").strip()
     if not to_address:
@@ -1717,6 +2001,9 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
     production_command = handle_production_mail_command(session, mail)
     if production_command is not None:
         return production_command
+    status_query_command = handle_status_query_mail_command(session, mail)
+    if status_query_command is not None:
+        return status_query_command
     if find_requirement_for_supplement_reply(session, mail) is not None:
         return handle_requirement_supplement_reply(session, mail)
     if mail.classification == "SalesOrderRequirement":

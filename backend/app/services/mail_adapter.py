@@ -338,6 +338,8 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "ProductionQuestionForward",
     "ProductionQuestionReceipt",
     "ProductionPendingTasksQueryReply",
+    "SalesDemandStatusQueryReply",
+    "ProductionDemandStatusQueryReply",
     "ProductionConfirmationReceipt",
     "ProductionConfirmed",
     "ProductionRejected",

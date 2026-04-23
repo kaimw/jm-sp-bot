@@ -151,7 +151,7 @@
         </div>
         <form id="runtime-mail-form" class="form-grid">
           <label>机器人邮箱 <input name="bot_email" /></label>
-          <label>邮箱密码 <input name="bot_email_password" type="password" placeholder="留空不修改" /></label>
+          <label>邮箱密码 <input name="bot_email_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
           <label>显示名称 <input name="bot_display_name" /></label>
           <label>默认签名 <input name="bot_signature" /></label>
           <label>IMAP 主机 <input name="imap_host" /></label>
@@ -173,9 +173,9 @@
         </form>
         <form id="e2e-mail-form" class="form-grid compact-form">
           <label>销售测试邮箱 <input name="e2e_sales_email" value="bot.sales@jimuyida.com" /></label>
-          <label>销售邮箱密码 <input name="e2e_sales_password" type="password" placeholder="留空不修改" /></label>
+          <label>销售邮箱密码 <input name="e2e_sales_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
           <label>生产测试邮箱 <input name="e2e_production_email" value="bot.production@jimuyida.com" /></label>
-          <label>生产邮箱密码 <input name="e2e_production_password" type="password" placeholder="留空不修改" /></label>
+          <label>生产邮箱密码 <input name="e2e_production_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
           <button type="submit" class="button">保存测试账号</button>
           <button id="run-e2e-mail" type="button" class="button ghost">运行端到端测试</button>
         </form>
@@ -185,7 +185,7 @@
           <label>服务类型 <input name="provider" /></label>
           <label>模型名称 <input name="model_name" /></label>
           <label>API Base <input name="api_base" /></label>
-          <label class="wide">API Key <input name="api_key" type="password" placeholder="留空不修改" /></label>
+          <label class="wide">API Key <input name="api_key" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
           <button type="submit" class="button">保存模型配置</button>
         </form>
         <div class="section-head">
