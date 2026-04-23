@@ -607,6 +607,8 @@ function formatBytes(value) {
 function summarizeExceptionDetail(detail) {
   if (!detail || typeof detail !== "object") return "";
   const parts = [];
+  if (detail.message) parts.push(String(detail.message));
+  if (detail.action_hint) parts.push(`处理建议：${detail.action_hint}`);
   if (detail.source_mail_id) parts.push(`来源邮件：${detail.source_mail_id}`);
   if (detail.exception_types?.length) parts.push(`异常：${detail.exception_types.join("、")}`);
   if (detail.exceptions?.length && !detail.exception_types?.length) {

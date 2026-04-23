@@ -26,7 +26,7 @@ from backend.app.models import (
     now_utc,
 )
 from backend.app.services.jsonutil import as_list, dumps, loads
-from backend.app.services.initial_review import evaluate_initial_review, serialize_review_failures
+from backend.app.services.initial_review import evaluate_initial_review, find_recent_duplicate_requirement, serialize_review_failures
 from backend.app.services.llm_fallback import LLMMailClassification, classify_mail_with_llm, extract_requirement_with_llm
 from backend.app.services.model_provider import call_model, extract_chat_content
 from backend.app.services.parser import ExtractedRequirement, classify_mail, extract_requirement
@@ -315,6 +315,7 @@ def enqueue_sales_receipt_ack(
     mail: MailMessage,
     *,
     allow_order_requirement: bool = False,
+    task_no: str | None = None,
 ) -> OutboundMailJob | None:
     from_address = (mail.from_address or "").strip()
     if not from_address or mail.classification not in SALES_ACK_CLASSIFICATIONS:
@@ -336,19 +337,34 @@ def enqueue_sales_receipt_ack(
     subject = mail.subject.strip() if mail.subject else "生产订单需求"
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
-    body = "\n".join(
-        [
-            "销售同事好，",
-            "",
-            "您的邮件已收到，系统已进入排队处理中。",
-            f"原邮件主题：{mail.subject or ''}",
-            f"入库编号：{mail.id}",
-            "",
-            "后续如果订单信息缺失或生产部有疑问，我会继续邮件通知您补充确认。",
-            "",
-            get_config(session, "bot_signature", "积木易搭AI机器人"),
-        ]
-    )
+    if mail.classification == "SalesOrderRequirement" and task_no:
+        body = "\n".join(
+            [
+                "销售同事好，",
+                "",
+                "您的需求邮件已通过系统初审并创建生产任务。",
+                f"任务号：{task_no}",
+                f"原邮件主题：{mail.subject or ''}",
+                "",
+                "后续如需变更请邮件回复“订单变更 + 任务号”；如需撤回请邮件回复“撤回需求 + 任务号”（生产确认排单前有效）。",
+                "",
+                get_config(session, "bot_signature", "积木易搭AI机器人"),
+            ]
+        )
+    else:
+        body = "\n".join(
+            [
+                "销售同事好，",
+                "",
+                "您的邮件已收到，系统已进入排队处理中。",
+                f"原邮件主题：{mail.subject or ''}",
+                f"入库编号：{mail.id}",
+                "",
+                "后续如果订单信息缺失或生产部有疑问，我会继续邮件通知您补充确认。",
+                "",
+                get_config(session, "bot_signature", "积木易搭AI机器人"),
+            ]
+        )
     job = OutboundMailJob(
         mail_type="SalesReceiptAck",
         to_json=dumps(to_addresses),
@@ -360,7 +376,13 @@ def enqueue_sales_receipt_ack(
     )
     session.add(job)
     session.flush()
-    add_audit(session, "SalesReceiptAckQueued", "MailMessage", mail.id, {"to": to_addresses, "classification": mail.classification})
+    add_audit(
+        session,
+        "SalesReceiptAckQueued",
+        "MailMessage",
+        mail.id,
+        {"to": to_addresses, "classification": mail.classification, "task_no": task_no or ""},
+    )
     return job
 
 
@@ -487,7 +509,7 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
     if mail.related_task_id:
         existing_task = session.get(ProductionTask, mail.related_task_id)
         if existing_task is not None:
-            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True)
+            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=existing_task.task_no)
             return existing_task
     existing_requirements = (
         session.query(OrderRequirement)
@@ -504,7 +526,7 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
             .first()
         )
         if existing_task is not None:
-            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True)
+            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=existing_task.task_no)
             return existing_task
         existing_requirement = existing_requirements[0]
         if existing_requirement.status == "ReviewFailed":
@@ -585,6 +607,8 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
                 "source_mail_id": mail.id,
                 "missing_fields": [],
                 "risk_flags": ["生产部门邮箱未配置"],
+                "message": "订单初审已通过，但未配置生产部门邮箱，系统无法自动创建生产任务。",
+                "action_hint": "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。",
             },
             source_mail_id=mail.id,
         )
@@ -593,7 +617,7 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
 
     task = draft_task_from_requirement(session, requirement, mail)
     approve_task(session, task.id, actor="System")
-    enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True)
+    enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=task.task_no)
     return task
 
 
@@ -746,6 +770,8 @@ def handle_requirement_supplement_reply(session: Session, mail: MailMessage) -> 
                 "source_mail_id": mail.id,
                 "missing_fields": [],
                 "risk_flags": ["生产部门邮箱未配置"],
+                "message": "订单初审已通过，但未配置生产部门邮箱，系统无法自动创建生产任务。",
+                "action_hint": "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。",
             },
             source_mail_id=mail.id,
         )
@@ -788,33 +814,59 @@ def enqueue_initial_review_rejection(
     if existing is not None:
         return existing
     reason_lines = []
+    duplicate_submission = False
     for failure in failures:
         message = getattr(failure, "message", str(failure)).strip()
+        rule_name = getattr(failure, "rule_name", "")
+        if rule_name == "重复提交检查" or "请勿重复提交" in message:
+            duplicate_submission = True
         if message and message not in reason_lines:
             reason_lines.append(message)
     if not reason_lines:
         reason_lines = ["订单信息未通过系统初审，请补充完整后回复本邮件。"]
-    body = "\n".join(
-        [
-            "销售同事好，",
-            "",
-            "收到订单需求后，系统初审未通过，请按以下原因补充或修正后回复本邮件：",
-            *[f"- {reason}" for reason in reason_lines],
-            "",
-            f"当前识别客户：{requirement.customer_name or '未识别'}",
-            f"当前识别产品：{requirement.product_summary or '未识别'}",
-            f"当前识别数量：{requirement.quantity_text or '未识别'}",
-            f"当前识别交期：{requirement.expected_delivery_date or '未识别'}",
-            f"当前识别订单号：{requirement.external_order_no or '未识别'}",
-            "",
-            get_config(session, "bot_signature", "积木易搭AI机器人"),
-        ]
-    )
+    mail_type = "RequirementSupplementRequest"
+    subject = f"[订单信息待补充][{requirement.internal_order_no}] 请补充生产任务单信息"
+    if duplicate_submission:
+        duplicate_task_no = ""
+        _, duplicate_task = find_recent_duplicate_requirement(session, requirement, hours=24)
+        if duplicate_task is not None:
+            duplicate_task_no = duplicate_task.task_no
+        mail_type = "DuplicateSubmissionNotice"
+        subject = f"[重复提交提醒][{requirement.internal_order_no}] 需求已提交，请勿重复提交"
+        body = "\n".join(
+            [
+                "销售同事好，",
+                "",
+                "系统检测到同一需求在24小时内已提交并受理，本次不会重复创建任务。",
+                *([f"已受理任务号：{duplicate_task_no}"] if duplicate_task_no else []),
+                "",
+                "如需调整内容，请回复“订单变更 + 任务号”；如需撤回，请回复“撤回需求 + 任务号”（生产确认排单前有效）。",
+                "",
+                get_config(session, "bot_signature", "积木易搭AI机器人"),
+            ]
+        )
+    else:
+        body = "\n".join(
+            [
+                "销售同事好，",
+                "",
+                "收到订单需求后，系统初审未通过，请按以下原因补充或修正后回复本邮件：",
+                *[f"- {reason}" for reason in reason_lines],
+                "",
+                f"当前识别客户：{requirement.customer_name or '未识别'}",
+                f"当前识别产品：{requirement.product_summary or '未识别'}",
+                f"当前识别数量：{requirement.quantity_text or '未识别'}",
+                f"当前识别交期：{requirement.expected_delivery_date or '未识别'}",
+                f"当前识别订单号：{requirement.external_order_no or '未识别'}",
+                "",
+                get_config(session, "bot_signature", "积木易搭AI机器人"),
+            ]
+        )
     job = OutboundMailJob(
-        mail_type="RequirementSupplementRequest",
+        mail_type=mail_type,
         to_json=dumps(to_addresses),
         cc_json=dumps(cc_addresses),
-        subject=f"[订单信息待补充][{requirement.internal_order_no}] 请补充生产任务单信息",
+        subject=subject,
         body=body,
         idempotency_key=idem,
         status="Pending",
@@ -1839,21 +1891,187 @@ def enqueue_requirement_supplement_receipt(session: Session, sent_job: OutboundM
     return job
 
 
+def enqueue_sales_withdrawn_notice(session: Session, task: ProductionTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    sales_email = (task.requirement.salesperson_email or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    idem = f"sales-demand-withdrawn:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"任务 {task.task_no} 已按您的请求撤回，系统已关闭该任务，不会继续推进生产排单。",
+            "",
+            "如需重新发起，请发送新的订单需求邮件。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="SalesDemandWithdrawn",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[需求已撤回][{task.task_no}] 任务已关闭",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "SalesDemandWithdrawnQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def enqueue_production_withdrawn_notice(session: Session, task: ProductionTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    to_addresses = as_list(task.target_mail_to_json)
+    cc_addresses = as_list(task.target_mail_cc_json)
+    if not to_addresses:
+        return None
+    idem = f"production-demand-withdrawn:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "生产部同事好，",
+            "",
+            f"销售已撤回任务 {task.task_no}，该任务已关闭，请停止后续排单与生产动作。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="ProductionDemandWithdrawn",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[需求撤回][{task.task_no}] 请停止排单",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "ProductionDemandWithdrawnQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def enqueue_sales_withdraw_rejected_notice(
+    session: Session,
+    task: ProductionTask,
+    source_mail: MailMessage,
+    *,
+    reason: str,
+) -> OutboundMailJob | None:
+    sales_email = (task.requirement.salesperson_email or "").strip() or (source_mail.from_address or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    idem = f"sales-demand-withdraw-rejected:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"任务 {task.task_no} 撤回失败：{reason}",
+            "",
+            "如需进一步处理，请联系商务部人工介入。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="SalesDemandWithdrawRejected",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[撤回失败][{task.task_no}] 请人工处理",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "SalesDemandWithdrawRejectedQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id, "reason": reason})
+    return job
+
+
 def record_order_change_or_cancel(session: Session, mail: MailMessage, task: ProductionTask) -> ProductionTaskVersion | None:
     mail.related_task_id = task.id
     if mail.classification == "OrderCancelRequest":
-        task.manual_takeover = True
-        task.status = "CancelReview"
+        text = f"{mail.subject}\n{mail.body_text}"
+        requested_task_nos = query_requested_task_nos(text)
+        task_no_upper = task.task_no.upper()
+        if not requested_task_nos:
+            reason = "未识别到任务号，请按“撤回需求 + 任务号”格式发送。"
+            record_exception_case(
+                session,
+                related_task_id=task.id,
+                exception_type="OrderCancelTaskNoMissing",
+                severity="Medium",
+                detail={"source_mail_id": mail.id, "subject": mail.subject, "body": mail.body_text[:1000], "message": reason},
+                source_mail_id=mail.id,
+            )
+            enqueue_sales_withdraw_rejected_notice(session, task, mail, reason=reason)
+            add_audit(session, "OrderCancelRejectedMissingTaskNo", "ProductionTask", task.id, {"mail_id": mail.id})
+            return None
+        if task_no_upper not in requested_task_nos:
+            reason = f"邮件中的任务号与当前任务不一致（当前任务号：{task.task_no}）。"
+            record_exception_case(
+                session,
+                related_task_id=task.id,
+                exception_type="OrderCancelTaskNoMismatch",
+                severity="Medium",
+                detail={"source_mail_id": mail.id, "subject": mail.subject, "body": mail.body_text[:1000], "message": reason},
+                source_mail_id=mail.id,
+            )
+            enqueue_sales_withdraw_rejected_notice(session, task, mail, reason=reason)
+            add_audit(session, "OrderCancelRejectedTaskNoMismatch", "ProductionTask", task.id, {"mail_id": mail.id})
+            return None
+        if task.closed_reason == "ScheduledConfirmed" or task.confirmed_at is not None:
+            reason = "生产已确认排单，任务不可自动撤回。"
+            record_exception_case(
+                session,
+                related_task_id=task.id,
+                exception_type="OrderCancelAfterProductionConfirmed",
+                severity="High",
+                detail={"source_mail_id": mail.id, "subject": mail.subject, "body": mail.body_text[:1000], "message": reason},
+                source_mail_id=mail.id,
+            )
+            enqueue_sales_withdraw_rejected_notice(session, task, mail, reason=reason)
+            add_audit(session, "OrderCancelRejectedConfirmed", "ProductionTask", task.id, {"mail_id": mail.id})
+            return None
+        if task.status == "Closed":
+            reason = f"任务已关闭（{task.closed_reason or 'Closed'}），无需重复撤回。"
+            enqueue_sales_withdraw_rejected_notice(session, task, mail, reason=reason)
+            add_audit(session, "OrderCancelRejectedAlreadyClosed", "ProductionTask", task.id, {"mail_id": mail.id})
+            return None
+
+        task.status = "Closed"
+        task.closed_reason = "WithdrawnBySales"
+        task.manual_takeover = False
         task.updated_at = now_utc()
-        record_exception_case(
-            session,
-            related_task_id=task.id,
-            exception_type="OrderCancelManualReview",
-            severity="High" if task.closed_reason == "ScheduledConfirmed" else "Medium",
-            detail={"source_mail_id": mail.id, "subject": mail.subject, "body": mail.body_text[:1000]},
-            source_mail_id=mail.id,
+        task.requirement.status = "Closed"
+        task.requirement.updated_at = now_utc()
+        open_questions = (
+            session.query(QuestionAndReply)
+            .filter_by(task_id=task.id, status="AwaitingSalesReply")
+            .all()
         )
-        add_audit(session, "OrderCancelManualReview", "ProductionTask", task.id, {"mail_id": mail.id})
+        for question in open_questions:
+            question.status = "Answered"
+            if not (question.reply_text or "").strip():
+                question.reply_text = "销售已撤回需求，任务关闭。"
+            question.updated_at = now_utc()
+        enqueue_sales_withdrawn_notice(session, task, mail)
+        enqueue_production_withdrawn_notice(session, task, mail)
+        add_audit(session, "OrderWithdrawnBySales", "ProductionTask", task.id, {"mail_id": mail.id})
         return None
 
     if task.status == "Closed" or task.closed_reason == "ScheduledConfirmed":

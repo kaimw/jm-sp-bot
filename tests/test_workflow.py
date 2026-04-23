@@ -487,7 +487,9 @@ def test_email_store_and_processing_queue_creates_task():
     assert "表面处理" in (parsed_assets[0].extracted_text or "")
     assert mail.related_task_id is not None
     assert as_list(ack.to_json) == ["sales@jimuyida.com"]
-    assert "排队处理中" in ack.body
+    task = session.get(ProductionTask, mail.related_task_id)
+    assert task is not None
+    assert f"任务号：{task.task_no}" in ack.body
     assert "邮箱入库" in ack.subject
 
     duplicate = store_incoming_email(session, incoming)
@@ -1531,11 +1533,86 @@ def test_order_change_and_cancel_are_routed_to_correct_flow():
     )
     cancel_result = process_mail_direct(session, cancel_mail)
     session.commit()
-    case = session.query(ExceptionCase).filter_by(exception_type="OrderCancelManualReview").one()
+    sales_notice = session.query(OutboundMailJob).filter_by(mail_type="SalesDemandWithdrawn", related_task_id=task.id).one()
+    production_notice = session.query(OutboundMailJob).filter_by(mail_type="ProductionDemandWithdrawn", related_task_id=task.id).one()
 
     assert cancel_result is None
-    assert task.status == "CancelReview"
-    assert task.manual_takeover is True
+    assert task.status == "Closed"
+    assert task.closed_reason == "WithdrawnBySales"
+    assert task.manual_takeover is False
+    assert as_list(sales_notice.to_json) == ["sales@jimuyida.com"]
+    assert as_list(production_notice.to_json) == ["production@jimuyida.com"]
+    assert session.query(ExceptionCase).filter_by(exception_type="OrderCancelManualReview").count() == 0
+
+
+def test_duplicate_sales_requirement_within_24h_sends_no_repeat_notice():
+    session = make_session()
+    configure_department(session)
+    first_mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 重复提交1",
+        body_text="\n".join(
+            [
+                "客户名称：重复客户",
+                "产品：重复展台",
+                "数量：10套",
+                "期望交期：2026-08-20",
+                "订单号：SO-REPEAT-001",
+            ]
+        ),
+    )
+    first_task = create_task_from_mail(session, first_mail)
+    assert first_task is not None
+    session.commit()
+
+    duplicate_mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 重复提交2",
+        body_text="\n".join(
+            [
+                "客户名称：重复客户",
+                "产品：重复展台",
+                "数量：10套",
+                "期望交期：2026-08-20",
+                "订单号：SO-REPEAT-001",
+            ]
+        ),
+    )
+    duplicate_task = create_task_from_mail(session, duplicate_mail)
+    session.commit()
+
+    duplicate_notice = session.query(OutboundMailJob).filter_by(mail_type="DuplicateSubmissionNotice").one()
+    assert duplicate_task is None
+    assert session.query(ProductionTask).count() == 1
+    assert "请勿重复提交" in duplicate_notice.subject
+    assert f"已受理任务号：{first_task.task_no}" in duplicate_notice.body
+    assert as_list(duplicate_notice.to_json) == ["sales@jimuyida.com"]
+
+
+def test_sales_cancel_after_production_confirmed_is_rejected():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-CANCEL-AFTER-CONFIRMED")
+    record_production_feedback(session, task.id, "confirmed", "确认排产")
+    session.commit()
+
+    cancel_mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject=f"撤回需求 - {task.task_no}",
+        body_text=f"撤回需求 {task.task_no}",
+    )
+    result = process_mail_direct(session, cancel_mail)
+    session.commit()
+
+    reject_notice = session.query(OutboundMailJob).filter_by(mail_type="SalesDemandWithdrawRejected", related_task_id=task.id).one()
+    case = session.query(ExceptionCase).filter_by(exception_type="OrderCancelAfterProductionConfirmed").one()
+    assert result is None
+    assert task.status == "Closed"
+    assert task.closed_reason == "ScheduledConfirmed"
+    assert "生产已确认排单" in reject_notice.body
     assert case.related_task_id == task.id
 
 

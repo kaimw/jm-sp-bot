@@ -41,7 +41,7 @@ class Settings:
 
     bot_email: str = os.getenv("BOT_EMAIL", "bot.market@jimuyida.com")
     bot_email_password: str = os.getenv("BOT_EMAIL_PASSWORD", "")
-    bot_display_name: str = os.getenv("BOT_DISPLAY_NAME", "市场部小J")
+    bot_display_name: str = os.getenv("BOT_DISPLAY_NAME", "商务部小J")
     bot_signature: str = os.getenv("BOT_SIGNATURE", "积木易搭AI机器人")
     imap_host: str = os.getenv("IMAP_HOST", "imap.exmail.qq.com")
     imap_port: int = int_env("IMAP_PORT", 993)

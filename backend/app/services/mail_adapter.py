@@ -71,6 +71,13 @@ def strip_html(html: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def normalize_bot_display_name(value: str) -> str:
+    # Compatibility shim: keep old persisted config values but emit new sender name.
+    if (value or "").strip() == "市场部小J":
+        return "商务部小J"
+    return (value or "").strip() or "商务部小J"
+
+
 def parse_email_bytes(raw: bytes) -> IncomingEmail:
     msg = email.message_from_bytes(raw, policy=default)
     subject = decode_mime(msg.get("Subject"))
@@ -292,7 +299,7 @@ def send_pending_smtp(session: Session, *, limit: int = 20) -> dict:
     port = int(get_config(session, "smtp_port", "465"))
     username = get_config(session, "bot_email", "bot.market@jimuyida.com")
     password = get_config(session, "bot_email_password", "")
-    display_name = get_config(session, "bot_display_name", "市场部小J")
+    display_name = normalize_bot_display_name(get_config(session, "bot_display_name", "商务部小J"))
     jobs = session.query(OutboundMailJob).filter_by(status="Pending").order_by(OutboundMailJob.created_at).limit(limit).all()
     return send_outbound_jobs_with_account(
         session,
@@ -310,7 +317,7 @@ def send_outbound_jobs_smtp(session: Session, job_ids: list[str], *, include_gen
     port = int(get_config(session, "smtp_port", "465"))
     username = get_config(session, "bot_email", "bot.market@jimuyida.com")
     password = get_config(session, "bot_email_password", "")
-    display_name = get_config(session, "bot_display_name", "市场部小J")
+    display_name = normalize_bot_display_name(get_config(session, "bot_display_name", "商务部小J"))
     jobs = (
         session.query(OutboundMailJob)
         .filter(OutboundMailJob.id.in_(job_ids), OutboundMailJob.status == "Pending")
@@ -332,6 +339,7 @@ def send_outbound_jobs_smtp(session: Session, job_ids: list[str], *, include_gen
 AUTO_WORKFLOW_MAIL_TYPES = {
     "SalesReceiptAck",
     "RequirementSupplementRequest",
+    "DuplicateSubmissionNotice",
     "RequirementSupplementTaskIssue",
     "RequirementSupplementAcceptedReceipt",
     "TaskIssue",
@@ -343,6 +351,9 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "ProductionConfirmationReceipt",
     "ProductionConfirmed",
     "ProductionRejected",
+    "SalesDemandWithdrawn",
+    "ProductionDemandWithdrawn",
+    "SalesDemandWithdrawRejected",
     "ConversationClosedMaxRounds",
     "SalesReplyTaskReissue",
     "SalesReplyReissueReceipt",
@@ -393,6 +404,7 @@ def send_outbound_jobs_with_account(
     display_name: str,
     include_generated_followups: bool = False,
 ) -> dict:
+    display_name = normalize_bot_display_name(display_name)
     if not jobs:
         return {"sent": 0, "failed": 0, "total": 0}
     if not password:
@@ -466,6 +478,7 @@ def send_direct_smtp(
     subject: str,
     body: str,
 ) -> None:
+    display_name = normalize_bot_display_name(display_name)
     if not password:
         raise RuntimeError(f"smtp password is not configured for {username}")
     recipients = to_addresses + (cc_addresses or [])

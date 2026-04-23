@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from sqlalchemy.orm import Session
 
-from backend.app.models import OrderRequirement, SystemConfig
+from backend.app.models import OrderRequirement, ProductionTask, SystemConfig, now_utc
 from backend.app.services.jsonutil import dumps, loads
 
 
@@ -129,6 +129,57 @@ def _rule_passes(target: str, operator: str, expected: str) -> bool:
     return True
 
 
+def _normalize_compare_text(value: str | None) -> str:
+    compact = re.sub(r"\s+", "", str(value or "")).strip().lower()
+    return compact
+
+
+def _same_requirement_content(current: OrderRequirement, existing: OrderRequirement) -> bool:
+    current_order_no = _normalize_compare_text(current.external_order_no)
+    existing_order_no = _normalize_compare_text(existing.external_order_no)
+    if current_order_no and existing_order_no:
+        return current_order_no == existing_order_no
+
+    fields = ("customer_name", "product_summary", "quantity_text", "expected_delivery_date")
+    for field in fields:
+        left = _normalize_compare_text(getattr(current, field, ""))
+        right = _normalize_compare_text(getattr(existing, field, ""))
+        if not left or not right or left != right:
+            return False
+    return True
+
+
+def find_recent_duplicate_requirement(session: Session, requirement: OrderRequirement, *, hours: int = 24) -> tuple[OrderRequirement, ProductionTask | None] | tuple[None, None]:
+    salesperson_email = (requirement.salesperson_email or "").strip().lower()
+    if not salesperson_email:
+        return None, None
+
+    cutoff_at = now_utc() - timedelta(hours=hours)
+    candidates = (
+        session.query(OrderRequirement)
+        .filter(
+            OrderRequirement.id != requirement.id,
+            OrderRequirement.created_at >= cutoff_at,
+            OrderRequirement.salesperson_email.is_not(None),
+        )
+        .order_by(OrderRequirement.created_at.desc())
+        .all()
+    )
+    for candidate in candidates:
+        if _normalize_compare_text(candidate.salesperson_email) != salesperson_email:
+            continue
+        if not _same_requirement_content(requirement, candidate):
+            continue
+        task = (
+            session.query(ProductionTask)
+            .filter_by(requirement_id=candidate.id)
+            .order_by(ProductionTask.created_at.desc())
+            .first()
+        )
+        return candidate, task
+    return None, None
+
+
 def evaluate_initial_review(
     session: Session,
     requirement: OrderRequirement,
@@ -167,6 +218,21 @@ def evaluate_initial_review(
                 message=flag,
             )
         )
+
+    duplicate_requirement, duplicate_task = find_recent_duplicate_requirement(session, requirement, hours=24)
+    if duplicate_requirement is not None:
+        duplicate_message = "同一需求在24小时内已提交，请勿重复提交。"
+        if duplicate_task is not None:
+            duplicate_message = f"{duplicate_message} 已存在任务号：{duplicate_task.task_no}。"
+        failures.append(
+            ReviewFailure(
+                field="source_text",
+                field_label=FIELD_LABELS["source_text"],
+                rule_name="重复提交检查",
+                message=duplicate_message,
+            )
+        )
+        rule_risk_flags.append(duplicate_message)
 
     for rule in config["rules"]:
         if not isinstance(rule, dict) or not rule.get("enabled", True):

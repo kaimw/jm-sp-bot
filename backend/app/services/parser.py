@@ -62,7 +62,7 @@ def classify_mail(subject: str, body: str, from_address: str = "") -> tuple[str,
     text = f"{subject}\n{body}".lower()
     if any(word in text for word in BOUNCE_KEYWORDS) or "mailer-daemon" in from_address.lower():
         return "BounceOrAutoReply", 94
-    if any(word in text for word in ["取消订单", "订单取消", "取消生产"]):
+    if any(word in text for word in ["取消订单", "订单取消", "取消生产", "取消任务", "撤回需求", "撤回任务", "撤回订单"]):
         return "OrderCancelRequest", 92
     if any(word in text for word in ["变更", "更改", "修改订单"]):
         return "OrderChangeRequest", 88
