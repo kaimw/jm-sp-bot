@@ -46,6 +46,14 @@ class TaskManualCloseRequest(BaseModel):
     note: str = ""
 
 
+class TaskClearRequest(BaseModel):
+    admin_password: str
+
+
+class AdminPasswordRequest(BaseModel):
+    admin_password: str
+
+
 class ExceptionResolveRequest(BaseModel):
     note: str = ""
 
@@ -64,6 +72,15 @@ class ExceptionRequirementPatchRequest(BaseModel):
 class WeeklyReportRecipientsUpdate(BaseModel):
     to: list[str]
     cc: list[str] = []
+
+
+class OutboundBulkCancelRequest(BaseModel):
+    q: str | None = None
+    status: str | None = None
+    mail_type: str | None = None
+    recipient: str | None = None
+    ids: list[str] = []
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 class MailRuntimeConfigUpdate(BaseModel):

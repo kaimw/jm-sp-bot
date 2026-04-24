@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hmac
 import logging
 import uuid
 from datetime import datetime
@@ -40,6 +41,7 @@ from backend.app.models import (
     now_utc,
 )
 from backend.app.schemas import (
+    AdminPasswordRequest,
     DemoOrderRequest,
     DepartmentUpsert,
     ExceptionRequirementPatchRequest,
@@ -49,8 +51,10 @@ from backend.app.schemas import (
     MailRuntimeConfigUpdate,
     ModelChatTestRequest,
     ModelProviderUpdate,
+    OutboundBulkCancelRequest,
     ProductionFeedbackRequest,
     ProductionQuestionRequest,
+    TaskClearRequest,
     SalesReplyRequest,
     TaskManualCloseRequest,
     TemplateUpdate,
@@ -78,7 +82,7 @@ from backend.app.services.jobs import run_pending_jobs
 from backend.app.services.mail_adapter import send_pending_smtp, sync_imap_mailbox
 from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, run_mail_auto_worker_once
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds
-from backend.app.services.model_provider import call_model, extract_chat_content
+from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
 from backend.app.services.workflow_rules import (
@@ -237,6 +241,37 @@ def bootstrap(session: Session = Depends(get_session)) -> dict:
     return {"ok": True}
 
 
+def runtime_startup_readiness(session: Session, overrides: dict | None = None) -> dict:
+    overrides = overrides or {}
+    missing: list[str] = []
+    model = session.query(ModelProviderConfig).filter_by(status="Active").first()
+    if model is None or not (model.api_base or "").strip():
+        missing.append("Dify API Base")
+    if model is None or not resolve_api_key(session, model).strip():
+        missing.append("Dify API Key")
+
+    saved_bot_email = session.get(SystemConfig, "bot_email")
+    bot_email = str(overrides.get("bot_email") or (saved_bot_email.value if saved_bot_email else "")).strip()
+    if not bot_email:
+        missing.append("bot邮箱")
+
+    incoming_password = overrides.get("bot_email_password")
+    saved_password = session.get(SystemConfig, "bot_email_password")
+    if not (str(incoming_password or "").strip() or (saved_password is not None and str(saved_password.value or "").strip())):
+        missing.append("bot邮箱密码")
+
+    departments = session.query(ProductionDepartment).filter_by(status="Active").all()
+    if not any(as_list(dept.mail_to_json) for dept in departments):
+        missing.append("生产部门邮箱")
+
+    return {"ready": not missing, "missing": missing}
+
+
+def require_admin_password(admin_password: str) -> None:
+    if not hmac.compare_digest(admin_password or "", settings.admin_password or ""):
+        raise HTTPException(status_code=403, detail="invalid admin password")
+
+
 @app.get("/api/config")
 def config(session: Session = Depends(get_session)) -> dict:
     configs = {row.key: ("***" if row.is_secret else row.value) for row in session.query(SystemConfig).all()}
@@ -252,6 +287,7 @@ def config(session: Session = Depends(get_session)) -> dict:
             "api_base": model.api_base,
             "credential_ref": model.credential_ref,
         },
+        "startup_readiness": runtime_startup_readiness(session),
     }
 
 
@@ -268,6 +304,10 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
         if requested_interval < MAIL_LOGIN_MIN_INTERVAL_SECONDS:
             raise HTTPException(status_code=400, detail=f"邮箱登录/发信间隔不能低于 {MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒")
         values["mail_rate_limit_interval_seconds"] = clamp_mail_interval_seconds(requested_interval)
+    if values.get("bot_enabled") is True:
+        readiness = runtime_startup_readiness(session, values)
+        if not readiness["ready"]:
+            raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
     secret_keys = {"bot_email_password", "e2e_sales_password", "e2e_production_password"}
     for key, value in values.items():
         if value in (None, ""):
@@ -714,6 +754,107 @@ def tasks(
     )
 
 
+@app.post("/api/tasks/clear")
+def clear_tasks(payload: TaskClearRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+
+    tasks_to_clear = session.query(ProductionTask).all()
+    task_ids = [task.id for task in tasks_to_clear]
+    requirement_ids = [task.requirement_id for task in tasks_to_clear]
+    version_ids = [
+        row.id
+        for row in session.query(ProductionTaskVersion.id).filter(ProductionTaskVersion.task_id.in_(task_ids)).all()
+    ] if task_ids else []
+
+    mail_updates = 0
+    outbound_updates = 0
+    exception_updates = 0
+    question_deletes = 0
+    version_deletes = 0
+    binding_deletes = 0
+    evidence_deletes = 0
+    requirement_deletes = 0
+    task_deletes = 0
+
+    if task_ids:
+        mail_updates = (
+            session.query(MailMessage)
+            .filter(MailMessage.related_task_id.in_(task_ids))
+            .update({MailMessage.related_task_id: None}, synchronize_session=False)
+        )
+        exception_updates = (
+            session.query(ExceptionCase)
+            .filter(ExceptionCase.related_task_id.in_(task_ids))
+            .update({ExceptionCase.related_task_id: None}, synchronize_session=False)
+        )
+        outbound_query = session.query(OutboundMailJob).filter(OutboundMailJob.related_task_id.in_(task_ids))
+        if version_ids:
+            outbound_query = session.query(OutboundMailJob).filter(
+                or_(OutboundMailJob.related_task_id.in_(task_ids), OutboundMailJob.related_version_id.in_(version_ids))
+            )
+        outbound_updates = outbound_query.update(
+            {OutboundMailJob.related_task_id: None, OutboundMailJob.related_version_id: None},
+            synchronize_session=False,
+        )
+        question_deletes = (
+            session.query(QuestionAndReply)
+            .filter(QuestionAndReply.task_id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        version_deletes = (
+            session.query(ProductionTaskVersion)
+            .filter(ProductionTaskVersion.task_id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        task_deletes = (
+            session.query(ProductionTask)
+            .filter(ProductionTask.id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+
+    if requirement_ids:
+        binding_deletes = (
+            session.query(RequirementWorkflowBinding)
+            .filter(RequirementWorkflowBinding.requirement_id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+        evidence_deletes = (
+            session.query(ExtractionEvidence)
+            .filter(ExtractionEvidence.requirement_id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+        requirement_deletes = (
+            session.query(OrderRequirement)
+            .filter(OrderRequirement.id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+
+    actor = getattr(request.state, "username", "system")
+    detail = {
+        "task_count": task_deletes,
+        "requirement_count": requirement_deletes,
+        "version_count": version_deletes,
+        "question_count": question_deletes,
+        "binding_count": binding_deletes,
+        "evidence_count": evidence_deletes,
+        "mail_links_cleared": mail_updates,
+        "outbound_links_cleared": outbound_updates,
+        "exception_links_cleared": exception_updates,
+    }
+    session.add(
+        AuditEvent(
+            event_type="TaskListCleared",
+            actor=actor,
+            related_object_type="ProductionTask",
+            related_object_id="bulk-clear",
+            detail=dumps(detail),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"cleared": task_deletes, **detail}
+
+
 @app.get("/api/tasks/{task_id}")
 def task_detail(task_id: str, session: Session = Depends(get_session)) -> dict:
     task = session.get(ProductionTask, task_id)
@@ -971,6 +1112,36 @@ def outbound_mails(
     )
 
 
+def filtered_outbound_query(
+    session: Session,
+    *,
+    q: str | None = None,
+    status: str | None = None,
+    mail_type: str | None = None,
+    recipient: str | None = None,
+):
+    query = session.query(OutboundMailJob)
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                OutboundMailJob.subject.ilike(pattern),
+                OutboundMailJob.mail_type.ilike(pattern),
+                OutboundMailJob.status.ilike(pattern),
+                OutboundMailJob.to_json.ilike(pattern),
+                OutboundMailJob.cc_json.ilike(pattern),
+            )
+        )
+    if status and status.strip():
+        query = query.filter(OutboundMailJob.status == status.strip())
+    if mail_type and mail_type.strip():
+        query = query.filter(OutboundMailJob.mail_type == mail_type.strip())
+    if recipient and recipient.strip():
+        pattern = f"%{recipient.strip()}%"
+        query = query.filter(or_(OutboundMailJob.to_json.ilike(pattern), OutboundMailJob.cc_json.ilike(pattern)))
+    return query
+
+
 @app.post("/api/outbound-mails/send-pending")
 def send_pending_outbound(limit: int = 20, session: Session = Depends(get_session)) -> dict:
     try:
@@ -979,6 +1150,44 @@ def send_pending_outbound(limit: int = 20, session: Session = Depends(get_sessio
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()
     return result
+
+
+@app.post("/api/outbound-mails/cancel-pending")
+def cancel_pending_outbound(payload: OutboundBulkCancelRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    if payload.status and payload.status.strip() and payload.status.strip() != "Pending":
+        return {"cancelled": 0, "matched": 0, "status": "Cancelled", "skipped": "only Pending outbound mails can be cancelled"}
+
+    query = filtered_outbound_query(
+        session,
+        q=payload.q,
+        status="Pending",
+        mail_type=payload.mail_type,
+        recipient=payload.recipient,
+    )
+    if payload.ids:
+        query = query.filter(OutboundMailJob.id.in_(payload.ids))
+    rows = query.order_by(OutboundMailJob.created_at).limit(payload.limit).all()
+    now = now_utc()
+    actor = getattr(request.state, "username", "system")
+    for row in rows:
+        row.status = "Cancelled"
+        session.add(
+            AuditEvent(
+                event_type="OutboundMailCancelled",
+                actor=actor,
+                related_object_type="OutboundMailJob",
+                related_object_id=row.id,
+                detail=dumps({"mail_type": row.mail_type, "subject": row.subject, "previous_status": "Pending"}),
+                created_at=now,
+            )
+        )
+    session.commit()
+    return {
+        "cancelled": len(rows),
+        "matched": len(rows),
+        "status": "Cancelled",
+        "limit": payload.limit,
+    }
 
 
 @app.post("/api/outbound-mails/{job_id}/retry")
@@ -1045,6 +1254,25 @@ def list_jobs(
     )
 
 
+@app.post("/api/jobs/clear")
+def clear_jobs(payload: AdminPasswordRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    deleted = session.query(ProcessingJob).delete(synchronize_session=False)
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="ProcessingJobsCleared",
+            actor=actor,
+            related_object_type="ProcessingJob",
+            related_object_id="bulk-clear",
+            detail=dumps({"job_count": deleted}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"cleared": deleted}
+
+
 @app.post("/api/jobs/run-pending")
 def run_jobs(limit: int = 20, session: Session = Depends(get_session)) -> dict:
     result = run_pending_jobs(session, limit=limit)
@@ -1093,6 +1321,31 @@ def list_attachments(
     )
 
 
+@app.post("/api/attachments/clear")
+def clear_attachments(payload: AdminPasswordRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    evidence_links = (
+        session.query(ExtractionEvidence)
+        .filter(ExtractionEvidence.source_attachment_id.isnot(None))
+        .update({ExtractionEvidence.source_attachment_id: None}, synchronize_session=False)
+    )
+    session.query(AttachmentAsset).update({AttachmentAsset.parent_attachment_id: None}, synchronize_session=False)
+    deleted = session.query(AttachmentAsset).delete(synchronize_session=False)
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="AttachmentsCleared",
+            actor=actor,
+            related_object_type="AttachmentAsset",
+            related_object_id="bulk-clear",
+            detail=dumps({"attachment_count": deleted, "evidence_links_cleared": evidence_links}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"cleared": deleted, "evidence_links_cleared": evidence_links}
+
+
 @app.get("/api/storage/usage")
 def storage_usage_api() -> dict:
     return storage_usage()
@@ -1138,6 +1391,25 @@ def list_exceptions(
             "exception_type_options": distinct_values(session, ExceptionCase.exception_type),
         },
     )
+
+
+@app.post("/api/exceptions/clear")
+def clear_exceptions(payload: AdminPasswordRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    deleted = session.query(ExceptionCase).delete(synchronize_session=False)
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="ExceptionsCleared",
+            actor=actor,
+            related_object_type="ExceptionCase",
+            related_object_id="bulk-clear",
+            detail=dumps({"exception_count": deleted}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"cleared": deleted}
 
 
 @app.get("/api/exceptions/{exception_id}")
@@ -1429,6 +1701,25 @@ def run_backup(session: Session = Depends(get_session)) -> dict:
     return {"backup_job_id": job.id, "status": job.status, "storage_ref": job.storage_ref}
 
 
+@app.post("/api/backups/clear")
+def clear_backups(payload: AdminPasswordRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    deleted = session.query(BackupJob).delete(synchronize_session=False)
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="BackupsCleared",
+            actor=actor,
+            related_object_type="BackupJob",
+            related_object_id="bulk-clear",
+            detail=dumps({"backup_count": deleted}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"cleared": deleted}
+
+
 @app.get("/api/audit-events")
 def audit_events(
     q: str | None = None,
@@ -1469,6 +1760,14 @@ def audit_events(
             "related_object_type_options": distinct_values(session, AuditEvent.related_object_type),
         },
     )
+
+
+@app.post("/api/audit-events/clear")
+def clear_audit_events(payload: AdminPasswordRequest, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    deleted = session.query(AuditEvent).delete(synchronize_session=False)
+    session.commit()
+    return {"cleared": deleted}
 
 
 def serialize_department(row: ProductionDepartment) -> dict:

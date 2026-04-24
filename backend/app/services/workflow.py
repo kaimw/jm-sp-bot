@@ -68,7 +68,7 @@ def get_config(session: Session, key: str, fallback: str = "") -> str:
 
 
 def bot_enabled(session: Session) -> bool:
-    return get_config(session, "bot_enabled", "true").lower() in {"1", "true", "yes", "on"}
+    return get_config(session, "bot_enabled", "false").lower() in {"1", "true", "yes", "on"}
 
 
 def add_audit(session: Session, event_type: str, object_type: str, object_id: str, detail: dict, actor: str = "System") -> None:

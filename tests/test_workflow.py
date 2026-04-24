@@ -15,7 +15,9 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.database import Base
 from backend.app.models import (
+    AuditEvent,
     AttachmentAsset,
+    BackupJob,
     ExceptionCase,
     ExtractionEvidence,
     MailMessage,
@@ -126,10 +128,43 @@ def test_seed_defaults_omit_plaintext_secrets():
     assert session.get(SystemConfig, "bot_email").value == "bot.market@jimuyida.com"
     assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "60"
     assert session.get(SystemConfig, "mail_rate_limit_interval_seconds").value == "60"
-    assert session.get(SystemConfig, "bot_enabled").value == "true"
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
     model = session.query(ModelProviderConfig).one()
     assert model.title == "Dify deepseekV3"
     assert model.credential_ref == "env:MODEL_API_KEY"
+
+
+def test_system_enable_requires_model_bot_and_department_config():
+    from backend.app.main import config, update_mail_config
+    from backend.app.schemas import MailRuntimeConfigUpdate
+
+    session = make_session()
+
+    readiness = config(session)["startup_readiness"]
+    assert readiness["ready"] is False
+    assert "Dify API Key" in readiness["missing"]
+    assert "bot邮箱密码" in readiness["missing"]
+    assert "生产部门邮箱" in readiness["missing"]
+
+    with pytest.raises(Exception) as exc:
+        update_mail_config(MailRuntimeConfigUpdate(bot_enabled=True), session)
+
+    assert exc.value.status_code == 400
+    assert "Dify API Key" in exc.value.detail
+    assert "bot邮箱密码" in exc.value.detail
+    assert "生产部门邮箱" in exc.value.detail
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
+
+    configure_department(session)
+    model = session.query(ModelProviderConfig).one()
+    set_config(session, "model_api_key", "runtime-secret", is_secret=True)
+    model.credential_ref = "config:model_api_key"
+    session.commit()
+
+    result = update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
+
+    assert result["startup_readiness"]["ready"] is True
+    assert session.get(SystemConfig, "bot_enabled").value == "True"
 
 
 def test_mail_rate_limit_interval_is_clamped_to_one_minute():
@@ -760,6 +795,7 @@ def test_source_mail_exceptions_are_merged_into_one_record():
 def test_production_question_sales_reply_reissue_flow(monkeypatch):
     session = make_session()
     configure_department(session)
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     task = create_valid_task(session, order_no="SO-QUESTION-001")
     original_issue = approve_task(session, task.id, actor="tester")
@@ -1002,6 +1038,7 @@ def test_manual_weekly_report_enqueue_creates_new_outbound_each_click():
 
 def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     ok = OutboundMailJob(
         mail_type="Manual",
@@ -1106,6 +1143,201 @@ def test_smtp_send_skips_when_bot_disabled():
     assert pending.status == "Pending"
 
 
+def test_cancel_pending_outbound_marks_only_matching_pending_jobs():
+    from backend.app.main import cancel_pending_outbound
+    from backend.app.schemas import OutboundBulkCancelRequest
+
+    class Request:
+        class State:
+            username = "tester"
+
+        state = State()
+
+    session = make_session()
+    matched = OutboundMailJob(
+        mail_type="WeeklyReport",
+        to_json=dumps(["finance@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="周报-Pending",
+        body="hello",
+        idempotency_key="cancel-matched",
+        status="Pending",
+    )
+    other_pending = OutboundMailJob(
+        mail_type="TaskIssue",
+        to_json=dumps(["production@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="任务-Pending",
+        body="hello",
+        idempotency_key="cancel-other",
+        status="Pending",
+    )
+    sent = OutboundMailJob(
+        mail_type="WeeklyReport",
+        to_json=dumps(["finance@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="周报-Sent",
+        body="hello",
+        idempotency_key="cancel-sent",
+        status="Sent",
+    )
+    session.add_all([matched, other_pending, sent])
+    session.commit()
+
+    result = cancel_pending_outbound(
+        OutboundBulkCancelRequest(mail_type="WeeklyReport"),
+        Request(),
+        session,
+    )
+
+    assert result["cancelled"] == 1
+    assert matched.status == "Cancelled"
+    assert other_pending.status == "Pending"
+    assert sent.status == "Sent"
+    audit = session.query(AuditEvent).filter_by(event_type="OutboundMailCancelled", related_object_id=matched.id).one()
+    assert audit.actor == "tester"
+
+
+def test_clear_tasks_requires_admin_password_and_removes_task_list():
+    from backend.app.main import clear_tasks
+    from backend.app.schemas import TaskClearRequest
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-CLEAR")
+    version = session.query(ProductionTaskVersion).filter_by(task_id=task.id).first()
+    assert version is not None
+    source_mail = session.get(MailMessage, task.requirement.source_mail_id)
+    source_mail.related_task_id = task.id
+    question = QuestionAndReply(
+        task_id=task.id,
+        question_text="请补充包装要求",
+        status="AwaitingSalesReply",
+    )
+    outbound = OutboundMailJob(
+        related_task_id=task.id,
+        related_version_id=version.id,
+        mail_type="TaskIssue",
+        to_json=dumps(["production@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="任务单",
+        body="hello",
+        idempotency_key="clear-task-outbound",
+        status="Pending",
+    )
+    case = ExceptionCase(
+        related_task_id=task.id,
+        exception_type="ManualReview",
+        severity="Medium",
+        detail="测试异常",
+        status="Open",
+    )
+    session.add_all([source_mail, question, outbound, case])
+    session.commit()
+    task_id = task.id
+    requirement_id = task.requirement_id
+    source_mail_id = source_mail.id
+    outbound_id = outbound.id
+    case_id = case.id
+
+    with pytest.raises(Exception) as exc:
+        clear_tasks(TaskClearRequest(admin_password="wrong"), Request(), session)
+    assert exc.value.status_code == 403
+    assert session.query(ProductionTask).count() == 1
+
+    result = clear_tasks(TaskClearRequest(admin_password="admin"), Request(), session)
+    session.expire_all()
+
+    assert result["cleared"] == 1
+    assert session.query(ProductionTask).count() == 0
+    assert session.query(ProductionTaskVersion).filter_by(task_id=task_id).count() == 0
+    assert session.query(QuestionAndReply).filter_by(task_id=task_id).count() == 0
+    assert session.query(OrderRequirement).filter_by(id=requirement_id).count() == 0
+    assert session.query(RequirementWorkflowBinding).filter_by(requirement_id=requirement_id).count() == 0
+    assert session.query(ExtractionEvidence).filter_by(requirement_id=requirement_id).count() == 0
+    assert session.get(MailMessage, source_mail_id).related_task_id is None
+    assert session.get(OutboundMailJob, outbound_id).related_task_id is None
+    assert session.get(OutboundMailJob, outbound_id).related_version_id is None
+    assert session.get(ExceptionCase, case_id).related_task_id is None
+    audit = session.query(AuditEvent).filter_by(event_type="TaskListCleared").one()
+    assert audit.actor == "admin"
+
+
+def test_clear_exception_and_ops_lists_require_admin_password():
+    from backend.app.main import clear_attachments, clear_audit_events, clear_backups, clear_exceptions, clear_jobs
+    from backend.app.schemas import AdminPasswordRequest
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="附件测试",
+        body_text="测试正文",
+    )
+    attachment = AttachmentAsset(
+        mail_id=mail.id,
+        file_name="order.docx",
+        file_size=12,
+        file_hash="hash-clear",
+        storage_ref="data/attachments/order.docx",
+        parse_status="Completed",
+    )
+    session.add(attachment)
+    session.flush()
+    session.add_all(
+        [
+            ProcessingJob(job_type="process_inbound_mail", payload_json=dumps({"mail_id": mail.id}), status="Pending"),
+            ExceptionCase(exception_type="ReviewNeedManual", severity="Medium", detail="缺少字段", status="Open"),
+            BackupJob(backup_type="Manual", status="Completed", storage_ref="data/backups/test.zip", manifest_json=dumps({})),
+            ExtractionEvidence(
+                requirement_id="not-used-in-this-test",
+                field_name="customer_name",
+                field_value="测试客户",
+                source_type="attachment",
+                source_attachment_id=attachment.id,
+                evidence_text="客户名称：测试客户",
+                confidence=90,
+            ),
+        ]
+    )
+    session.commit()
+
+    with pytest.raises(Exception) as exc:
+        clear_exceptions(AdminPasswordRequest(admin_password="wrong"), Request(), session)
+    assert exc.value.status_code == 403
+    assert session.query(ExceptionCase).count() == 1
+
+    assert clear_exceptions(AdminPasswordRequest(admin_password="admin"), Request(), session)["cleared"] == 1
+    assert clear_jobs(AdminPasswordRequest(admin_password="admin"), Request(), session)["cleared"] == 1
+    attachment_result = clear_attachments(AdminPasswordRequest(admin_password="admin"), Request(), session)
+    assert attachment_result["cleared"] == 1
+    assert attachment_result["evidence_links_cleared"] == 1
+    assert clear_backups(AdminPasswordRequest(admin_password="admin"), Request(), session)["cleared"] == 1
+    assert session.query(ExceptionCase).count() == 0
+    assert session.query(ProcessingJob).count() == 0
+    assert session.query(AttachmentAsset).count() == 0
+    assert session.query(BackupJob).count() == 0
+    assert session.query(ExtractionEvidence).filter(ExtractionEvidence.source_attachment_id.isnot(None)).count() == 0
+    assert session.query(AuditEvent).filter(AuditEvent.event_type.in_(["ExceptionsCleared", "ProcessingJobsCleared", "AttachmentsCleared", "BackupsCleared"])).count() == 4
+
+    audit_count = session.query(AuditEvent).count()
+    audit_result = clear_audit_events(AdminPasswordRequest(admin_password="admin"), session)
+    assert audit_result["cleared"] == audit_count
+    assert session.query(AuditEvent).count() == 0
+
+
 def test_sync_imap_mailbox_skips_when_bot_disabled():
     session = make_session()
     set_config(session, "bot_enabled", "false", is_secret=False)
@@ -1130,6 +1362,7 @@ def test_mail_auto_worker_skips_when_bot_disabled(monkeypatch):
 
 def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
     session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     selected = OutboundMailJob(
         mail_type="Manual",
@@ -1183,6 +1416,7 @@ def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
 
 def test_pending_receipt_ack_sender_does_not_send_task_issues(monkeypatch):
     session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     ack = OutboundMailJob(
         mail_type="SalesReceiptAck",
@@ -1335,6 +1569,7 @@ def test_short_natural_sales_order_triggers_review_rejection_without_ack():
 def test_sales_reply_to_initial_review_supplement_creates_task_and_receipt_after_send(monkeypatch):
     session = make_session()
     configure_department(session)
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     original = create_inbound_mail(
         session,
@@ -1665,6 +1900,7 @@ def test_initial_review_config_removes_duplicate_custom_rules():
 
 def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeypatch):
     session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     ack = OutboundMailJob(
         mail_type="SalesReceiptAck",
@@ -1778,6 +2014,7 @@ def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeyp
 
 def test_pending_auto_workflow_sender_includes_production_rejected(monkeypatch):
     session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
     rejected = OutboundMailJob(
         mail_type="ProductionRejected",

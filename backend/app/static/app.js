@@ -1,8 +1,10 @@
 const $ = (selector) => document.querySelector(selector);
+const hiddenPages = new Set(["orders", "templates"]);
 let initialReviewState = { enabled: true, required_fields: [], rules: [], field_options: [], operator_options: [] };
 let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, readonly: false };
 let workflowChatState = { messages: [], compiledRule: null, validationErrors: [], ready: false, editVersionId: "", editWorkflowName: "" };
 let runtimeConfigState = {};
+let startupReadinessState = { ready: false, missing: [] };
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
 const tableStates = {
   workflows: { q: "", status: "", page: 1, page_size: 10 },
@@ -225,7 +227,8 @@ function currentPageName() {
 
 function setActivePage(pageName = currentPageName()) {
   const pages = [...document.querySelectorAll(".page")];
-  const target = pages.find((page) => page.dataset.page === pageName) || pages.find((page) => page.dataset.page === "dashboard");
+  const visiblePages = pages.filter((page) => !hiddenPages.has(page.dataset.page));
+  const target = visiblePages.find((page) => page.dataset.page === pageName) || visiblePages.find((page) => page.dataset.page === "dashboard");
   if (!target) return;
   pages.forEach((page) => page.classList.toggle("is-active", page === target));
   document.querySelectorAll("[data-page-link]").forEach((link) => {
@@ -258,7 +261,7 @@ async function refreshDepartments() {
   $("#departments-list").innerHTML = rows
     .map(
       (row) => `
-        <div class="row">
+        <div class="row task-row">
           <div><strong>${h(row.department_name)}</strong><br /><small>${h(row.department_code)}</small></div>
           <div><small>主送</small><br />${h(row.mail_to.join(", ") || "未配置")}</div>
           <div><small>抄送</small><br />${h(row.mail_cc.join(", ") || "无")}</div>
@@ -284,7 +287,7 @@ async function refreshTasks() {
     rows
       .map(
         (row) => `
-        <div class="row">
+        <div class="row task-row">
           <div>
             <strong>${h(row.task_no)}</strong><br />
             <small>${h(row.customer_name || "未识别客户")} · ${h(row.salesperson_email || "未知销售")}</small><br />
@@ -292,6 +295,7 @@ async function refreshTasks() {
           </div>
           <div>${h(row.product_summary || "未识别产品")}<br /><small>${h(row.quantity_text || "")} ${h(row.expected_delivery_date || "")}</small></div>
           <div><small>${h(row.status)}</small></div>
+          <div><small>创建时间</small><br />${h(formatTime(row.created_at))}</div>
           <div class="actions">
             <button class="button" data-action="workflow" data-id="${row.id}">查看工作流</button>
             <button class="button ghost" data-action="manual-close-task" data-id="${row.id}" ${row.status === "Closed" ? "disabled" : ""}>手动关闭</button>
@@ -336,6 +340,7 @@ function mailStatusClass(status) {
     Sent: "status-sent",
     Pending: "status-pending",
     Failed: "status-failed",
+    Cancelled: "status-cancelled",
     Running: "status-running",
   }[status] || "status-muted";
 }
@@ -381,7 +386,7 @@ function fillForm(formSelector, values) {
   }
 }
 
-function configEnabled(value, fallback = true) {
+function configEnabled(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
@@ -389,9 +394,11 @@ function configEnabled(value, fallback = true) {
 function renderSystemToggle() {
   const button = $("#system-toggle");
   if (!button) return;
-  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, false);
   button.textContent = enabled ? "停用系统" : "启用系统";
-  button.title = enabled ? "停用机器人邮箱监听与自动处理" : "启用机器人邮箱监听与自动处理";
+  button.title = enabled
+    ? "停用机器人邮箱监听与自动处理"
+    : (startupReadinessState.ready ? "启用机器人邮箱监听与自动处理" : `启动前需补齐：${(startupReadinessState.missing || []).join("、")}`);
   button.classList.toggle("is-paused", !enabled);
 }
 
@@ -463,13 +470,15 @@ function renderInitialReviewRules() {
     (pageData.items || [])
       .map(
         (rule) => `
-        <div class="row">
-          <div><strong>${h(rule.name || "未命名规则")}</strong><br /><small>${h(reviewRuleStatusText(rule))}</small></div>
-          <div><small>字段 / 判断</small><br />${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(reviewOperatorLabel(rule.operator))}</div>
-          <div><small>规则值</small><br />${h(rule.value || "无")}</div>
-          <div>
-            <small>${h(rule.message || "未填写未通过原因")}</small>
-            <div class="actions row-actions">
+        <div class="review-rule-row">
+          <div class="review-rule-main">
+            <strong>${h(rule.name || "未命名规则")}</strong>
+            <span class="status-pill ${rule.enabled === false ? "is-muted" : "is-active"}">${h(reviewRuleStatusText(rule))}</span>
+          </div>
+          <div class="review-rule-field"><small>字段 / 判断</small><span>${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(reviewOperatorLabel(rule.operator))}</span></div>
+          <div class="review-rule-value"><small>规则值</small><span>${h(rule.value || "无")}</span></div>
+          <div class="review-rule-message"><small>未通过原因</small><span>${h(rule.message || "未填写未通过原因")}</span></div>
+          <div class="actions row-actions review-rule-actions">
               ${
                 isReadonlyReviewRule(rule)
                   ? `<span class="status-pill">系统内置 · 只读</span>`
@@ -478,11 +487,10 @@ function renderInitialReviewRules() {
                     <button class="button warn" data-action="delete-review-rule" data-id="${h(rule.id)}">删除</button>
                   `
               }
-            </div>
           </div>
         </div>`
       )
-      .join("") || `<div class="row"><div>暂无自定义规则，当前仅执行必填项和内置风险初审。</div></div>`;
+      .join("") || `<div class="empty-note">暂无自定义规则，当前仅执行必填项和内置风险初审。</div>`;
   renderListPagination("#initial-review-rules-pagination", "reviewRules", pageData);
 }
 
@@ -944,6 +952,7 @@ function startWorkflowChatEdit(row) {
 async function refreshConfig() {
   const data = await api("/api/config");
   runtimeConfigState = data.configs || {};
+  startupReadinessState = data.startup_readiness || { ready: false, missing: [] };
   fillForm("#runtime-mail-form", data.configs || {});
   fillForm("#e2e-mail-form", data.configs || {});
   if (data.model) {
@@ -1014,7 +1023,7 @@ async function refreshMails() {
     rows
       .map(
         (row) => `
-        <div class="row">
+        <div class="row clickable-row" data-mail-id="${h(row.id)}" role="button" tabindex="0" title="查看邮件详情">
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.from_address)}</small></div>
           <div><small>分类</small><br />${h(row.classification)} (${h(row.classification_confidence)})</div>
           <div><small>任务</small><br />${h(row.related_task_id || "未关联")}</div>
@@ -1023,6 +1032,26 @@ async function refreshMails() {
       )
       .join("") || `<div class="row"><div>暂无入库邮件</div></div>`;
   renderListPagination("#mails-pagination", "mails", data);
+}
+
+async function openMailDetail(mailId) {
+  const detail = await api(`/api/mails/${mailId}`);
+  $("#mail-detail-title").textContent = detail.subject || "邮件详情";
+  $("#mail-detail-meta").textContent = `${detail.direction || "邮件"} · ${detail.created_at || ""}`;
+  $("#mail-detail-fields").innerHTML = `
+    <div><small>发件人</small><strong>${h(detail.from_address || "未记录")}</strong></div>
+    <div><small>收件人</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
+    <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
+    <div><small>分类</small><strong>${h(detail.classification || "未分类")} (${h(detail.classification_confidence ?? 0)})</strong></div>
+    <div><small>关联任务</small><strong>${h(detail.related_task_id || "未关联")}</strong></div>
+    <div><small>附件</small><strong>${h((detail.attachments || []).map((item) => item.file_name).join(", ") || "无")}</strong></div>
+  `;
+  $("#mail-detail-body").textContent = detail.body_text || "无正文内容";
+  $("#mail-detail-modal").hidden = false;
+}
+
+function closeMailDetail() {
+  $("#mail-detail-modal").hidden = true;
 }
 
 async function refreshOps() {
@@ -1248,9 +1277,42 @@ const tableRefreshers = {
   reviewRules: async () => renderInitialReviewRules(),
 };
 
+const clearListConfigs = {
+  exceptions: { label: "异常列表", endpoint: "/api/exceptions/clear" },
+  jobs: { label: "入库队列", endpoint: "/api/jobs/clear" },
+  attachments: { label: "附件列表", endpoint: "/api/attachments/clear" },
+  audit: { label: "审计列表", endpoint: "/api/audit-events/clear" },
+  backups: { label: "备份列表", endpoint: "/api/backups/clear" },
+};
+
 async function refreshTable(key) {
   const refresher = tableRefreshers[key];
   if (refresher) await refresher();
+}
+
+async function clearManagedList(key) {
+  const config = clearListConfigs[key];
+  if (!config) return;
+  const adminPassword = window.prompt(`请输入管理员密码确认清空${config.label}。此操作不可恢复。`);
+  if (adminPassword === null) return;
+  if (!adminPassword.trim()) {
+    toast("管理员密码不能为空");
+    return;
+  }
+  const ok = window.confirm(`确认清空${config.label}？`);
+  if (!ok) return;
+  try {
+    const result = await api(config.endpoint, {
+      method: "POST",
+      body: JSON.stringify({ admin_password: adminPassword }),
+    });
+    const state = tableStates[key];
+    if (state) state.page = 1;
+    toast(`已清空 ${result.cleared || 0} 条${config.label}记录`);
+    await refreshTable(key);
+  } catch (error) {
+    notifyError(error, [config.label, "清空失败"]);
+  }
 }
 
 document.querySelectorAll("[data-table-filter]").forEach((form) => {
@@ -1277,6 +1339,12 @@ document.querySelectorAll("[data-table-filter]").forEach((form) => {
       await refreshTable(key);
     });
   }
+});
+
+document.querySelectorAll("[data-clear-list]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    await clearManagedList(button.dataset.clearList);
+  });
 });
 
 document.querySelectorAll("[data-table-pagination]").forEach((pagination) => {
@@ -1686,12 +1754,16 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
   }
   values.bot_enabled = $("#runtime-mail-form [name=bot_enabled]").checked;
   values.llm_fallback_enabled = $("#runtime-mail-form [name=llm_fallback_enabled]").checked;
-  await api("/api/config/mail", {
-    method: "PUT",
-    body: JSON.stringify(values),
-  });
-  toast("邮箱与运行参数已保存");
-  await refreshAll();
+  try {
+    await api("/api/config/mail", {
+      method: "PUT",
+      body: JSON.stringify(values),
+    });
+    toast("邮箱与运行参数已保存");
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["接入配置", "保存失败"]);
+  }
 });
 
 $("#e2e-mail-form").addEventListener("submit", async (event) => {
@@ -1765,17 +1837,26 @@ $("#enqueue-weekly-report").addEventListener("click", async () => {
 });
 
 $("#system-toggle")?.addEventListener("click", async () => {
-  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, false);
   const nextEnabled = !enabled;
-  await api("/api/config/mail", {
-    method: "PUT",
-    body: JSON.stringify({ bot_enabled: nextEnabled }),
-  });
-  runtimeConfigState = { ...runtimeConfigState, bot_enabled: String(nextEnabled) };
-  const runtimeToggle = $("#runtime-mail-form [name=bot_enabled]");
-  if (runtimeToggle) runtimeToggle.checked = nextEnabled;
-  renderSystemToggle();
-  toast(nextEnabled ? "系统已启用" : "系统已停用");
+  if (nextEnabled && startupReadinessState.ready === false) {
+    toast(`系统启动前配置不完整：缺少 ${(startupReadinessState.missing || []).join("、")}`);
+    return;
+  }
+  try {
+    await api("/api/config/mail", {
+      method: "PUT",
+      body: JSON.stringify({ bot_enabled: nextEnabled }),
+    });
+    runtimeConfigState = { ...runtimeConfigState, bot_enabled: String(nextEnabled) };
+    const runtimeToggle = $("#runtime-mail-form [name=bot_enabled]");
+    if (runtimeToggle) runtimeToggle.checked = nextEnabled;
+    await refreshConfig();
+    renderSystemToggle();
+    toast(nextEnabled ? "系统已启用" : "系统已停用");
+  } catch (error) {
+    notifyError(error, ["系统", nextEnabled ? "启动失败" : "停用失败"]);
+  }
 });
 
 $("#outbound-list").addEventListener("click", async (event) => {
@@ -1784,6 +1865,34 @@ $("#outbound-list").addEventListener("click", async (event) => {
   await guardedAction(["外发", "重新入队"], async () => {
     await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
     toast("已重新加入外发队列");
+    await refreshAll();
+  });
+});
+
+$("#cancel-pending-outbound")?.addEventListener("click", async () => {
+  const state = tableStates.outbound;
+  const scopeParts = [
+    state.q ? `关键词：${state.q}` : "",
+    state.status ? `状态：${state.status}` : "状态：Pending",
+    state.mail_type ? `类型：${state.mail_type}` : "",
+    state.recipient ? `收件人：${state.recipient}` : "",
+  ].filter(Boolean);
+  const confirmed = window.confirm(
+    `确认批量取消当前筛选条件下的 Pending 外发任务？\n${scopeParts.join("；") || "全部 Pending 外发任务"}`
+  );
+  if (!confirmed) return;
+  await guardedAction(["外发", "批量取消Pending"], async () => {
+    const result = await api("/api/outbound-mails/cancel-pending", {
+      method: "POST",
+      body: JSON.stringify({
+        q: state.q,
+        status: state.status,
+        mail_type: state.mail_type,
+        recipient: state.recipient,
+        limit: 5000,
+      }),
+    });
+    toast(`已取消 ${result.cancelled || 0} 条 Pending 外发任务`);
     await refreshAll();
   });
 });
@@ -1868,6 +1977,28 @@ $("#task-filter-reset").addEventListener("click", async () => {
   await refreshTasks();
 });
 
+$("#task-list-clear")?.addEventListener("click", async () => {
+  const adminPassword = window.prompt("请输入管理员密码确认清空任务列表。此操作不可恢复。");
+  if (adminPassword === null) return;
+  if (!adminPassword.trim()) {
+    toast("管理员密码不能为空");
+    return;
+  }
+  const ok = window.confirm("确认清空所有任务？该操作会删除任务、任务版本、问答记录和对应需求草稿。");
+  if (!ok) return;
+  try {
+    const result = await api("/api/tasks/clear", {
+      method: "POST",
+      body: JSON.stringify({ admin_password: adminPassword }),
+    });
+    toast(`已清空 ${result.cleared || 0} 条任务`);
+    taskQueryState.page = 1;
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["任务列表", "清空失败"]);
+  }
+});
+
 $("#task-pagination").addEventListener("click", async (event) => {
   const target = event.target.closest("button[data-task-page]");
   if (!target || target.disabled) return;
@@ -1880,6 +2011,20 @@ $("#task-pagination").addEventListener("change", async (event) => {
   taskQueryState.page_size = Number(event.target.value || 10);
   taskQueryState.page = 1;
   await refreshTasks();
+});
+
+$("#mails-list")?.addEventListener("click", async (event) => {
+  const row = event.target.closest("[data-mail-id]");
+  if (!row) return;
+  await guardedAction(["邮件", "详情"], async () => openMailDetail(row.dataset.mailId));
+});
+
+$("#mails-list")?.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const row = event.target.closest("[data-mail-id]");
+  if (!row) return;
+  event.preventDefault();
+  await guardedAction(["邮件", "详情"], async () => openMailDetail(row.dataset.mailId));
 });
 
 $("#tasks").addEventListener("click", async (event) => {
@@ -1927,6 +2072,11 @@ $("#initial-review-rule-modal")?.addEventListener("click", (event) => {
 $("#weekly-preview-close").addEventListener("click", closeWeeklyReportPreview);
 $("#weekly-preview-modal").addEventListener("click", (event) => {
   if (event.target.id === "weekly-preview-modal") closeWeeklyReportPreview();
+});
+
+$("#mail-detail-close")?.addEventListener("click", closeMailDetail);
+$("#mail-detail-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "mail-detail-modal") closeMailDetail();
 });
 
 $("#exceptions-list").addEventListener("click", async (event) => {

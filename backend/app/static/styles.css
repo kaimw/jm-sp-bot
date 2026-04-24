@@ -275,6 +275,14 @@ label {
   background: var(--warn);
 }
 
+.icon-button.danger-action {
+  background: var(--danger);
+}
+
+.icon-button.danger-action:hover {
+  background: #b91c1c;
+}
+
 .system-toggle {
   min-width: 92px;
 }
@@ -372,16 +380,30 @@ label {
 }
 
 .task-filter-bar {
-  grid-template-columns: minmax(260px, 1.8fr) minmax(130px, 0.85fr) repeat(5, minmax(100px, 0.75fr)) 40px 40px;
+  overflow-x: auto;
+}
+
+.task-filter-bar {
+  grid-template-columns: minmax(250px, 1.8fr) minmax(130px, 0.8fr) repeat(5, minmax(108px, 0.75fr)) repeat(3, 38px);
 }
 
 .table-filter-bar {
   grid-template-columns: minmax(260px, 1.7fr) repeat(4, minmax(118px, 0.75fr)) 40px 40px;
 }
 
-.table-filter-bar:has(> :nth-child(4):last-child),
-.table-filter-bar:has(> :nth-child(5):last-child) {
+.clearable-filter-bar {
+  grid-template-columns: minmax(260px, 1.7fr) repeat(3, minmax(118px, 0.75fr)) auto;
+}
+
+.table-filter-bar:not(.clearable-filter-bar):has(> :nth-child(4):last-child),
+.table-filter-bar:not(.clearable-filter-bar):has(> :nth-child(5):last-child) {
   grid-template-columns: minmax(260px, 1.7fr) repeat(2, minmax(128px, 0.75fr)) 40px 40px;
+}
+
+.filter-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .task-filter-bar input,
@@ -493,7 +515,67 @@ textarea:focus {
 }
 
 .rule-list {
+  display: grid;
+  gap: 8px;
   margin-top: 16px;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+}
+
+.review-rule-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.25fr) minmax(190px, 0.95fr) minmax(130px, 0.65fr) minmax(260px, 1.4fr) minmax(150px, auto);
+  gap: 12px;
+  align-items: center;
+  min-height: 78px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.review-rule-row:hover {
+  border-color: rgba(20, 126, 113, 0.25);
+  background: #fbfcfd;
+}
+
+.review-rule-main,
+.review-rule-field,
+.review-rule-value,
+.review-rule-message {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.review-rule-main {
+  align-content: center;
+}
+
+.review-rule-field span,
+.review-rule-value span,
+.review-rule-message span {
+  overflow-wrap: anywhere;
+}
+
+.review-rule-row small {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.review-rule-message span {
+  display: -webkit-box;
+  overflow: hidden;
+  line-height: 1.45;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.review-rule-actions {
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  margin-top: 0;
 }
 
 .list {
@@ -513,6 +595,15 @@ textarea:focus {
   min-height: 72px;
   padding: 15px 16px;
   background: var(--surface);
+}
+
+.task-row {
+  grid-template-columns: minmax(300px, 1.45fr) minmax(230px, 1.05fr) minmax(90px, 0.45fr) minmax(170px, 0.7fr) minmax(220px, auto);
+}
+
+.task-row .actions {
+  justify-content: flex-end;
+  flex-wrap: nowrap;
 }
 
 .row strong {
@@ -540,6 +631,10 @@ textarea:focus {
   color: var(--warn);
 }
 
+.status-cancelled {
+  color: var(--muted);
+}
+
 .status-running,
 .status-muted {
   color: var(--muted);
@@ -556,6 +651,8 @@ textarea:focus {
 .status-pill {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  width: fit-content;
   min-height: 30px;
   padding: 0 10px;
   border: 1px solid var(--border);
@@ -564,6 +661,17 @@ textarea:focus {
   background: #f8fafc;
   font-size: 12px;
   font-weight: 600;
+}
+
+.status-pill.is-active {
+  border-color: rgba(20, 126, 113, 0.28);
+  color: var(--accent);
+  background: rgba(20, 126, 113, 0.08);
+}
+
+.status-pill.is-muted {
+  color: var(--muted);
+  background: var(--surface-soft);
 }
 
 .pagination {
@@ -655,6 +763,59 @@ textarea:focus {
 .modal-head small {
   color: var(--muted);
   font-weight: 700;
+}
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover,
+.clickable-row:focus-visible {
+  border-color: rgba(20, 126, 113, 0.42);
+  background: rgba(20, 126, 113, 0.06);
+  outline: none;
+}
+
+.mail-detail-panel {
+  width: min(880px, 100%);
+}
+
+.mail-detail-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mail-detail-fields > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.mail-detail-fields small {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.mail-detail-fields strong {
+  overflow-wrap: anywhere;
+}
+
+.mail-detail-body {
+  max-height: min(420px, 45vh);
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f172a;
+  color: #f8fafc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .icon-button {
@@ -1141,7 +1302,10 @@ textarea:focus {
     grid-template-columns: repeat(3, minmax(150px, 1fr));
   }
 
-  .task-filter-bar,
+  .task-filter-bar {
+    grid-template-columns: minmax(250px, 1.8fr) minmax(130px, 0.8fr) repeat(5, minmax(108px, 0.75fr)) repeat(3, 38px);
+  }
+
   .table-filter-bar {
     grid-template-columns: minmax(240px, 1.5fr) repeat(3, minmax(110px, 1fr)) 40px 40px;
   }
@@ -1150,12 +1314,22 @@ textarea:focus {
     grid-template-columns: minmax(220px, 1.3fr) minmax(150px, 0.9fr) minmax(120px, 0.7fr);
   }
 
+  .task-row {
+    grid-template-columns: minmax(260px, 1.4fr) minmax(190px, 1fr) minmax(90px, 0.45fr) minmax(155px, 0.7fr) minmax(210px, auto);
+    overflow-x: auto;
+  }
+
   .workflow-required-grid {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
 
   .workflow-review-rule-item {
     grid-template-columns: 1fr;
+  }
+
+  .review-rule-row {
+    grid-template-columns: minmax(200px, 1.2fr) minmax(170px, 0.9fr) minmax(120px, 0.6fr) minmax(220px, 1.1fr) minmax(140px, auto);
+    overflow-x: auto;
   }
 
   .workflow-review-rule-item .row-actions {
@@ -1227,6 +1401,15 @@ textarea:focus {
   .pagination {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .review-rule-row {
+    grid-template-columns: 1fr;
+  }
+
+  .review-rule-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .chat-message {
