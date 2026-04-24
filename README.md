@@ -9,7 +9,7 @@ python3 -m pip install -e ".[test]"
 ```
 
 ```bash
-python3 -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+python3 -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 打开：

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import io
 import zipfile
+from contextlib import nullcontext
 from datetime import timedelta
 from email.message import EmailMessage
 
+import httpx
 import pytest
 from docx import Document
 from openpyxl import Workbook
@@ -25,7 +27,10 @@ from backend.app.models import (
     ProductionTask,
     ProductionTaskVersion,
     QuestionAndReply,
+    RequirementWorkflowBinding,
     SystemConfig,
+    WorkflowImportJob,
+    WorkflowVersion,
 )
 from backend.app.services.attachment_parser import parse_attachment
 from backend.app.services.auth import create_session_token, parse_session_token
@@ -38,10 +43,13 @@ from backend.app.services.mail_adapter import (
     send_pending_auto_workflow_mails_smtp,
     send_pending_receipt_acks_smtp,
     send_pending_smtp,
+    sync_imap_mailbox,
     store_incoming_email,
 )
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds, reset_mail_login_throttle
-from backend.app.services.model_provider import build_openai_chat_payload, extract_chat_content, resolve_api_key
+from backend.app.services.mail_worker import run_mail_auto_worker_once
+from backend.app.services.initial_review import initial_review_config, remember_deleted_workflow_review_rules
+from backend.app.services.model_provider import build_openai_chat_payload, call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, execute_cleanup, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
 from backend.app.services.workflow import (
@@ -50,11 +58,23 @@ from backend.app.services.workflow import (
     create_inbound_mail,
     create_task_from_mail,
     enqueue_weekly_report,
+    force_close_task_manual,
     record_exception_case,
     record_production_feedback,
+    record_production_question,
     retry_outbound_mail,
     set_weekly_report_recipients,
     weekly_report_recipients,
+)
+from backend.app.services.workflow_rules import (
+    deactivate_workflow_version,
+    delete_workflow_version,
+    chat_generate_workflow_rule,
+    import_structured_workflow_rules,
+    import_workflow_document,
+    list_workflow_rules,
+    match_workflow_for_mail,
+    save_workflow_version_rules,
 )
 from backend.app.models import now_utc
 
@@ -106,6 +126,7 @@ def test_seed_defaults_omit_plaintext_secrets():
     assert session.get(SystemConfig, "bot_email").value == "bot.market@jimuyida.com"
     assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "60"
     assert session.get(SystemConfig, "mail_rate_limit_interval_seconds").value == "60"
+    assert session.get(SystemConfig, "bot_enabled").value == "true"
     model = session.query(ModelProviderConfig).one()
     assert model.title == "Dify deepseekV3"
     assert model.credential_ref == "env:MODEL_API_KEY"
@@ -392,6 +413,75 @@ def test_conversation_closes_when_max_rounds_reached():
     assert case.related_task_id == task.id
 
 
+def test_workflow_conversation_policy_overrides_global_max_rounds():
+    session = make_session()
+    configure_department(session)
+    set_config(session, "conversation_max_rounds", "3")
+    set_config(session, "workflow_contact_map_json", dumps({"张燕": "production@jimuyida.com"}), is_secret=False)
+    import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_name": "轮次限制流程",
+                "routing": {"to_names": ["张燕"], "cc_names": []},
+                "match": {"any_keywords": ["轮次限制流程", "轮次限制"], "order_type": "normal_sales"},
+                "subject_template": "[轮次限制][{{task_no}}]",
+                "body_template": "流程类型：轮次限制流程",
+                "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                "required_attachments": [],
+                "review_rules": [],
+                "conversation_policy": {
+                    "max_question_rounds": 1,
+                    "on_exceeded": "close_task",
+                    "message": "本流程最多允许1轮询问答疑，已达到上限。",
+                },
+            }
+        ],
+        actor="tester",
+        auto_publish=True,
+        source_asset_ref="workflow-policy-test",
+    )
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 轮次限制流程",
+        body_text="\n".join(
+            [
+                "客户名称：轮次客户",
+                "产品：轮次产品",
+                "数量：10台",
+                "期望交期：2026-10-20",
+                "订单号：SO-WF-MAX-ROUND",
+            ]
+        ),
+    )
+    task = create_task_from_mail(session, mail)
+    assert task is not None
+    approve_task(session, task.id, actor="tester")
+    session.add(
+        QuestionAndReply(
+            task_id=task.id,
+            question_text="第一轮疑问",
+            reply_text="第一轮答复",
+            status="Answered",
+        )
+    )
+    production_mail = create_inbound_mail(
+        session,
+        from_address="production@jimuyida.com",
+        subject=f"Re: [轮次限制][{task.task_no}]",
+        body_text="请再确认包装方式？",
+    )
+    session.commit()
+
+    close_job = record_production_question(session, task.id, production_mail.body_text, source_mail=production_mail)
+    session.commit()
+
+    assert close_job.mail_type == "ConversationClosedMaxRounds"
+    assert task.status == "Closed"
+    assert "本流程最多允许1轮询问答疑" in close_job.body
+
+
 def make_docx_bytes(text: str) -> bytes:
     document = Document()
     document.add_paragraph(text)
@@ -515,6 +605,57 @@ def test_model_provider_extracts_chat_content():
     output = {"choices": [{"message": {"content": "配置可用"}}]}
     assert extract_chat_content(output) == "配置可用"
     assert extract_chat_content({"choices": []}) == ""
+
+
+def test_model_provider_streaming_collects_sse_chunks(monkeypatch):
+    session = make_session()
+    model = session.query(ModelProviderConfig).one()
+    set_config(session, "model_api_key", "runtime-secret", is_secret=True)
+    model.credential_ref = "config:model_api_key"
+    session.commit()
+
+    class FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"流程"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"导入"}}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.timeout = kwargs.get("timeout")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, *, headers=None, json=None):
+            assert method == "POST"
+            assert url.endswith("/chat/completions")
+            assert json is not None and json.get("stream") is True
+            return FakeStreamResponse()
+
+    monkeypatch.setattr("backend.app.services.model_provider.httpx.Client", FakeClient)
+
+    output = call_model(
+        session,
+        model,
+        task_type="WorkflowImportParse",
+        messages=[{"role": "user", "content": "ping"}],
+        stream=True,
+    )
+
+    assert extract_chat_content(output) == "流程导入"
 
 
 def test_llm_fallback_can_classify_and_extract_natural_sales_order(monkeypatch):
@@ -718,6 +859,60 @@ def test_production_question_sales_reply_reissue_flow(monkeypatch):
     assert "已更新生产任务单并成功重新发送给生产部" in sales_receipt.body
 
 
+def test_sales_reply_after_conversation_closed_is_rejected_without_reissue():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-CLOSED-REPLY-001")
+    task.status = "Closed"
+    task.closed_reason = "ConversationMaxRounds"
+    task.requirement.status = "Closed"
+    task.current_version_no = 1
+    session.commit()
+
+    reply = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject=f"答复生产疑问 - {task.task_no}",
+        body_text="答复如下：产品：关闭后不应重发",
+    )
+    result = process_mail_direct(session, reply)
+    session.commit()
+
+    reject = session.query(OutboundMailJob).filter_by(mail_type="ClosedTaskReplyRejected", related_task_id=task.id).one()
+    assert result == reject
+    assert task.status == "Closed"
+    assert task.current_version_no == 1
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReplyTaskReissue", related_task_id=task.id).count() == 0
+    assert "已关闭" in reject.body
+
+
+def test_sales_reply_without_open_question_does_not_reissue_task():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-NO-OPEN-QUESTION")
+    task.status = "TaskIssued"
+    task.current_version_no = 1
+    session.commit()
+
+    reply = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject=f"答复生产疑问 - {task.task_no}",
+        body_text="答复如下：产品：没有待答复疑问时不应重发",
+    )
+    result = process_mail_direct(session, reply)
+    session.commit()
+
+    notice = session.query(OutboundMailJob).filter_by(mail_type="SalesReplyNoOpenQuestion", related_task_id=task.id).one()
+    case = session.query(ExceptionCase).filter_by(exception_type="SalesReplyWithoutOpenQuestion", related_task_id=task.id).one()
+    assert result == notice
+    assert case.related_task_id == task.id
+    assert task.status == "TaskIssued"
+    assert task.current_version_no == 1
+    assert session.query(ProductionTaskVersion).filter_by(task_id=task.id, version_no=2).count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReplyTaskReissue", related_task_id=task.id).count() == 0
+
+
 def test_exception_patch_can_recover_missing_fields_to_task_draft():
     session = make_session()
     configure_department(session)
@@ -886,6 +1081,51 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     session.commit()
 
     assert retried.status == "Pending"
+
+
+def test_smtp_send_skips_when_bot_disabled():
+    session = make_session()
+    set_config(session, "bot_enabled", "false", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    pending = OutboundMailJob(
+        mail_type="Manual",
+        to_json=dumps(["sales@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="BOT DISABLED",
+        body="hello",
+        idempotency_key="smtp-bot-disabled",
+        status="Pending",
+    )
+    session.add(pending)
+    session.commit()
+
+    result = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    assert result == {"sent": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"}
+    assert pending.status == "Pending"
+
+
+def test_sync_imap_mailbox_skips_when_bot_disabled():
+    session = make_session()
+    set_config(session, "bot_enabled", "false", is_secret=False)
+    result = sync_imap_mailbox(session, limit=10)
+    assert result == {"imported": 0, "queued": 0, "skipped": "bot is disabled"}
+
+
+def test_mail_auto_worker_skips_when_bot_disabled(monkeypatch):
+    session = make_session()
+    set_config(session, "bot_enabled", "false", is_secret=False)
+    session.add(ProcessingJob(job_type="process_inbound_mail", payload_json=dumps({"mail_id": "demo"}), status="Pending"))
+    session.commit()
+
+    monkeypatch.setattr("backend.app.services.mail_worker.SessionLocal", lambda: nullcontext(session))
+    result = run_mail_auto_worker_once()
+
+    assert result["enabled"] is False
+    assert result["synced"]["skipped"] == "bot is disabled"
+    assert result["processed"]["skipped"] == "bot is disabled"
+    assert session.query(ProcessingJob).filter_by(status="Pending").count() == 1
 
 
 def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
@@ -1341,6 +1581,88 @@ def test_custom_initial_review_rule_rejects_sales_order():
     assert session.query(ProductionTaskVersion).count() == 0
 
 
+def test_initial_review_config_includes_readonly_builtin_rules():
+    session = make_session()
+    set_config(
+        session,
+        "initial_review_rules_json",
+        dumps(
+            [
+                {
+                    "id": "custom-rule",
+                    "name": "自定义规则",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": "采购订单",
+                    "message": "缺少采购订单",
+                    "enabled": True,
+                }
+            ]
+        ),
+    )
+    session.commit()
+
+    config = initial_review_config(session)
+    rules = config["rules"]
+
+    assert [rule["id"] for rule in rules[:3]] == [
+        "builtin-required-core-fields",
+        "builtin-parser-risk-flags",
+        "builtin-duplicate-submission",
+    ]
+    assert all(rule["read_only"] is True and rule["is_builtin"] is True for rule in rules[:3])
+    assert rules[-1]["id"] == "custom-rule"
+
+
+def test_initial_review_config_removes_duplicate_custom_rules():
+    session = make_session()
+    set_config(
+        session,
+        "initial_review_rules_json",
+        dumps(
+            [
+                {
+                    "id": "rule-1",
+                    "name": "采购订单校验",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": "采购订单",
+                    "message": "缺少采购订单",
+                    "enabled": True,
+                },
+                {
+                    "id": "rule-2",
+                    "name": "重复采购订单校验",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": " 采购 订单 ",
+                    "message": "重复项应被清理",
+                    "enabled": False,
+                },
+                {
+                    "id": "rule-3",
+                    "name": "特批编码校验",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": "特批编码",
+                    "message": "缺少特批编码",
+                    "enabled": True,
+                },
+            ]
+        ),
+        is_secret=False,
+    )
+    session.commit()
+
+    config = initial_review_config(session, include_workflow_rules=True)
+    session.commit()
+
+    custom_rules = [rule for rule in config["rules"] if not rule.get("is_builtin")]
+    assert [rule["id"] for rule in custom_rules] == ["rule-1", "rule-3"]
+    persisted_rules = loads(session.get(SystemConfig, "initial_review_rules_json").value, [])
+    assert [rule["id"] for rule in persisted_rules] == ["rule-1", "rule-3"]
+
+
 def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeypatch):
     session = make_session()
     set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
@@ -1545,6 +1867,66 @@ def test_order_change_and_cancel_are_routed_to_correct_flow():
     assert session.query(ExceptionCase).filter_by(exception_type="OrderCancelManualReview").count() == 0
 
 
+def test_manual_force_close_task_sends_sales_and_production_notice():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-MANUAL-CLOSE-001")
+    jobs = force_close_task_manual(session, task.id, reason="商务人工终止", actor="tester")
+    session.commit()
+
+    sales_notice = session.query(OutboundMailJob).filter_by(mail_type="TaskManualClosedSales", related_task_id=task.id).one()
+    production_notice = session.query(OutboundMailJob).filter_by(mail_type="TaskManualClosedProduction", related_task_id=task.id).one()
+
+    assert len(jobs) == 2
+    assert task.status == "Closed"
+    assert task.closed_reason == "ManualForceClosed"
+    assert task.manual_takeover is True
+    assert task.requirement.status == "Closed"
+    assert as_list(sales_notice.to_json) == ["sales@jimuyida.com"]
+    assert as_list(production_notice.to_json) == ["production@jimuyida.com"]
+    assert "商务人工终止" in sales_notice.body
+    assert "商务人工终止" in production_notice.body
+
+
+def test_manual_force_close_closed_task_raises():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-MANUAL-CLOSE-002")
+    record_production_feedback(session, task.id, "confirmed", "已确认排产")
+    session.commit()
+
+    with pytest.raises(ValueError, match="already closed"):
+        force_close_task_manual(session, task.id, reason="再次关闭", actor="tester")
+
+
+def test_production_termination_uses_dedicated_notice_types():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="SO-PRODUCTION-TERMINATE")
+    session.commit()
+
+    terminate_mail = create_inbound_mail(
+        session,
+        from_address="production@jimuyida.com",
+        subject=f"终止生产 - {task.task_no}",
+        body_text=f"生产侧终止生产，请停止该任务 {task.task_no}。",
+    )
+    result = process_mail_direct(session, terminate_mail)
+    session.commit()
+
+    sales_notice = session.query(OutboundMailJob).filter_by(mail_type="ProductionTerminateSalesNotice", related_task_id=task.id).one()
+    production_notice = session.query(OutboundMailJob).filter_by(mail_type="ProductionTerminateProductionNotice", related_task_id=task.id).one()
+    assert result == [sales_notice, production_notice]
+    assert terminate_mail.classification == "ProductionTerminateRequest"
+    assert task.status == "Closed"
+    assert task.closed_reason == "ProductionTerminated"
+    assert as_list(sales_notice.to_json) == ["sales@jimuyida.com"]
+    assert as_list(production_notice.to_json) == ["production@jimuyida.com"]
+    assert "生产侧已终止" in sales_notice.body
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesDemandWithdrawn", related_task_id=task.id).count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="ProductionDemandWithdrawn", related_task_id=task.id).count() == 0
+
+
 def test_duplicate_sales_requirement_within_24h_sends_no_repeat_notice():
     session = make_session()
     configure_department(session)
@@ -1645,3 +2027,1378 @@ def test_cleanup_preview_execute_and_weekly_csv():
     assert session.get(MailMessage, mail.id) is None
     assert "section,period,product,salesperson" in csv_text
     assert "任务统计" in csv_text
+
+
+def test_workflow_import_creates_published_versions():
+    session = make_session()
+    result = import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    assert result["validation_errors"] == []
+    assert len(result["created_versions"]) >= 5
+    assert session.query(WorkflowImportJob).count() == 1
+    assert session.query(WorkflowVersion).filter_by(status="Active").count() >= 5
+
+
+def test_workflow_import_accepts_uploaded_text_content():
+    session = make_session()
+    raw_text = """
+流程一: 上传流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[上传][{{task_no}}]
+邮件内容模板：
+流程类型：上传流程
+附件：采购订单
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=None,
+        file_name="workflow-rules.txt",
+        file_content=raw_text.encode("utf-8"),
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    assert result["validation_errors"] == []
+    assert result["file_name"] == "workflow-rules.txt"
+    assert result["source_asset_ref"] == "uploaded:workflow-rules.txt"
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    assert version is not None
+    assert loads(version.compiled_rules_json, {})["workflow_name"] == "上传流程"
+
+
+def test_workflow_import_same_doc_is_idempotent_on_versions():
+    session = make_session()
+    first = import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    before_versions = session.query(WorkflowVersion).count()
+    second = import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    after_versions = session.query(WorkflowVersion).count()
+
+    assert len(first["created_versions"]) >= 5
+    assert second["validation_errors"] == []
+    assert len(second["created_versions"]) == 0
+    assert before_versions == after_versions
+
+
+def test_workflow_list_includes_builtin_default_order_flow():
+    session = make_session()
+    configure_department(session)
+
+    rows = list_workflow_rules(session, only_active=False)
+    builtin = next((row for row in rows if row.get("is_builtin")), None)
+
+    assert builtin is not None
+    assert builtin["workflow_code"] == "builtin_default_order_flow"
+    assert builtin["status"] == "BuiltIn"
+    assert builtin["editable"] is False
+    assert "production@jimuyida.com" in (builtin["rules"].get("routing", {}).get("to_names") or [])
+    assert builtin["rules"]["subject_template"]
+    assert builtin["rules"]["body_template"]
+
+
+def test_workflow_import_falls_back_when_llm_timeout(monkeypatch):
+    session = make_session()
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+
+    def raise_timeout(*args, **kwargs):
+        raise httpx.ReadTimeout("timed out")
+
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", raise_timeout)
+    monkeypatch.setattr("backend.app.services.workflow_rules.resolve_api_key", lambda *args, **kwargs: "mock-key")
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=True,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    assert result["validation_errors"] == []
+    assert result["llm_used"] is False
+    assert len(result["created_versions"]) == 1
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    assert version is not None
+    rules = loads(version.compiled_rules_json, {})
+    assert rules["workflow_name"] == "常规销售流程"
+    assert rules["routing"]["to_names"] == ["张燕"]
+
+
+def test_workflow_import_backfills_task_template_variables_when_missing():
+    session = make_session()
+    raw_text = """
+流程一: 静态模板流程
+邮件收件人：张燕
+邮件主题：静态主题
+邮件内容模板：
+张主管，你好！
+现有销售订单需要备货出货。
+物料详情描述：【含物料编码、物料名称、规格型号、数量】
+附件：采购订单
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    rules = loads(version.compiled_rules_json, {})
+    assert "{{task_no}}" in rules["subject_template"]
+    assert "{{customer_name}}" in rules["subject_template"]
+    for token in [
+        "{{task_no}}",
+        "{{version_no}}",
+        "{{customer_name}}",
+        "{{product_summary}}",
+        "{{quantity_text}}",
+        "{{expected_delivery_date}}",
+        "{{workflow_name}}",
+    ]:
+        assert token in rules["body_template"]
+    assert "原流程邮件模板" in rules["body_template"]
+    assert "张主管，你好" in rules["body_template"]
+
+
+def test_workflow_chat_generate_returns_normalized_rule(monkeypatch):
+    session = make_session()
+
+    def fake_call_model(*args, **kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": dumps(
+                            {
+                                "assistant_reply": "流程信息齐全，已生成草稿。",
+                                "ready": True,
+                                "workflow_rule": {
+                                    "workflow_name": "样机赠送流程",
+                                    "match": {
+                                        "any_keywords": ["样机赠送", "赠送"],
+                                        "warehouse": "wuhan",
+                                        "order_type": "sample_gift",
+                                    },
+                                    "routing": {"to_names": ["洪丹"], "cc_names": ["销售直属领导"]},
+                                    "subject_template": "[样机赠送][{{task_no}}]",
+                                    "body_template": "流程类型：样机赠送",
+                                    "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                                    "required_attachments": ["审批截图"],
+                                    "review_rules": [
+                                        {
+                                            "id": "gift-approval",
+                                            "name": "审批截图校验",
+                                            "field": "source_text",
+                                            "operator": "contains",
+                                            "value": "审批截图",
+                                            "message": "缺少审批截图说明",
+                                            "enabled": True,
+                                        }
+                                    ],
+                                },
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.app.services.workflow_rules._active_model", lambda _session: object())
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", fake_call_model)
+
+    result = chat_generate_workflow_rule(
+        session,
+        messages=[{"role": "user", "content": "新增样机赠送流程，收件人洪丹。"}],
+        current_rule=None,
+    )
+
+    assert result["ready"] is True
+    assert result["validation_errors"] == []
+    assert result["reply"] == "流程信息齐全，已生成草稿。"
+    assert "自动生成该流程对应规则" in result["notification"]
+    assert result["compiled_rule"]["workflow_name"] == "样机赠送流程"
+    assert result["compiled_rule"]["routing"]["to_names"] == ["洪丹"]
+    assert len(result["compiled_rule"]["review_rules"]) == 1
+
+
+def test_workflow_chat_generate_guides_user_when_definition_incomplete(monkeypatch):
+    session = make_session()
+
+    def fake_call_model(*args, **kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": dumps(
+                            {
+                                "assistant_reply": "先记录到流程草稿。",
+                                "ready": True,
+                                "workflow_rule": {
+                                    "workflow_name": "新流程",
+                                    "routing": {"to_names": [], "cc_names": []},
+                                    "match": {"any_keywords": ["流程"], "order_type": "normal_sales"},
+                                    "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                                },
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.app.services.workflow_rules._active_model", lambda _session: object())
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", fake_call_model)
+
+    result = chat_generate_workflow_rule(
+        session,
+        messages=[{"role": "user", "content": "先建一个新流程"}],
+        current_rule=None,
+    )
+
+    assert result["ready"] is False
+    assert result["compiled_rule"] is not None
+    assert "主送给谁" in result["next_question"]
+    assert result["pending_questions"]
+    assert result["notification"] == ""
+
+
+def test_workflow_chat_generate_backfills_name_from_user_turn_when_rule_missing(monkeypatch):
+    session = make_session()
+
+    def fake_call_model(*args, **kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": dumps(
+                            {
+                                "assistant_reply": "流程名称已确认。",
+                                "ready": False,
+                                "workflow_rule": None,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.app.services.workflow_rules._active_model", lambda _session: object())
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", fake_call_model)
+
+    result = chat_generate_workflow_rule(
+        session,
+        messages=[
+            {"role": "assistant", "content": "请先告诉我这个新流程的名称。"},
+            {"role": "user", "content": "新流程的名称就是“测试流程”"},
+        ],
+        current_rule=None,
+    )
+
+    assert result["ready"] is False
+    assert result["compiled_rule"] is not None
+    assert result["compiled_rule"]["workflow_name"] == "测试流程"
+    assert result["next_question"].startswith("该流程邮件主送给谁")
+    assert result["pending_questions"]
+    assert "名称" not in result["pending_questions"][0]
+
+
+def test_workflow_chat_generate_detects_existing_flow_for_edit(monkeypatch):
+    session = make_session()
+    import_result = import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "transfer_flow",
+                "workflow_name": "新机调拨流程",
+                "routing": {"to_names": ["张燕"], "cc_names": ["销售直属领导"]},
+                "match": {"any_keywords": ["新机调拨"], "order_type": "transfer"},
+                "subject_template": "[新机调拨][{{task_no}}]",
+                "body_template": "流程类型：新机调拨",
+                "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                "required_attachments": [],
+                "review_rules": [],
+            }
+        ],
+        actor="tester",
+        auto_publish=False,
+        source_asset_ref="workflow-chat",
+    )
+    session.commit()
+    version_id = import_result["created_versions"][0]["id"]
+
+    def fake_call_model(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        assert any("当前任务是编辑已有流程" in item.get("content", "") for item in messages)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": dumps(
+                            {
+                                "assistant_reply": "已在原流程上增加必填字段。",
+                                "ready": True,
+                                "workflow_rule": {
+                                    "workflow_name": "新增的错误流程名",
+                                    "required_fields": [
+                                        "customer_name",
+                                        "product_summary",
+                                        "quantity_text",
+                                        "expected_delivery_date",
+                                        "initiator",
+                                        "expected_time",
+                                    ],
+                                },
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.app.services.workflow_rules._active_model", lambda _session: object())
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", fake_call_model)
+
+    result = chat_generate_workflow_rule(
+        session,
+        messages=[{"role": "user", "content": "我要重新编辑 新机调拨流程，增加必填字段包括发起人和期望时间"}],
+        current_rule=None,
+    )
+
+    assert result["edit_version_id"] == version_id
+    assert result["edit_workflow_name"] == "新机调拨流程"
+    assert result["compiled_rule"]["workflow_code"] == "transfer_flow"
+    assert result["compiled_rule"]["workflow_name"] == "新机调拨流程"
+    assert "initiator" in result["compiled_rule"]["required_fields"]
+
+
+def test_import_structured_workflow_rules_creates_draft_version():
+    session = make_session()
+    result = import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_name": "对话生成流程",
+                "routing": {"to_names": ["张燕"], "cc_names": ["销售直属领导"]},
+                "match": {"any_keywords": ["对话流程"], "order_type": "normal_sales"},
+                "subject_template": "[对话流程][{{task_no}}]",
+                "body_template": "流程类型：对话流程",
+                "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                "required_attachments": ["采购订单"],
+                "review_rules": [
+                    {
+                        "id": "chat-rule-1",
+                        "name": "采购订单校验",
+                        "field": "source_text",
+                        "operator": "contains",
+                        "value": "采购订单",
+                        "message": "缺少采购订单信息",
+                        "enabled": True,
+                    }
+                ],
+            }
+        ],
+        actor="tester",
+        auto_publish=False,
+        source_asset_ref="workflow-chat",
+    )
+    session.commit()
+
+    assert result["validation_errors"] == []
+    assert len(result["created_versions"]) == 1
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    assert version is not None
+    assert version.status == "Draft"
+    assert version.source_asset_ref == "workflow-chat"
+
+
+def test_save_workflow_version_rules_can_activate_after_manual_edit():
+    session = make_session()
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    draft_id = result["created_versions"][0]["id"]
+    draft = session.get(WorkflowVersion, draft_id)
+    assert draft is not None
+    assert draft.status == "Draft"
+    rules = loads(draft.compiled_rules_json, {})
+    rules["review_rules"] = [
+        {
+            "id": "manual-review-1",
+            "name": "特批编码校验",
+            "field": "source_text",
+            "operator": "contains",
+            "value": "特批编码",
+            "message": "邮件缺少特批编码信息",
+            "enabled": True,
+        }
+    ]
+    rules["routing"] = {"to_names": ["洪丹"], "cc_names": ["销售直属领导", "商务负责人"]}
+
+    saved = save_workflow_version_rules(
+        session,
+        draft_id,
+        compiled_rules=rules,
+        actor="tester",
+        activate=True,
+    )
+    session.commit()
+
+    assert saved.status == "Active"
+    saved_rules = loads(saved.compiled_rules_json, {})
+    assert len(saved_rules.get("review_rules", [])) == 1
+    assert saved_rules["review_rules"][0]["name"] == "特批编码校验"
+    assert saved_rules["routing"]["to_names"] == ["洪丹"]
+    assert saved_rules["routing"]["cc_names"] == ["销售直属领导", "商务负责人"]
+
+
+def test_edit_active_workflow_requires_deactivate_first():
+    session = make_session()
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    version_id = result["created_versions"][0]["id"]
+    active = session.get(WorkflowVersion, version_id)
+    assert active is not None
+    assert active.status == "Active"
+
+    rules = loads(active.compiled_rules_json, {})
+    rules["subject_template"] = "[更新][{{task_no}}]"
+    with pytest.raises(ValueError, match="deactivated before edit"):
+        save_workflow_version_rules(
+            session,
+            version_id,
+            compiled_rules=rules,
+            actor="tester",
+            activate=False,
+        )
+
+
+def test_workflow_version_can_be_deactivated_then_updated_in_place_and_deleted():
+    session = make_session()
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    version_id = result["created_versions"][0]["id"]
+    archived = deactivate_workflow_version(session, version_id)
+    session.commit()
+    assert archived.status == "Archived"
+
+    rules = loads(archived.compiled_rules_json, {})
+    rules["subject_template"] = "[停用后编辑][{{task_no}}]"
+    draft = save_workflow_version_rules(
+        session,
+        version_id,
+        compiled_rules=rules,
+        actor="tester",
+        activate=False,
+    )
+    session.commit()
+    assert draft.id == version_id
+    assert draft.status == "Draft"
+    assert session.query(WorkflowVersion).count() == 1
+
+    delete_workflow_version(session, version_id)
+    session.commit()
+    assert session.get(WorkflowVersion, version_id) is None
+
+
+def test_delete_active_workflow_requires_deactivate_first():
+    session = make_session()
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    version_id = result["created_versions"][0]["id"]
+    with pytest.raises(ValueError, match="deactivated before delete"):
+        delete_workflow_version(session, version_id)
+
+
+def test_import_workflow_document_rejects_duplicate_workflow_name():
+    session = make_session()
+    first_text = """
+流程一: 新机调拨
+邮件收件人：张燕
+邮件主题：[新机调拨][{{task_no}}]
+邮件内容模板：
+流程类型：新机调拨
+""".strip()
+    second_text = """
+流程一: 新机 调拨
+邮件收件人：张燕
+邮件主题：[新机调拨更新][{{task_no}}]
+邮件内容模板：
+流程类型：新机调拨更新
+""".strip()
+
+    first = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=first_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    second = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=second_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    assert first["created_versions"]
+    assert second["created_versions"] == []
+    assert any("流程已存在" in message for message in second["validation_errors"])
+    assert session.query(WorkflowVersion).count() == 1
+
+
+def test_import_workflow_document_rejects_duplicate_names_in_same_batch():
+    session = make_session()
+    raw_text = """
+流程一: 重复流程
+邮件收件人：张燕
+邮件主题：[重复A][{{task_no}}]
+邮件内容模板：
+流程类型：重复A
+
+流程二: 重复流程
+邮件收件人：洪丹
+邮件主题：[重复B][{{task_no}}]
+邮件内容模板：
+流程类型：重复B
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    assert len(result["created_versions"]) == 1
+    assert any("本次导入的其他流程名称重复" in message for message in result["validation_errors"])
+
+
+def test_workflow_specific_review_rules_block_and_allow_after_fix():
+    session = make_session()
+    set_config(
+        session,
+        "workflow_contact_map_json",
+        dumps(
+            {
+                "张燕": "zhangyan@jimuyida.com",
+                "销售直属领导": "sales.lead@jimuyida.com",
+            }
+        ),
+        is_secret=False,
+    )
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    import_result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    version_id = import_result["created_versions"][0]["id"]
+    active_version = session.get(WorkflowVersion, version_id)
+    assert active_version is not None
+    custom_rules = loads(active_version.compiled_rules_json, {})
+    custom_rules["review_rules"] = [
+        {
+            "id": "special-code",
+            "name": "特批编码校验",
+            "field": "source_text",
+            "operator": "contains",
+            "value": "特批编码",
+            "message": "邮件缺少特批编码信息",
+            "enabled": True,
+        }
+    ]
+    deactivate_workflow_version(session, version_id)
+    save_workflow_version_rules(session, version_id, compiled_rules=custom_rules, actor="tester", activate=True)
+    session.commit()
+
+    blocked = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 常规销售流程",
+        body_text="\n".join(
+            [
+                "客户名称：流程客户A",
+                "产品：产品A",
+                "数量：20台",
+                "期望交期：2026-10-20",
+                "订单号：SO-WF-REVIEW-001",
+                "附件：采购订单",
+            ]
+        ),
+    )
+    blocked_task = create_task_from_mail(session, blocked)
+    session.commit()
+
+    assert blocked_task is None
+    blocked_case = session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").order_by(ExceptionCase.created_at.desc()).first()
+    assert blocked_case is not None
+    blocked_detail = loads(blocked_case.detail, {})
+    assert any("特批编码校验" in str(item.get("rule_name", "")) for item in blocked_detail.get("review_failures", []))
+
+    passed = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 常规销售流程",
+        body_text="\n".join(
+            [
+                "客户名称：流程客户B",
+                "产品：产品B",
+                "数量：22台",
+                "期望交期：2026-10-22",
+                "订单号：SO-WF-REVIEW-002",
+                "附件：采购订单",
+                "特批编码：SP-7788",
+            ]
+        ),
+    )
+    passed_task = create_task_from_mail(session, passed)
+    session.commit()
+
+    assert passed_task is not None
+    assert as_list(passed_task.target_mail_to_json) == ["zhangyan@jimuyida.com"]
+
+
+def test_workflow_match_prefers_llm_selected_flow_when_multiple_active(monkeypatch):
+    session = make_session()
+    raw_text = """
+流程一: 样机借用 下单
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[样机借用][{{task_no}}]
+邮件内容模板：
+流程类型：样机借用
+附件：样机借用审批截图
+
+流程二: 常规销售 下单
+邮件收件人：洪丹
+邮件抄送人：销售直属领导
+邮件主题：[常规销售][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    versions = session.query(WorkflowVersion).filter_by(status="Active").all()
+    code_by_name = {}
+    for version in versions:
+        rule = loads(version.compiled_rules_json, {})
+        code_by_name[str(rule.get("workflow_name"))] = str(rule.get("workflow_code"))
+    sample_code = code_by_name["样机借用 下单"]
+
+    def fake_call_model(*args, **kwargs):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": dumps(
+                            {
+                                "workflow_code": sample_code,
+                                "confidence": 89,
+                                "reason": "邮件提到样机借用审批截图，优先走样机借用流程。",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.app.services.workflow_rules._active_model", lambda _session: object())
+    monkeypatch.setattr("backend.app.services.workflow_rules.call_model", fake_call_model)
+
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 需要样机借用",
+        body_text="客户名称：测试客户\n产品：G100\n数量：10台\n期望交期：2026-08-01\n样机借用审批截图：已上传",
+    )
+    match = match_workflow_for_mail(session, mail, mail.body_text)
+
+    assert match is not None
+    assert match.rule["workflow_code"] == sample_code
+    assert match.confidence == 89
+    assert any("LLM判定" in reason for reason in match.reasons)
+
+
+def test_supplement_reply_uses_full_context_for_workflow_required_fields():
+    session = make_session()
+    set_config(
+        session,
+        "workflow_contact_map_json",
+        dumps(
+            {
+                "张燕": "zhangyan@jimuyida.com",
+                "洪丹": "hongdan@jimuyida.com",
+                "销售直属领导": "sales.lead@jimuyida.com",
+            }
+        ),
+        is_secret=False,
+    )
+    raw_text = """
+流程一: 样机借用 下单
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[样机借用][{{task_no}}]
+邮件内容模板：
+流程类型：样机借用
+附件：样机借用审批截图
+
+流程二: 常规销售 下单
+邮件收件人：洪丹
+邮件抄送人：销售直属领导
+邮件主题：[常规销售][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    original = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 样机借用 下单",
+        body_text="\n".join(
+            [
+                "客户名称：样机客户",
+                "产品：样机机型X",
+                "数量：5台",
+                "订单号：SO-SAMPLE-CTX-001",
+                "样机借用审批截图：已附图",
+            ]
+        ),
+    )
+    task = create_task_from_mail(session, original)
+    session.commit()
+    assert task is None
+
+    reply = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="Re: 订单信息待补充",
+        body_text="期望交期：2026-09-30",
+    )
+    created = process_mail_direct(session, reply)
+    session.commit()
+
+    assert created is not None
+    assert as_list(created.target_mail_to_json) == ["zhangyan@jimuyida.com"]
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=created.requirement_id).one()
+    assert binding.workflow_name == "样机借用 下单"
+    assert "样机借用审批截图" not in as_list(binding.missing_fields_json)
+
+
+def test_workflow_review_rules_are_not_mixed_with_global_initial_review_rules():
+    session = make_session()
+    set_config(
+        session,
+        "initial_review_rules_json",
+        dumps(
+            [
+                {
+                    "id": "global-blocker",
+                    "name": "全局阻断规则",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": "永远不会出现",
+                    "message": "命中全局阻断规则",
+                    "enabled": True,
+                }
+            ]
+        ),
+        is_secret=False,
+    )
+    set_config(
+        session,
+        "workflow_contact_map_json",
+        dumps(
+            {
+                "张燕": "zhangyan@jimuyida.com",
+                "销售直属领导": "sales.lead@jimuyida.com",
+            }
+        ),
+        is_secret=False,
+    )
+    raw_text = """
+流程一: 常规销售流程
+邮件收件人：张燕
+邮件抄送人：销售直属领导
+邮件主题：[常规][{{task_no}}]
+邮件内容模板：
+流程类型：常规销售
+附件：采购订单
+""".strip()
+    import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 常规销售流程",
+        body_text="\n".join(
+            [
+                "客户名称：流程客户",
+                "产品：常规产品A",
+                "数量：30台",
+                "期望交期：2026-10-10",
+                "订单号：SO-WF-NO-GLOBAL-001",
+                "附件：采购订单",
+            ]
+        ),
+    )
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert as_list(task.target_mail_to_json) == ["zhangyan@jimuyida.com"]
+    latest_review_case = (
+        session.query(ExceptionCase)
+        .filter_by(exception_type="ReviewNeedManual")
+        .order_by(ExceptionCase.created_at.desc())
+        .first()
+    )
+    if latest_review_case is not None:
+        detail = loads(latest_review_case.detail, {})
+        assert not any("全局阻断规则" in str(item.get("rule_name", "")) for item in detail.get("review_failures", []))
+
+
+def test_initial_review_config_syncs_workflow_review_rules_as_custom_rules():
+    session = make_session()
+    set_config(
+        session,
+        "workflow_contact_map_json",
+        dumps({"张燕": "zhangyan@jimuyida.com"}),
+        is_secret=False,
+    )
+    import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "custom_review_flow",
+                "workflow_name": "带规则流程",
+                "match": {"any_keywords": ["带规则流程"]},
+                "routing": {"to_names": ["张燕"]},
+                "subject_template": "[带规则][{{task_no}}]",
+                "body_template": "流程类型：{{workflow_name}}",
+                "required_fields": [],
+                "required_attachments": [],
+                "review_rules": [
+                    {
+                        "id": "workflow-special-code",
+                        "name": "特批编码校验",
+                        "field": "source_text",
+                        "operator": "contains",
+                        "value": "特批编码",
+                        "message": "邮件缺少特批编码信息",
+                        "enabled": True,
+                    }
+                ],
+            }
+        ],
+        actor="tester",
+        auto_publish=True,
+    )
+    session.commit()
+
+    display_config = initial_review_config(session, include_workflow_rules=True)
+    execution_config = initial_review_config(session)
+
+    workflow_rule = next(rule for rule in display_config["rules"] if rule.get("name") == "特批编码校验")
+    assert workflow_rule.get("read_only") is not True
+    assert workflow_rule.get("is_builtin") is not True
+    assert workflow_rule["is_workflow_rule"] is True
+    assert workflow_rule["workflow_name"] == "带规则流程"
+    assert workflow_rule["id"].startswith("workflow:")
+    assert any(rule.get("name") == "特批编码校验" for rule in execution_config["rules"])
+
+
+def test_deleted_workflow_review_rule_is_not_restored_by_sync():
+    session = make_session()
+    import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "deletable_review_flow",
+                "workflow_name": "可删除规则流程",
+                "match": {"any_keywords": ["可删除规则流程"]},
+                "routing": {"to_names": ["张燕"]},
+                "subject_template": "[可删除][{{task_no}}]",
+                "body_template": "流程类型：{{workflow_name}}",
+                "required_fields": [],
+                "required_attachments": [],
+                "review_rules": [
+                    {
+                        "id": "deletable-code",
+                        "name": "可删除规则",
+                        "field": "source_text",
+                        "operator": "contains",
+                        "value": "特批编码",
+                        "message": "邮件缺少特批编码信息",
+                        "enabled": True,
+                    }
+                ],
+            }
+        ],
+        actor="tester",
+        auto_publish=True,
+    )
+    session.commit()
+
+    first_config = initial_review_config(session, include_workflow_rules=True)
+    workflow_rule_id = next(rule["id"] for rule in first_config["rules"] if rule.get("name") == "可删除规则")
+    remember_deleted_workflow_review_rules(
+        session,
+        {str(rule.get("id")) for rule in first_config["rules"] if rule.get("id") != workflow_rule_id},
+    )
+    set_config(
+        session,
+        "initial_review_rules_json",
+        dumps([rule for rule in first_config["rules"] if rule.get("id") != workflow_rule_id and not rule.get("is_builtin")]),
+        is_secret=False,
+    )
+    session.commit()
+
+    second_config = initial_review_config(session, include_workflow_rules=True)
+    assert not any(rule.get("id") == workflow_rule_id for rule in second_config["rules"])
+
+
+WORKFLOW_CONTACT_MAP = {
+    "张燕": "zhangyan@jimuyida.com",
+    "单涛": "dantao@jimuyida.com",
+    "丁总": "dingyong@jimuyida.com",
+    "金总": "jinzong@jimuyida.com",
+    "罗总": "luozong@jimuyida.com",
+    "张杏": "zhangxing@jimuyida.com",
+    "洪丹": "hongdan@jimuyida.com",
+    "曾鲜艳": "zengxianyan@jimuyida.com",
+    "余烁": "yushuo@jimuyida.com",
+    "袁辉": "yuanhui@jimuyida.com",
+    "包亚敏": "baoyamin@jimuyida.com",
+    "张洁仪": "zhangjieyi@jimuyida.com",
+    "邢惠玲": "xinghuiling@jimuyida.com",
+    "宋勤红": "songqinhong@jimuyida.com",
+    "蒋文俊": "jiangwenjun@jimuyida.com",
+    "张文鹏": "zhangwenpeng@jimuyida.com",
+    "吴婉真": "wuwanzhen@jimuyida.com",
+    "徐升": "xusheng@jimuyida.com",
+    "销售直属领导": "sales.lead@jimuyida.com",
+}
+
+
+WORKFLOW_CASES = [
+    {
+        "name": "武汉仓出货硬件正常销售订单/样机赠送/电商平台/海外电商、渠道备货",
+        "subject": "生产订单需求 - 武汉仓出货硬件正常销售订单",
+        "expected_to": "zhangyan@jimuyida.com",
+        "missing_label": "物流发货方式",
+        "lines": [
+            "客户名称：流程客户A",
+            "产品：武汉仓标准设备A",
+            "数量：20台",
+            "期望交期：2026-07-01",
+            "订单号：SO-WF-MATRIX-001",
+            "物料详情描述：编码A1，规格标准版，20台",
+            "物流发货方式：顺丰",
+            "出货时间要求：2026-06-28",
+            "客户收件信息：深圳南山区xx路",
+            "交付要求：木箱加固",
+            "附件：深圳积木与湖北积木的采购订单文档、海外渠道销售PI、特殊附作等",
+        ],
+    },
+    {
+        "name": "武汉仓出货硬件独立站补单/假期订单补单",
+        "subject": "生产订单需求 - 武汉仓出货硬件独立站补单",
+        "expected_to": "zhangyan@jimuyida.com",
+        "missing_label": "物料详情描述",
+        "lines": [
+            "客户名称：流程客户B",
+            "产品：独立站补单设备B",
+            "数量：3台",
+            "期望交期：2026-07-02",
+            "订单号：SO-WF-MATRIX-002",
+            "物料详情描述：编码B1，假期补单，3台",
+            "附件：深圳积木与湖北积木的采购订单文档、海外渠道销售PI、特殊附作等",
+        ],
+    },
+    {
+        "name": "武汉仓出货硬件销售样机借用",
+        "subject": "生产订单需求 - 武汉仓出货硬件销售样机借用",
+        "expected_to": "zhangyan@jimuyida.com",
+        "missing_label": "样机借用审批截图",
+        "lines": [
+            "客户名称：流程客户C",
+            "产品：武汉仓样机C",
+            "数量：1台",
+            "期望交期：2026-07-03",
+            "订单号：SO-WF-MATRIX-003",
+            "物料详情描述：编码C1，样机，1台",
+            "借用时间：2026-07-03至2026-07-20",
+            "物流发货方式：顺丰",
+            "出货时间要求：2026-07-03",
+            "客户收件信息：广州天河区xx路",
+            "样机借用审批截图：已上传",
+            "附件：深圳积木与湖北积木的采购订单文档",
+        ],
+    },
+    {
+        "name": "海外仓出货硬件销售订单/样机赠送",
+        "subject": "生产订单需求 - 海外仓出货硬件销售订单",
+        "expected_to": "dantao@jimuyida.com",
+        "missing_label": "出货仓/借货仓",
+        "lines": [
+            "客户名称：流程客户D",
+            "产品：海外仓设备D",
+            "数量：8台",
+            "期望交期：2026-07-04",
+            "订单号：SO-WF-MATRIX-004",
+            "物料详情描述：编码D1，海外仓设备，8台",
+            "物流发货方式：DHL",
+            "出货仓：美国仓",
+            "客户收件信息：海外客户地址",
+            "交付要求：按PI发货",
+            "附件：海外渠道销售PI、特殊附作等",
+        ],
+    },
+    {
+        "name": "海外仓出货硬件销售样机借用",
+        "subject": "生产订单需求 - 海外仓出货硬件销售样机借用",
+        "expected_to": "dantao@jimuyida.com",
+        "missing_label": "归还时间",
+        "lines": [
+            "客户名称：流程客户E",
+            "产品：海外仓样机E",
+            "数量：1台",
+            "期望交期：2026-07-05",
+            "订单号：SO-WF-MATRIX-005",
+            "物料详情描述：编码E1，海外样机，1台",
+            "归还时间：2026-08-05",
+            "出货仓：德国仓",
+            "客户收件信息：海外样机地址",
+            "样机借用审批截图：已上传",
+        ],
+    },
+]
+
+
+def prepare_imported_workflow_session():
+    session = make_session()
+    set_config(session, "workflow_contact_map_json", dumps(WORKFLOW_CONTACT_MAP), is_secret=False)
+    import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    return session
+
+
+@pytest.mark.parametrize("case", WORKFLOW_CASES, ids=[item["name"] for item in WORKFLOW_CASES])
+def test_imported_business_workflow_cases_pass_initial_review_and_route(case):
+    session = prepare_imported_workflow_session()
+    mail = create_inbound_mail(
+        session,
+        from_address="bot.sales@jimuyida.com",
+        subject=case["subject"],
+        body_text="\n".join(case["lines"]),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert as_list(task.target_mail_to_json)[0] == case["expected_to"]
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one()
+    assert binding.workflow_name == case["name"]
+    assert as_list(binding.missing_fields_json) == []
+
+
+@pytest.mark.parametrize("case", WORKFLOW_CASES, ids=[item["name"] for item in WORKFLOW_CASES])
+def test_imported_business_workflow_cases_fail_initial_review_when_required_field_missing(case):
+    session = prepare_imported_workflow_session()
+    missing_label = case["missing_label"]
+    lines = [line for line in case["lines"] if not line.startswith(f"{missing_label.split('/')[0]}：")]
+    mail = create_inbound_mail(
+        session,
+        from_address="bot.sales@jimuyida.com",
+        subject=f"{case['subject']} - 缺字段",
+        body_text="\n".join(lines),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is None
+    case_row = (
+        session.query(ExceptionCase)
+        .filter_by(exception_type="ReviewNeedManual")
+        .order_by(ExceptionCase.created_at.desc())
+        .first()
+    )
+    assert case_row is not None
+    detail = loads(case_row.detail, {})
+    assert any(missing_label in item.get("message", "") for item in detail.get("review_failures", []))
+
+
+def test_imported_workflow_routes_task_after_contact_mapping():
+    session = make_session()
+    set_config(
+        session,
+        "workflow_contact_map_json",
+        dumps(
+            {
+                "张燕": "zhangyan@jimuyida.com",
+                "丁总": "dingyong@jimuyida.com",
+                "金总": "jinzong@jimuyida.com",
+                "罗总": "luozong@jimuyida.com",
+                "张杏": "zhangxing@jimuyida.com",
+                "洪丹": "hongdan@jimuyida.com",
+                "曾鲜艳": "zengxianyan@jimuyida.com",
+                "余烁": "yushuo@jimuyida.com",
+                "单涛": "dantao@jimuyida.com",
+                "袁辉": "yuanhui@jimuyida.com",
+                "包亚敏": "baoyamin@jimuyida.com",
+                "张洁仪": "zhangjieyi@jimuyida.com",
+                "邢惠玲": "xinghuiling@jimuyida.com",
+                "宋勤红": "songqinhong@jimuyida.com",
+                "销售直属领导": "sales.lead@jimuyida.com",
+            }
+        ),
+        is_secret=False,
+    )
+    import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 武汉仓出货硬件正常销售订单",
+        body_text="\n".join(
+            [
+                "客户名称：测试客户",
+                "产品：G100",
+                "数量：20台",
+                "期望交期：2026-07-01",
+                "订单号：SO-WF-001",
+                "物料详情描述：编码A1，规格标准版，20台",
+                "物流发货方式：顺丰",
+                "出货时间要求：2026-06-28",
+                "客户收件信息：深圳南山区xx路",
+                "交付要求：木箱加固",
+                "附件：深圳积木与湖北积木的采购订单文档、海外渠道销售PI、特殊附作等",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert as_list(task.target_mail_to_json) == ["zhangyan@jimuyida.com"]
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one()
+    assert binding.workflow_code
+    assert "物流发货方式" not in as_list(binding.missing_fields_json)
+
+
+def test_imported_workflow_without_contact_mapping_fails_review():
+    session = make_session()
+    import_workflow_document(
+        session,
+        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
+        raw_text=None,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 武汉仓出货硬件正常销售订单",
+        body_text="\n".join(
+            [
+                "客户名称：测试客户",
+                "产品：G100",
+                "数量：20台",
+                "期望交期：2026-07-01",
+                "订单号：SO-WF-002",
+                "物料详情描述：编码A1，规格标准版，20台",
+                "物流发货方式：顺丰",
+                "出货时间要求：2026-06-28",
+                "客户收件信息：深圳南山区xx路",
+                "交付要求：木箱加固",
+                "附件：深圳积木与湖北积木的采购订单文档、海外渠道销售PI、特殊附作等",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is None
+    case = session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").order_by(ExceptionCase.created_at.desc()).first()
+    assert case is not None
+    detail = loads(case.detail, {})
+    assert any("流程收件人未映射邮箱" in item.get("message", "") for item in detail.get("review_failures", []))

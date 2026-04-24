@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>商务生产任务单智能体 MVP</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260423-3" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260424-9" />
   </head>
   <body>
     <section id="login-screen" class="login-screen" hidden>
@@ -28,6 +28,7 @@
       </div>
       <nav>
         <a href="#dashboard" data-page-link="dashboard">工作台</a>
+        <a href="#workflows" data-page-link="workflows">流程</a>
         <a href="#tasks" data-page-link="tasks">任务</a>
         <a href="#orders" data-page-link="orders">模拟订单</a>
         <a href="#review-rules" data-page-link="review-rules">初审规则</a>
@@ -49,9 +50,7 @@
           <p id="page-subtitle">核心状态、队列水位和待处理风险。</p>
         </div>
         <div class="top-actions">
-          <button id="sync-mailbox" type="button" class="icon-button" title="同步邮箱">↻</button>
-          <button id="run-jobs" type="button" class="icon-button" title="运行入库队列">▶</button>
-          <button id="send-pending" type="button" class="icon-button" title="发送待发邮件">✉</button>
+          <button id="system-toggle" type="button" class="button system-toggle">系统状态</button>
           <button id="logout" type="button" class="button ghost">退出</button>
         </div>
       </header>
@@ -100,30 +99,9 @@
 
       <section class="page" data-page="review-rules" data-title="初审规则" data-subtitle="定义销售订单邮件进入任务草稿前的自动审查条件。">
         <div class="section-head">
-          <h2>初审开关与必填项</h2>
-          <p>未通过初审的销售邮件会自动回复销售，并停留在异常队列等待补充。</p>
-        </div>
-        <form id="initial-review-form" class="form-grid">
-          <label class="switch-line">
-            <input name="enabled" type="checkbox" />
-            <span>启用销售订单初审</span>
-          </label>
-          <div id="initial-review-required-fields" class="check-grid wide"></div>
-          <button type="submit" class="button">保存初审规则</button>
-        </form>
-
-        <div class="section-head">
           <h2>自定义规则</h2>
           <p>规则按顺序执行，任意一条未通过都会回复销售说明原因。</p>
         </div>
-        <form id="initial-review-rule-form" class="form-grid compact-form">
-          <label>规则名称 <input name="name" placeholder="例如：禁止加急订单自动通过" /></label>
-          <label>审查字段 <select name="field"></select></label>
-          <label>判断方式 <select name="operator"></select></label>
-          <label>规则值 <input name="value" placeholder="例如：加急、50、2026-10-01 或正则" /></label>
-          <label class="wide">未通过原因 <input name="message" placeholder="例如：加急订单需要商务人工确认后再下达生产。" /></label>
-          <button type="submit" class="button ghost">添加规则</button>
-        </form>
         <form id="initial-review-rules-filter-form" class="table-filter-bar" data-table-filter="reviewRules">
           <div class="filter-search">
             <span aria-hidden="true">⌕</span>
@@ -135,10 +113,58 @@
             <option value="disabled">停用</option>
           </select>
           <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button id="initial-review-rule-open" type="button" class="icon-button filter-action" title="增加规则" aria-label="增加规则">＋</button>
           <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
         </form>
         <div id="initial-review-rules-list" class="list rule-list"></div>
         <div id="initial-review-rules-pagination" class="pagination" data-table-pagination="reviewRules"></div>
+      </section>
+
+      <section class="page" data-page="workflows" data-title="流程" data-subtitle="流程列表、导入、编辑与启用。">
+        <div class="section-head">
+          <h2>流程列表</h2>
+          <p>查询流程版本、启用状态和路由信息。</p>
+        </div>
+        <form id="workflows-filter-form" class="table-filter-bar" data-table-filter="workflows">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索流程" placeholder="流程名称 / 编码 / 收件人 / 版本" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+          <button id="workflow-import-open" type="button" class="icon-button filter-action" title="批量导入" aria-label="批量导入">⇪</button>
+          <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+        </form>
+        <div id="workflow-rules-list" class="list rule-list"></div>
+        <div id="workflows-pagination" class="pagination" data-table-pagination="workflows"></div>
+
+        <div class="section-head">
+          <h2>流程规则导入与启用</h2>
+          <p>先用 LLM 自动生成流程专属规则，人工复核并保存后再启用。</p>
+        </div>
+        <div class="workflow-chat-layout">
+          <div class="chat-shell">
+            <div id="workflow-chat-log" class="chat-log">
+              <div class="chat-message assistant">
+                <small>流程助手</small>
+                <p>请描述要新增或编辑的流程，我会通过多轮对话整理并生成可落库的流程规则。</p>
+              </div>
+            </div>
+            <form id="workflow-chat-form" class="chat-input">
+              <textarea name="message" rows="3" placeholder="例如：我要新增‘样机赠送’流程，或修改‘新机调拨流程’的必填字段。"></textarea>
+              <button type="submit" class="button">发送</button>
+            </form>
+          </div>
+          <pre id="workflow-chat-preview" class="test-result workflow-chat-preview"></pre>
+        </div>
+        <div class="actions toolbar">
+          <button id="workflow-chat-reset" type="button" class="button ghost">清空对话</button>
+          <button id="workflow-chat-save" type="button" class="button">保存为流程草稿</button>
+          <label class="switch-line">
+            <input id="workflow-chat-activate" type="checkbox" />
+            <span>保存后立即启用</span>
+          </label>
+        </div>
       </section>
 
       <section class="page" data-page="integration" data-title="接入配置" data-subtitle="腾讯企业邮箱、队列、SMTP 和模型服务。">
@@ -165,6 +191,10 @@
           <label>ZIP 最大字节 <input name="zip_max_bytes" type="number" /></label>
           <label>ZIP 解压层级 <input name="zip_max_depth" type="number" /></label>
           <label>最大沟通轮数 <input name="conversation_max_rounds" type="number" min="1" /></label>
+          <label class="switch-line">
+            <input name="bot_enabled" type="checkbox" />
+            <span>启用机器人邮箱监听/发送</span>
+          </label>
           <label class="switch-line">
             <input name="llm_fallback_enabled" type="checkbox" />
             <span>启用 LLM 兜底识别</span>
@@ -417,6 +447,135 @@
       </section>
     </div>
 
+    <div id="initial-review-rule-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel workflow-import-modal-panel" role="dialog" aria-modal="true" aria-labelledby="initial-review-rule-title">
+        <div class="modal-head">
+          <div>
+            <small>自定义初审规则</small>
+            <h2 id="initial-review-rule-title">增加规则</h2>
+          </div>
+          <button id="initial-review-rule-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="initial-review-rule-form" class="form-grid compact-form">
+          <label>规则名称 <input name="name" placeholder="例如：禁止加急订单自动通过" /></label>
+          <label>审查字段 <select name="field"></select></label>
+          <label>判断方式 <select name="operator"></select></label>
+          <label>规则值 <input name="value" placeholder="例如：加急、50、2026-10-01 或正则" /></label>
+          <label class="wide">未通过原因 <input name="message" placeholder="例如：加急订单需要商务人工确认后再下达生产。" /></label>
+          <button type="submit" class="button ghost">添加规则</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="workflow-editor-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel workflow-editor-modal-panel" role="dialog" aria-modal="true" aria-labelledby="workflow-editor-title">
+        <div class="modal-head">
+          <div>
+            <small id="workflow-editor-subtitle">流程规则编辑</small>
+            <h2 id="workflow-editor-title">编辑流程</h2>
+          </div>
+          <button id="workflow-editor-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="workflow-rule-editor-form" class="form-grid compact-form" hidden>
+          <input name="version_id" type="hidden" />
+          <input name="compiled_rules_json" type="hidden" />
+          <div class="workflow-editor-layout wide">
+            <section class="workflow-review-editor">
+              <div class="workflow-editor-card workflow-routing-card">
+                <div class="workflow-editor-card-head">
+                  <strong>收件人路由</strong>
+                </div>
+                <label>主送人
+                  <input name="routing_to_names" placeholder="例如：张燕、生产负责人，或 production@jimuyida.com" />
+                </label>
+                <label>抄送人
+                  <input name="routing_cc_names" placeholder="例如：销售直属领导、商务负责人" />
+                </label>
+              </div>
+              <div class="workflow-editor-card">
+                <div class="workflow-editor-card-head">
+                  <strong>必填字段</strong>
+                  <small>来自当前流程规则 JSON</small>
+                </div>
+                <div id="workflow-required-fields" class="check-grid workflow-required-grid"></div>
+              </div>
+              <div class="workflow-editor-card workflow-policy-card">
+                <div class="workflow-editor-card-head">
+                  <strong>问答策略</strong>
+                  <small>生产提问达到上限后自动关闭并通知两侧</small>
+                </div>
+                <label>允许问答轮次
+                  <input name="max_question_rounds" type="number" min="1" max="20" placeholder="默认使用全局配置" />
+                </label>
+                <label class="wide">超限提示
+                  <input name="conversation_exceeded_message" placeholder="可选：达到上限后通知销售和生产的说明" />
+                </label>
+              </div>
+              <div class="workflow-editor-card">
+                <div class="workflow-editor-card-head">
+                  <strong>当前规则</strong>
+                  <small>规则按列表顺序执行</small>
+                </div>
+                <div class="workflow-rule-picker">
+                  <label>添加初审规则 <select name="review_rule_source"></select></label>
+                  <button type="button" class="button ghost" data-action="add-workflow-review-rule">添加规则</button>
+                </div>
+                <div id="workflow-review-rules-list" class="workflow-review-rule-list"></div>
+              </div>
+            </section>
+            <section class="workflow-mail-preview" aria-live="polite">
+              <div class="workflow-mail-preview-title">
+                <strong>邮件预览</strong>
+                <small>基于当前 JSON 草稿实时生成</small>
+              </div>
+              <div class="workflow-mail-preview-block">
+                <small>主题</small>
+                <pre id="workflow-mail-preview-subject"></pre>
+              </div>
+              <div class="workflow-mail-preview-block">
+                <small>正文</small>
+                <pre id="workflow-mail-preview-body"></pre>
+              </div>
+            </section>
+          </div>
+          <div class="actions wide">
+            <button type="button" class="button ghost" data-action="save-activate">保存并启用</button>
+            <button type="button" class="button ghost" data-action="cancel-edit">取消编辑</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <div id="workflow-import-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel workflow-import-modal-panel" role="dialog" aria-modal="true" aria-labelledby="workflow-import-title">
+        <div class="modal-head">
+          <div>
+            <small>流程批量导入</small>
+            <h2 id="workflow-import-title">导入流程草稿</h2>
+          </div>
+          <button id="workflow-import-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="workflow-import-form" class="form-grid compact-form">
+          <label class="wide">流程文档
+            <input name="workflow_file" type="file" accept=".docx,.txt,.md" />
+          </label>
+          <label class="switch-line">
+            <input name="prefer_llm" type="checkbox" checked />
+            <span>使用 LLM 自动生成流程规则</span>
+          </label>
+          <label class="switch-line">
+            <input name="auto_publish" type="checkbox" />
+            <span>导入后立即启用（跳过人工复核）</span>
+          </label>
+          <label class="wide">或直接粘贴流程文本
+            <textarea name="raw_text" rows="6" placeholder="可选：直接粘贴流程文档内容"></textarea>
+          </label>
+          <button type="submit" class="button">导入流程草稿</button>
+        </form>
+        <pre id="workflow-import-result" class="test-result"></pre>
+      </section>
+    </div>
+
     <div id="weekly-preview-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="weekly-preview-title">
         <div class="modal-head">
@@ -432,6 +591,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260423-3"></script>
+    <script src="/static/app.js?v=20260424-9"></script>
   </body>
 </html>

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import logging
 import uuid
@@ -29,9 +31,12 @@ from backend.app.models import (
     ProcessingJob,
     ProductionDepartment,
     QuestionAndReply,
+    RequirementWorkflowBinding,
     ProductionTask,
     ProductionTaskVersion,
     SystemConfig,
+    WorkflowImportJob,
+    WorkflowVersion,
     now_utc,
 )
 from backend.app.schemas import (
@@ -47,14 +52,27 @@ from backend.app.schemas import (
     ProductionFeedbackRequest,
     ProductionQuestionRequest,
     SalesReplyRequest,
+    TaskManualCloseRequest,
     TemplateUpdate,
+    WorkflowContactMapUpdate,
+    WorkflowChatGenerateRequest,
+    WorkflowChatSaveRequest,
+    WorkflowImportRequest,
+    WorkflowVersionUpdateRequest,
     WeeklyReportRecipientsUpdate,
 )
 from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_INTERVAL_SECONDS
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token
 from backend.app.services.bootstrap import seed_defaults, set_config
 from backend.app.services.e2e_mail import run_tencent_mail_e2e
-from backend.app.services.initial_review import FIELD_LABELS, OPERATOR_OPTIONS, initial_review_config
+from backend.app.services.initial_review import (
+    FIELD_LABELS,
+    OPERATOR_OPTIONS,
+    dedupe_initial_review_rules,
+    initial_review_config,
+    remember_deleted_workflow_review_rules,
+    sync_workflow_review_rules_to_initial_review,
+)
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.jobs import run_pending_jobs
 from backend.app.services.mail_adapter import send_pending_smtp, sync_imap_mailbox
@@ -63,11 +81,22 @@ from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
+from backend.app.services.workflow_rules import (
+    activate_workflow_version,
+    chat_generate_workflow_rule,
+    deactivate_workflow_version,
+    delete_workflow_version,
+    import_structured_workflow_rules,
+    import_workflow_document,
+    list_workflow_rules,
+    save_workflow_version_rules,
+)
 from backend.app.services.workflow import (
     approve_task,
     create_inbound_mail,
     dashboard,
     enqueue_weekly_report,
+    force_close_task_manual,
     apply_exception_requirement_patch,
     process_inbound_mail,
     record_production_question,
@@ -250,7 +279,9 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
 
 @app.get("/api/initial-review/rules")
 def get_initial_review_rules(session: Session = Depends(get_session)) -> dict:
-    return initial_review_config(session)
+    config = initial_review_config(session, include_workflow_rules=True)
+    session.commit()
+    return config
 
 
 @app.put("/api/initial-review/rules")
@@ -258,9 +289,13 @@ def update_initial_review_rules(payload: InitialReviewConfigUpdate, session: Ses
     allowed_fields = set(FIELD_LABELS)
     allowed_operators = {item["key"] for item in OPERATOR_OPTIONS}
     required_fields = [field for field in payload.required_fields if field in allowed_fields and field != "source_text"]
+    payload_rule_ids = {str(rule.id) for rule in payload.rules if rule.id}
+    remember_deleted_workflow_review_rules(session, payload_rule_ids)
     rules = []
     for rule in payload.rules:
         data = rule.model_dump()
+        if data.get("read_only") or data.get("is_builtin") or str(data.get("id") or "").startswith("builtin-"):
+            continue
         if data["field"] not in allowed_fields:
             raise HTTPException(status_code=400, detail=f"unsupported review field: {data['field']}")
         if data["operator"] not in allowed_operators:
@@ -268,11 +303,249 @@ def update_initial_review_rules(payload: InitialReviewConfigUpdate, session: Ses
         if not data.get("id"):
             data["id"] = str(uuid.uuid4())
         rules.append(data)
+    rules = dedupe_initial_review_rules(rules)
     set_config(session, "initial_review_enabled", "true" if payload.enabled else "false")
     set_config(session, "initial_review_required_fields_json", dumps(required_fields))
     set_config(session, "initial_review_rules_json", dumps(rules))
     session.commit()
-    return initial_review_config(session)
+    return initial_review_config(session, include_workflow_rules=True)
+
+
+@app.post("/api/workflows/import")
+def import_workflow_rules(payload: WorkflowImportRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    file_content: bytes | None = None
+    if payload.file_content_base64:
+        try:
+            file_content = base64.b64decode(payload.file_content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="file_content_base64 is invalid") from exc
+    if not payload.file_path and not file_content and not payload.raw_text:
+        raise HTTPException(status_code=400, detail="file upload or raw_text is required")
+    try:
+        result = import_workflow_document(
+            session,
+            file_path=payload.file_path,
+            raw_text=payload.raw_text,
+            file_name=payload.file_name,
+            file_content=file_content,
+            prefer_llm=payload.prefer_llm,
+            auto_publish=payload.auto_publish,
+            actor=getattr(request.state, "username", "system"),
+        )
+        sync_workflow_review_rules_to_initial_review(session)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return result
+
+
+@app.post("/api/workflows/chat/generate")
+def workflow_chat_generate(payload: WorkflowChatGenerateRequest, session: Session = Depends(get_session)) -> dict:
+    turns = [item.model_dump() for item in payload.messages if item.content.strip()]
+    if not turns:
+        raise HTTPException(status_code=400, detail="messages is required")
+    try:
+        result = chat_generate_workflow_rule(
+            session,
+            messages=turns,
+            current_rule=payload.current_rule,
+            edit_version_id=payload.edit_version_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return result
+
+
+@app.post("/api/workflows/chat/save")
+def workflow_chat_save(
+    payload: WorkflowChatSaveRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    if not payload.compiled_rule:
+        raise HTTPException(status_code=400, detail="compiled_rule is required")
+    try:
+        actor = getattr(request.state, "username", "system")
+        if payload.edit_version_id:
+            version = save_workflow_version_rules(
+                session,
+                payload.edit_version_id,
+                compiled_rules=payload.compiled_rule,
+                actor=actor,
+                activate=payload.activate,
+            )
+            result = {
+                "job_id": None,
+                "file_name": "workflow-chat.json",
+                "source_asset_ref": "workflow-chat-edit",
+                "llm_used": True,
+                "validation_errors": [],
+                "diffs": [],
+                "created_versions": [
+                    {
+                        "id": version.id,
+                        "workflow_id": version.workflow_id,
+                        "version_no": version.version_no,
+                        "status": version.status,
+                    }
+                ],
+                "updated_version": serialize_workflow_version(version),
+            }
+            sync_workflow_review_rules_to_initial_review(session)
+        else:
+            result = import_structured_workflow_rules(
+                session,
+                rules=[payload.compiled_rule],
+                auto_publish=payload.activate,
+                actor=actor,
+                source_asset_ref="workflow-chat",
+                file_name="workflow-chat.json",
+                llm_used=True,
+            )
+            sync_workflow_review_rules_to_initial_review(session)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return result
+
+
+@app.get("/api/workflows")
+def workflows(
+    q: str | None = None,
+    only_active: bool = False,
+    session: Session = Depends(get_session),
+) -> dict:
+    rows = list_workflow_rules(session, only_active=only_active)
+    if q and q.strip():
+        keyword = q.strip().lower()
+        rows = [
+            row
+            for row in rows
+            if keyword in str(row.get("workflow_code", "")).lower() or keyword in str(row.get("workflow_name", "")).lower()
+        ]
+    return {"items": rows, "total": len(rows)}
+
+
+@app.post("/api/workflows/versions/{version_id}/activate")
+def activate_workflow(version_id: str, request: Request, session: Session = Depends(get_session)) -> dict:
+    try:
+        version = activate_workflow_version(session, version_id, actor=getattr(request.state, "username", "system"))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    session.commit()
+    return serialize_workflow_version(version)
+
+
+@app.post("/api/workflows/versions/{version_id}/deactivate")
+def deactivate_workflow(version_id: str, session: Session = Depends(get_session)) -> dict:
+    try:
+        version = deactivate_workflow_version(session, version_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    session.commit()
+    return serialize_workflow_version(version)
+
+
+@app.delete("/api/workflows/versions/{version_id}")
+def remove_workflow_version(version_id: str, session: Session = Depends(get_session)) -> dict:
+    try:
+        delete_workflow_version(session, version_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    session.commit()
+    return {"deleted": True, "version_id": version_id}
+
+
+@app.put("/api/workflows/versions/{version_id}")
+def update_workflow_version(
+    version_id: str,
+    payload: WorkflowVersionUpdateRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        version = save_workflow_version_rules(
+            session,
+            version_id,
+            compiled_rules=payload.compiled_rules,
+            actor=getattr(request.state, "username", "system"),
+            activate=payload.activate,
+        )
+        sync_workflow_review_rules_to_initial_review(session)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    session.commit()
+    return serialize_workflow_version(version)
+
+
+@app.get("/api/workflow-import-jobs")
+def workflow_import_jobs(
+    q: str | None = None,
+    parse_status: str | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(WorkflowImportJob)
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                WorkflowImportJob.file_name.ilike(pattern),
+                WorkflowImportJob.source_asset_ref.ilike(pattern),
+                WorkflowImportJob.source_text.ilike(pattern),
+            )
+        )
+    if parse_status and parse_status.strip():
+        query = query.filter(WorkflowImportJob.parse_status == parse_status.strip())
+    if status and status.strip():
+        query = query.filter(WorkflowImportJob.status == status.strip())
+    return page_response(
+        query.order_by(WorkflowImportJob.created_at.desc()),
+        serialize_workflow_import_job,
+        page,
+        page_size,
+        {
+            "parse_status_options": distinct_values(session, WorkflowImportJob.parse_status),
+            "status_options": distinct_values(session, WorkflowImportJob.status),
+        },
+    )
+
+
+@app.get("/api/workflows/contact-map")
+def workflow_contact_map(session: Session = Depends(get_session)) -> dict:
+    row = session.get(SystemConfig, "workflow_contact_map_json")
+    mapping = loads(row.value if row is not None else "{}", {})
+    if not isinstance(mapping, dict):
+        mapping = {}
+    return {"mapping": mapping}
+
+
+@app.put("/api/workflows/contact-map")
+def update_workflow_contact_map(payload: WorkflowContactMapUpdate, session: Session = Depends(get_session)) -> dict:
+    normalized: dict[str, str | list[str]] = {}
+    for key, value in payload.mapping.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        if isinstance(value, list):
+            emails = [str(item).strip() for item in value if str(item).strip()]
+            normalized[name] = emails
+        else:
+            email = str(value).strip()
+            if email:
+                normalized[name] = email
+    set_config(session, "workflow_contact_map_json", dumps(normalized), is_secret=False)
+    session.commit()
+    return {"mapping": normalized}
 
 
 @app.post("/api/e2e/tencent-mail/run")
@@ -446,7 +719,11 @@ def task_detail(task_id: str, session: Session = Depends(get_session)) -> dict:
     task = session.get(ProductionTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
-    return serialize_task(task, include_versions=True)
+    data = serialize_task(task, include_versions=True)
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one_or_none()
+    if binding is not None:
+        data["workflow"] = serialize_requirement_workflow_binding(binding)
+    return data
 
 
 @app.get("/api/tasks/{task_id}/workflow")
@@ -584,6 +861,24 @@ def approve(task_id: str, session: Session = Depends(get_session)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()
     return {"outbound_job_id": job.id, "status": job.status}
+
+
+@app.post("/api/tasks/{task_id}/manual-close")
+def manual_close_task(task_id: str, payload: TaskManualCloseRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    try:
+        jobs = force_close_task_manual(
+            session,
+            task_id,
+            reason=payload.note,
+            actor=getattr(request.state, "username", "business-owner"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return {
+        "closed": True,
+        "outbound_jobs": [{"id": job.id, "mail_type": job.mail_type, "status": job.status} for job in jobs],
+    }
 
 
 @app.post("/api/tasks/{task_id}/production-feedback")
@@ -1243,6 +1538,56 @@ def serialize_template(template: MailTemplate) -> dict:
         "uploaded_asset_ref": template.uploaded_asset_ref,
         "version": template.version,
         "status": template.status,
+    }
+
+
+def serialize_workflow_version(row: WorkflowVersion) -> dict:
+    rules = loads(row.compiled_rules_json, {})
+    if not isinstance(rules, dict):
+        rules = {}
+    return {
+        "id": row.id,
+        "workflow_id": row.workflow_id,
+        "workflow_code": rules.get("workflow_code"),
+        "workflow_name": rules.get("workflow_name"),
+        "version_no": row.version_no,
+        "status": row.status,
+        "created_by": row.created_by,
+        "approved_by": row.approved_by,
+        "source_asset_ref": row.source_asset_ref,
+        "compiled_rules": rules,
+        "created_at": row.created_at.isoformat(),
+        "approved_at": row.approved_at.isoformat() if row.approved_at else None,
+    }
+
+
+def serialize_workflow_import_job(row: WorkflowImportJob) -> dict:
+    return {
+        "id": row.id,
+        "file_name": row.file_name,
+        "source_asset_ref": row.source_asset_ref,
+        "parse_status": row.parse_status,
+        "status": row.status,
+        "validation_errors": loads(row.validation_errors_json, []),
+        "diff": loads(row.diff_json, []),
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
+def serialize_requirement_workflow_binding(row: RequirementWorkflowBinding) -> dict:
+    return {
+        "id": row.id,
+        "workflow_version_id": row.workflow_version_id,
+        "workflow_code": row.workflow_code,
+        "workflow_name": row.workflow_name,
+        "match_confidence": row.match_confidence,
+        "route_to": as_list(row.route_to_json),
+        "route_cc": as_list(row.route_cc_json),
+        "required_fields": as_list(row.required_fields_json),
+        "required_attachments": as_list(row.required_attachments_json),
+        "missing_fields": as_list(row.missing_fields_json),
+        "unresolved_contacts": as_list(row.unresolved_contacts_json),
     }
 
 

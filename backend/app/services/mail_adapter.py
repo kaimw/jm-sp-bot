@@ -21,6 +21,7 @@ from backend.app.services.parser import classify_mail, normalize_latest_reply
 from backend.app.services.storage import save_attachment
 from backend.app.services.workflow import (
     add_audit,
+    bot_enabled,
     create_inbound_mail,
     enqueue_job,
     enqueue_requirement_supplement_receipt,
@@ -125,6 +126,9 @@ def parse_email_bytes(raw: bytes) -> IncomingEmail:
 
 
 def sync_imap_mailbox(session: Session, *, limit: int = 20) -> dict:
+    if not bot_enabled(session):
+        return {"imported": 0, "queued": 0, "skipped": "bot is disabled"}
+
     host = get_config(session, "imap_host", "imap.exmail.qq.com")
     port = int(get_config(session, "imap_port", "993"))
     username = get_config(session, "bot_email", "bot.market@jimuyida.com")
@@ -351,9 +355,15 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "ProductionConfirmationReceipt",
     "ProductionConfirmed",
     "ProductionRejected",
+    "ClosedTaskReplyRejected",
+    "SalesReplyNoOpenQuestion",
+    "ProductionTerminateSalesNotice",
+    "ProductionTerminateProductionNotice",
     "SalesDemandWithdrawn",
     "ProductionDemandWithdrawn",
     "SalesDemandWithdrawRejected",
+    "TaskManualClosedSales",
+    "TaskManualClosedProduction",
     "ConversationClosedMaxRounds",
     "SalesReplyTaskReissue",
     "SalesReplyReissueReceipt",
@@ -405,6 +415,8 @@ def send_outbound_jobs_with_account(
     include_generated_followups: bool = False,
 ) -> dict:
     display_name = normalize_bot_display_name(display_name)
+    if not bot_enabled(session):
+        return {"sent": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"}
     if not jobs:
         return {"sent": 0, "failed": 0, "total": 0}
     if not password:

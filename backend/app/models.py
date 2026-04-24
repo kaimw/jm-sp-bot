@@ -71,6 +71,51 @@ class ModelProviderConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
+class WorkflowDefinition(Base):
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workflow_code: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    workflow_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class WorkflowVersion(Base):
+    __tablename__ = "workflow_versions"
+    __table_args__ = (UniqueConstraint("workflow_id", "version_no", name="uq_workflow_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    workflow_id: Mapped[str] = mapped_column(String(36), ForeignKey("workflow_definitions.id"), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_asset_ref: Mapped[str | None] = mapped_column(Text)
+    source_text: Mapped[str | None] = mapped_column(Text)
+    compiled_rules_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Draft", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class WorkflowImportJob(Base):
+    __tablename__ = "workflow_import_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    file_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_asset_ref: Mapped[str | None] = mapped_column(Text)
+    source_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    parse_status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
+    llm_output_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    validation_errors_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    diff_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Draft", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
 class MailMessage(Base):
     __tablename__ = "mail_messages"
 
@@ -153,6 +198,29 @@ class OrderRequirement(Base):
     missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     risk_flags_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="Extracted", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class RequirementWorkflowBinding(Base):
+    __tablename__ = "requirement_workflow_bindings"
+    __table_args__ = (UniqueConstraint("requirement_id", name="uq_requirement_workflow_binding"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requirement_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_requirements.id"), nullable=False)
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("workflow_versions.id"))
+    workflow_code: Mapped[str | None] = mapped_column(String(128))
+    workflow_name: Mapped[str | None] = mapped_column(String(255))
+    match_confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    route_to_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    route_cc_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    subject_template: Mapped[str | None] = mapped_column(Text)
+    body_template: Mapped[str | None] = mapped_column(Text)
+    required_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    required_attachments_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    extracted_fields_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    missing_fields_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    unresolved_contacts_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
@@ -266,6 +334,18 @@ class AuditEvent(Base):
     related_object_type: Mapped[str] = mapped_column(String(64), nullable=False)
     related_object_id: Mapped[str] = mapped_column(String(36), nullable=False)
     detail: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class MailWorkflowMatch(Base):
+    __tablename__ = "mail_workflow_matches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    mail_id: Mapped[str] = mapped_column(String(36), ForeignKey("mail_messages.id"), nullable=False)
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("workflow_versions.id"))
+    workflow_code: Mapped[str | None] = mapped_column(String(128))
+    confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    match_detail_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 

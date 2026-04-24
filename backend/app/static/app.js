@@ -1,7 +1,11 @@
 const $ = (selector) => document.querySelector(selector);
 let initialReviewState = { enabled: true, required_fields: [], rules: [], field_options: [], operator_options: [] };
+let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, readonly: false };
+let workflowChatState = { messages: [], compiledRule: null, validationErrors: [], ready: false, editVersionId: "", editWorkflowName: "" };
+let runtimeConfigState = {};
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
 const tableStates = {
+  workflows: { q: "", status: "", page: 1, page_size: 10 },
   departments: { q: "", status: "", page: 1, page_size: 10 },
   mails: { q: "", classification: "", direction: "", from_address: "", page: 1, page_size: 10 },
   outbound: { q: "", status: "", mail_type: "", recipient: "", page: 1, page_size: 10 },
@@ -95,6 +99,13 @@ function splitEmails(value) {
     .filter(Boolean);
 }
 
+function splitRoutingNames(value) {
+  return String(value || "")
+    .split(/[,，;；、\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function queryFromState(state) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(state)) {
@@ -176,8 +187,8 @@ function paginateLocalRows(rows, key) {
   };
 }
 
-function appendChatMessage(role, label, message) {
-  const log = $("#model-chat-log");
+function appendChatMessage(role, label, message, selector = "#model-chat-log") {
+  const log = $(selector);
   if (!log) return;
   log.insertAdjacentHTML(
     "beforeend",
@@ -283,6 +294,7 @@ async function refreshTasks() {
           <div><small>${h(row.status)}</small></div>
           <div class="actions">
             <button class="button" data-action="workflow" data-id="${row.id}">查看工作流</button>
+            <button class="button ghost" data-action="manual-close-task" data-id="${row.id}" ${row.status === "Closed" ? "disabled" : ""}>手动关闭</button>
           </div>
         </div>`
       )
@@ -369,6 +381,20 @@ function fillForm(formSelector, values) {
   }
 }
 
+function configEnabled(value, fallback = true) {
+  if (value === undefined || value === null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function renderSystemToggle() {
+  const button = $("#system-toggle");
+  if (!button) return;
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
+  button.textContent = enabled ? "停用系统" : "启用系统";
+  button.title = enabled ? "停用机器人邮箱监听与自动处理" : "启用机器人邮箱监听与自动处理";
+  button.classList.toggle("is-paused", !enabled);
+}
+
 function reviewRuleId() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `rule-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -378,25 +404,36 @@ function optionLabel(options, key) {
   return options.find((item) => item.key === key)?.label || key;
 }
 
-function renderInitialReviewRules() {
-  const form = $("#initial-review-form");
-  if (!form) return;
-  form.querySelector("[name=enabled]").checked = Boolean(initialReviewState.enabled);
-  const requiredNode = $("#initial-review-required-fields");
-  const required = new Set(initialReviewState.required_fields || []);
-  const fieldOptions = (initialReviewState.field_options || []).filter((item) => item.key !== "source_text");
-  requiredNode.innerHTML = fieldOptions
-    .map(
-      (field) => `
-        <label class="check-item">
-          <input type="checkbox" name="required_field" value="${h(field.key)}" ${required.has(field.key) ? "checked" : ""} />
-          <span>${h(field.label)}</span>
-        </label>`
-    )
-    .join("");
+function isReadonlyReviewRule(rule) {
+  return Boolean(rule?.read_only || rule?.is_builtin || String(rule?.id || "").startsWith("builtin-"));
+}
 
+function reviewRuleSignature(rule) {
+  const field = String(rule?.field || "source_text").trim().toLowerCase();
+  const operator = String(rule?.operator || "contains").trim().toLowerCase();
+  const value = String(rule?.value || "").replace(/\s+/g, "").trim();
+  return `${field}::${operator}::${value}`;
+}
+
+function reviewRuleStatusText(rule) {
+  if (rule?.is_workflow_rule) {
+    const workflowName = String(rule.workflow_name || rule.workflow_code || "").trim();
+    const enabledText = rule.enabled === false ? "停用" : "启用";
+    return workflowName ? `自定义 · ${workflowName} · ${enabledText}` : `自定义 · ${enabledText}`;
+  }
+  if (isReadonlyReviewRule(rule)) return "系统内置 · 只读";
+  return rule.enabled === false ? "停用" : "启用";
+}
+
+function reviewOperatorLabel(operator) {
+  if (operator === "system_check") return "系统内置检查";
+  return optionLabel(initialReviewState.operator_options || [], operator);
+}
+
+function renderInitialReviewRules() {
   const fieldSelect = $("#initial-review-rule-form [name=field]");
   const operatorSelect = $("#initial-review-rule-form [name=operator]");
+  if (!fieldSelect || !operatorSelect) return;
   fieldSelect.innerHTML = (initialReviewState.field_options || [])
     .map((field) => `<option value="${h(field.key)}">${h(field.label)}</option>`)
     .join("");
@@ -414,7 +451,7 @@ function renderInitialReviewRules() {
     const haystack = [
       rule.name,
       optionLabel(initialReviewState.field_options || [], rule.field),
-      optionLabel(initialReviewState.operator_options || [], rule.operator),
+      reviewOperatorLabel(rule.operator),
       rule.value,
       rule.message,
       enabled ? "启用" : "停用",
@@ -427,14 +464,20 @@ function renderInitialReviewRules() {
       .map(
         (rule) => `
         <div class="row">
-          <div><strong>${h(rule.name || "未命名规则")}</strong><br /><small>${h(rule.enabled === false ? "停用" : "启用")}</small></div>
-          <div><small>字段 / 判断</small><br />${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(optionLabel(initialReviewState.operator_options || [], rule.operator))}</div>
+          <div><strong>${h(rule.name || "未命名规则")}</strong><br /><small>${h(reviewRuleStatusText(rule))}</small></div>
+          <div><small>字段 / 判断</small><br />${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(reviewOperatorLabel(rule.operator))}</div>
           <div><small>规则值</small><br />${h(rule.value || "无")}</div>
           <div>
             <small>${h(rule.message || "未填写未通过原因")}</small>
             <div class="actions row-actions">
-              <button class="button ghost" data-action="toggle-review-rule" data-id="${h(rule.id)}">${rule.enabled === false ? "启用" : "停用"}</button>
-              <button class="button warn" data-action="delete-review-rule" data-id="${h(rule.id)}">删除</button>
+              ${
+                isReadonlyReviewRule(rule)
+                  ? `<span class="status-pill">系统内置 · 只读</span>`
+                  : `
+                    <button class="button ghost" data-action="toggle-review-rule" data-id="${h(rule.id)}">${rule.enabled === false ? "启用" : "停用"}</button>
+                    <button class="button warn" data-action="delete-review-rule" data-id="${h(rule.id)}">删除</button>
+                  `
+              }
             </div>
           </div>
         </div>`
@@ -449,23 +492,458 @@ async function refreshInitialReviewRules() {
 }
 
 async function saveInitialReviewRules() {
-  const requiredFields = [...document.querySelectorAll("#initial-review-required-fields [name=required_field]:checked")].map(
-    (input) => input.value
-  );
-  const enabled = $("#initial-review-form [name=enabled]").checked;
   initialReviewState = await api("/api/initial-review/rules", {
     method: "PUT",
     body: JSON.stringify({
-      enabled,
-      required_fields: requiredFields,
-      rules: initialReviewState.rules || [],
+      enabled: Boolean(initialReviewState.enabled),
+      required_fields: initialReviewState.required_fields || [],
+      rules: (initialReviewState.rules || []).filter((rule) => !isReadonlyReviewRule(rule)),
     }),
   });
   renderInitialReviewRules();
 }
 
+function findWorkflowVersion(versionId) {
+  return (workflowRulesState.items || []).find((item) => item.version_id === versionId);
+}
+
+function renderTemplateWithContext(template, context) {
+  return String(template || "").replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (raw, key) => {
+    const value = context[key];
+    if (value === undefined || value === null || value === "") return raw;
+    return String(value);
+  });
+}
+
+function workflowFieldLabel(field) {
+  const fromInitial = optionLabel(initialReviewState.field_options || [], field);
+  if (fromInitial && fromInitial !== field) return fromInitial;
+  const extra = {
+    material_details: "物料详情描述",
+    logistics_method: "物流发货方式",
+    shipping_time_requirement: "出货时间要求",
+    customer_receiver_info: "客户收件信息",
+    delivery_requirement: "交付要求",
+    shipping_warehouse: "出货仓",
+    borrow_time: "借用时间",
+    return_time: "归还时间",
+    sample_approval_screenshot: "样机借用审批截图",
+    initiator: "发起人",
+    expected_time: "期望时间",
+  };
+  return extra[field] || field;
+}
+
+function updateWorkflowMailPreview(ruleOrRaw = "") {
+  const subjectNode = $("#workflow-mail-preview-subject");
+  const bodyNode = $("#workflow-mail-preview-body");
+  if (!subjectNode || !bodyNode) return;
+  let rule;
+  if (typeof ruleOrRaw === "string") {
+    const source = String(ruleOrRaw || "").trim();
+    if (!source) {
+      subjectNode.textContent = "请先选择流程规则";
+      bodyNode.textContent = "请先选择流程规则";
+      return;
+    }
+    try {
+      rule = JSON.parse(source);
+    } catch (error) {
+      subjectNode.textContent = "JSON 解析失败";
+      bodyNode.textContent = error?.message || "请检查 JSON 格式";
+      return;
+    }
+  } else {
+    rule = ruleOrRaw || {};
+  }
+  const workflowName = String(rule?.workflow_name || "示例流程").trim() || "示例流程";
+  const context = {
+    task_no: "JM-RW-2026001",
+    version_no: "1",
+    customer_name: "示例客户",
+    salesperson_name: "商务部小J",
+    salesperson_email: "bot.business@jimuyida.com",
+    product_summary: "示例产品A",
+    quantity_text: "120套",
+    expected_delivery_date: "2026-05-20",
+    workflow_name: workflowName,
+    bot_signature: "商务部小J",
+  };
+  const subjectTemplate = String(rule?.subject_template || "").trim();
+  const bodyTemplate = String(rule?.body_template || "").trim();
+  subjectNode.textContent = subjectTemplate
+    ? renderTemplateWithContext(subjectTemplate, context)
+    : "（未配置 subject_template，保存后将使用系统默认主题模板）";
+  bodyNode.textContent = bodyTemplate
+    ? renderTemplateWithContext(bodyTemplate, context)
+    : "（未配置 body_template，保存后将使用系统默认正文模板）";
+}
+
+function syncWorkflowRuleEditorState() {
+  const form = $("#workflow-rule-editor-form");
+  if (!form || !workflowRulesState.editingRules) return null;
+  if (workflowRulesState.readonly) return workflowRulesState.editingRules;
+  const requiredFields = [...form.querySelectorAll("#workflow-required-fields [name=workflow_required_field]:checked")].map((input) => input.value);
+  const toNames = splitRoutingNames(form.querySelector("[name=routing_to_names]")?.value || "");
+  const ccNames = splitRoutingNames(form.querySelector("[name=routing_cc_names]")?.value || "");
+  const maxQuestionRounds = Number(form.querySelector("[name=max_question_rounds]")?.value || 0);
+  const exceededMessage = String(form.querySelector("[name=conversation_exceeded_message]")?.value || "").trim();
+  const reviewRules = (workflowRulesState.editingRules.review_rules || []).map((rule) => ({
+    ...rule,
+    enabled: rule.enabled !== false,
+  }));
+  const nextRules = {
+    ...workflowRulesState.editingRules,
+    routing: {
+      ...(workflowRulesState.editingRules.routing || {}),
+      to_names: toNames,
+      cc_names: ccNames,
+    },
+    required_fields: requiredFields,
+    review_rules: reviewRules,
+  };
+  if (maxQuestionRounds > 0) {
+    nextRules.conversation_policy = {
+      max_question_rounds: Math.max(1, Math.min(maxQuestionRounds, 20)),
+      on_exceeded: "close_task",
+      message: exceededMessage,
+    };
+  } else {
+    nextRules.conversation_policy = {};
+  }
+  workflowRulesState.editingRules = nextRules;
+  const hidden = form.querySelector("[name=compiled_rules_json]");
+  if (hidden) hidden.value = JSON.stringify(nextRules);
+  updateWorkflowMailPreview(nextRules);
+  return nextRules;
+}
+
+function renderWorkflowRuleEditor() {
+  const form = $("#workflow-rule-editor-form");
+  const rules = workflowRulesState.editingRules || {};
+  if (!form) return;
+  const readonly = Boolean(workflowRulesState.readonly);
+  const requiredFields = Array.isArray(rules.required_fields) ? rules.required_fields : [];
+  const reviewRules = Array.isArray(rules.review_rules) ? rules.review_rules : [];
+  const conversationPolicy = rules.conversation_policy && typeof rules.conversation_policy === "object" ? rules.conversation_policy : {};
+  const routing = rules.routing && typeof rules.routing === "object" ? rules.routing : {};
+  const toNames = Array.isArray(routing.to_names) ? routing.to_names : [];
+  const ccNames = Array.isArray(routing.cc_names) ? routing.cc_names : [];
+  form.querySelector("[name=routing_to_names]").value = toNames.join("、");
+  form.querySelector("[name=routing_to_names]").disabled = readonly;
+  form.querySelector("[name=routing_cc_names]").value = ccNames.join("、");
+  form.querySelector("[name=routing_cc_names]").disabled = readonly;
+  form.querySelector("[name=max_question_rounds]").value = conversationPolicy.max_question_rounds || "";
+  form.querySelector("[name=max_question_rounds]").disabled = readonly;
+  form.querySelector("[name=conversation_exceeded_message]").value = conversationPolicy.message || "";
+  form.querySelector("[name=conversation_exceeded_message]").disabled = readonly;
+  $("#workflow-required-fields").innerHTML =
+    requiredFields
+      .map(
+        (field) => `
+          <label class="check-item">
+            <input type="checkbox" name="workflow_required_field" value="${h(field)}" checked ${readonly ? "disabled" : ""} />
+            <span>${h(workflowFieldLabel(field))}</span>
+          </label>`
+      )
+      .join("") || `<div class="empty-note">当前流程未配置必填字段。</div>`;
+
+  const existingIds = new Set(reviewRules.map((rule) => String(rule.id || "")));
+  const selectableRules = (initialReviewState.rules || []).filter((rule) => !isReadonlyReviewRule(rule) && !existingIds.has(String(rule.id || "")));
+  const selector = form.querySelector("[name=review_rule_source]");
+  selector.innerHTML =
+    `<option value="">选择初审面板中的自定义规则</option>` +
+    selectableRules.map((rule) => `<option value="${h(rule.id)}">${h(rule.name || "未命名规则")}</option>`).join("");
+  selector.disabled = readonly;
+  form.querySelector('[data-action="add-workflow-review-rule"]').hidden = readonly;
+
+  $("#workflow-review-rules-list").innerHTML =
+    reviewRules
+      .map(
+        (rule) => `
+          <div class="workflow-review-rule-item">
+            <div><strong>${h(rule.name || "未命名规则")}</strong><br /><small>${h(rule.enabled === false ? "停用" : "启用")}</small></div>
+            <div class="workflow-review-rule-meta">
+              <span><small>字段 / 判断</small><br />${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(reviewOperatorLabel(rule.operator))}</span>
+              <span><small>规则值</small><br />${h(rule.value || "无")}</span>
+            </div>
+            <p>${h(rule.message || "未填写未通过原因")}</p>
+            <div class="actions row-actions">
+              ${
+                readonly || isReadonlyReviewRule(rule)
+                  ? `<span class="status-pill">${isReadonlyReviewRule(rule) ? "系统内置 · 只读" : "只读"}</span>`
+                  : `<button class="button warn" type="button" data-action="remove-workflow-review-rule" data-id="${h(rule.id)}">移除规则</button>`
+              }
+            </div>
+          </div>`
+      )
+      .join("") || `<div class="empty-note">当前流程未配置专属初审规则。</div>`;
+  if (readonly) {
+    updateWorkflowMailPreview(rules);
+  } else {
+    syncWorkflowRuleEditorState();
+  }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function openWorkflowImportModal() {
+  const modal = $("#workflow-import-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  const form = $("#workflow-import-form");
+  form?.querySelector("[name=workflow_file]")?.focus();
+}
+
+function closeWorkflowImportModal() {
+  const modal = $("#workflow-import-modal");
+  if (modal) modal.hidden = true;
+}
+
+function openInitialReviewRuleModal() {
+  const modal = $("#initial-review-rule-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  $("#initial-review-rule-form [name=name]")?.focus();
+}
+
+function closeInitialReviewRuleModal() {
+  const modal = $("#initial-review-rule-modal");
+  if (modal) modal.hidden = true;
+}
+
+function openWorkflowRuleEditor(versionId, rules, options = {}) {
+  const form = $("#workflow-rule-editor-form");
+  if (!form) return;
+  const readonly = Boolean(options.readonly);
+  form.hidden = false;
+  const modal = $("#workflow-editor-modal");
+  if (modal) modal.hidden = false;
+  const title = $("#workflow-editor-title");
+  if (title) title.textContent = rules?.workflow_name ? `${readonly ? "查看" : "编辑"}流程：${rules.workflow_name}` : readonly ? "查看流程" : "编辑流程";
+  const subtitle = $("#workflow-editor-subtitle");
+  if (subtitle) subtitle.textContent = versionId ? `流程版本 ${versionId}${readonly ? "（只读）" : ""}` : readonly ? "流程规则查看" : "流程规则编辑";
+  form.querySelector("[name=version_id]").value = versionId || "";
+  workflowRulesState.editingRules = JSON.parse(JSON.stringify(rules || {}));
+  form.querySelector("[name=compiled_rules_json]").value = JSON.stringify(workflowRulesState.editingRules);
+  workflowRulesState.editingVersionId = versionId || "";
+  workflowRulesState.readonly = readonly;
+  form.querySelector('[data-action="save-activate"]').hidden = readonly;
+  renderWorkflowRuleEditor();
+}
+
+function closeWorkflowRuleEditor() {
+  const form = $("#workflow-rule-editor-form");
+  if (form) {
+    form.hidden = true;
+    form.querySelector("[name=version_id]").value = "";
+    form.querySelector("[name=compiled_rules_json]").value = "";
+  }
+  const modal = $("#workflow-editor-modal");
+  if (modal) modal.hidden = true;
+  updateWorkflowMailPreview("");
+  workflowRulesState.editingVersionId = "";
+  workflowRulesState.editingRules = null;
+  workflowRulesState.readonly = false;
+}
+
+function renderWorkflowRules() {
+  const node = $("#workflow-rules-list");
+  if (!node) return;
+  const rows = workflowRulesState.items || [];
+  const q = tableStates.workflows.q.trim().toLowerCase();
+  const status = tableStates.workflows.status;
+  const statusOptions = Array.from(new Set(rows.map((row) => String(row.status || "").trim()).filter(Boolean)));
+  setSelectOptions("#workflows-filter-form [name=status]", statusOptions, "全部状态", tableStates.workflows.status);
+  const filteredRows = rows.filter((row) => {
+    if (status && String(row.status || "") !== status) return false;
+    if (!q) return true;
+    const routing = row.rules?.routing || {};
+    const toNames = Array.isArray(routing.to_names) ? routing.to_names : [];
+    const haystack = [
+      row.workflow_name,
+      row.workflow_code,
+      row.status,
+      `V${row.version_no || ""}`,
+      toNames.join(", "),
+      row.approved_at || "",
+      row.created_at || "",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+  const pageData = paginateLocalRows(filteredRows, "workflows");
+  node.innerHTML =
+    (pageData.items || [])
+      .map((row) => {
+        const routing = row.rules?.routing || {};
+        const toNames = Array.isArray(routing.to_names) ? routing.to_names : [];
+        const reviewRules = Array.isArray(row.rules?.review_rules) ? row.rules.review_rules : [];
+        const enabledReviewRules = reviewRules.filter((item) => item && item.enabled !== false);
+        const isBuiltin = Boolean(row.is_builtin);
+        const editable = !isBuiltin && Boolean(row.editable);
+        const activatable = !isBuiltin && Boolean(row.activatable);
+        const deactivatable = !isBuiltin && Boolean(row.deactivatable);
+        const deletable = !isBuiltin && Boolean(row.deletable);
+        return `
+          <div class="row">
+            <div><strong>${h(row.workflow_name || row.workflow_code || "未命名流程")}</strong><br /><small>${h(row.workflow_code || "-")} · V${h(row.version_no)}</small></div>
+            <div><small>状态</small><br />${h(row.status)}</div>
+            <div><small>收件人</small><br />${h(toNames.join(", ") || "未配置")}<br /><small>专属初审规则 ${h(enabledReviewRules.length)}/${h(reviewRules.length)}</small></div>
+            <div>
+              <small>${h(isBuiltin ? "内置默认流程（只读）" : row.approved_at || row.created_at || "")}</small>
+              <div class="actions row-actions">
+                <button class="button ghost" data-action="view-workflow-version" data-id="${h(row.version_id)}">查看规则</button>
+                ${
+                  isBuiltin
+                    ? ""
+                    : `
+                  ${activatable ? `<button class="button" data-action="activate-workflow-version" data-id="${h(row.version_id)}">启用流程</button>` : ""}
+                  ${deactivatable ? `<button class="button ghost" data-action="deactivate-workflow-version" data-id="${h(row.version_id)}">停用流程</button>` : ""}
+                  ${editable ? `<button class="button ghost" data-action="llm-edit-workflow-version" data-id="${h(row.version_id)}">LLM编辑</button>` : ""}
+                  ${editable ? `<button class="button ghost" data-action="edit-workflow-version" data-id="${h(row.version_id)}">编辑规则</button>` : ""}
+                  ${deletable ? `<button class="button warn" data-action="delete-workflow-version" data-id="${h(row.version_id)}">删除流程</button>` : ""}
+                `
+                }
+              </div>
+            </div>
+          </div>`;
+      })
+      .join("") || `<div class="row"><div>暂无流程规则版本，请先导入流程文档。</div></div>`;
+  renderListPagination("#workflows-pagination", "workflows", pageData);
+}
+
+async function refreshWorkflowRules() {
+  const data = await api("/api/workflows");
+  workflowRulesState.items = data.items || [];
+  renderWorkflowRules();
+}
+
+async function saveWorkflowRuleEditor() {
+  const form = $("#workflow-rule-editor-form");
+  if (!form || form.hidden) return;
+  const versionId = form.querySelector("[name=version_id]").value;
+  if (!versionId) {
+      toast("缺少流程版本 ID");
+      return;
+    }
+  const compiledRules = syncWorkflowRuleEditorState();
+  if (!compiledRules) {
+    toast("流程规则状态为空");
+    return;
+  }
+  const saved = await api(`/api/workflows/versions/${versionId}`, {
+    method: "PUT",
+    body: JSON.stringify({ compiled_rules: compiledRules, activate: true }),
+  });
+  await refreshWorkflowRules();
+  closeWorkflowRuleEditor();
+  toast("流程规则已更新并启用");
+}
+
+function renderWorkflowChatPreview() {
+  const node = $("#workflow-chat-preview");
+  if (!node) return;
+  const saveButton = $("#workflow-chat-save");
+  if (saveButton) saveButton.disabled = !workflowChatState.compiledRule;
+  if (!workflowChatState.compiledRule && !(workflowChatState.validationErrors || []).length) {
+    node.classList.remove("show");
+    node.innerHTML = "";
+    return;
+  }
+  node.classList.add("show");
+  node.innerHTML = renderJsonPreview({
+    ready: Boolean(workflowChatState.ready),
+    edit_version_id: workflowChatState.editVersionId || "",
+    edit_workflow_name: workflowChatState.editWorkflowName || "",
+    validation_errors: workflowChatState.validationErrors || [],
+    compiled_rule: workflowChatState.compiledRule,
+  });
+}
+
+function renderJsonPreview(value, indent = 0) {
+  const pad = "  ".repeat(indent);
+  const nextPad = "  ".repeat(indent + 1);
+  if (value === null) return `<span class="json-null">null</span>`;
+  if (typeof value === "string") return `<span class="json-string">${h(JSON.stringify(value))}</span>`;
+  if (typeof value === "number") return `<span class="json-number">${h(String(value))}</span>`;
+  if (typeof value === "boolean") return `<span class="json-boolean">${value ? "true" : "false"}</span>`;
+  if (Array.isArray(value)) {
+    if (!value.length) return `<span class="json-punctuation">[]</span>`;
+    return [
+      `<span class="json-punctuation">[</span>`,
+      ...value.map((item, index) => `${nextPad}${renderJsonPreview(item, indent + 1)}${index < value.length - 1 ? '<span class="json-punctuation">,</span>' : ""}`),
+      `${pad}<span class="json-punctuation">]</span>`,
+    ].join("\n");
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value || {});
+    if (!entries.length) return `<span class="json-punctuation">{}</span>`;
+    return [
+      `<span class="json-punctuation">{</span>`,
+      ...entries.map(([key, item], index) => {
+        const comma = index < entries.length - 1 ? '<span class="json-punctuation">,</span>' : "";
+        return `${nextPad}<span class="json-key">${h(JSON.stringify(key))}</span><span class="json-punctuation">:</span> ${renderJsonPreview(item, indent + 1)}${comma}`;
+      }),
+      `${pad}<span class="json-punctuation">}</span>`,
+    ].join("\n");
+  }
+  return `<span class="json-null">${h(String(value))}</span>`;
+}
+
+function resetWorkflowChat() {
+  workflowChatState = { messages: [], compiledRule: null, validationErrors: [], ready: false, editVersionId: "", editWorkflowName: "" };
+  const log = $("#workflow-chat-log");
+  if (log) {
+    log.innerHTML = `
+      <div class="chat-message assistant">
+        <small>流程助手</small>
+        <p>请描述要新增或编辑的流程，我会通过多轮对话整理并生成可落库的流程规则。</p>
+      </div>
+    `;
+  }
+  const activate = $("#workflow-chat-activate");
+  if (activate) activate.checked = false;
+  renderWorkflowChatPreview();
+}
+
+function startWorkflowChatEdit(row) {
+  if (!row || !row.version_id || !row.rules) return;
+  workflowChatState = {
+    messages: [],
+    compiledRule: row.rules,
+    validationErrors: [],
+    ready: false,
+    editVersionId: row.version_id,
+    editWorkflowName: row.workflow_name || row.workflow_code || "",
+  };
+  const log = $("#workflow-chat-log");
+  if (log) {
+    log.innerHTML = `
+      <div class="chat-message assistant">
+        <small>流程助手</small>
+        <p>正在编辑“${h(workflowChatState.editWorkflowName)}”。请直接说明要修改的字段、规则或邮件模板。</p>
+      </div>
+    `;
+  }
+  const activate = $("#workflow-chat-activate");
+  if (activate) activate.checked = false;
+  renderWorkflowChatPreview();
+}
+
 async function refreshConfig() {
   const data = await api("/api/config");
+  runtimeConfigState = data.configs || {};
   fillForm("#runtime-mail-form", data.configs || {});
   fillForm("#e2e-mail-form", data.configs || {});
   if (data.model) {
@@ -478,6 +956,7 @@ async function refreshConfig() {
   });
   const modelKey = $("#model-form [name=api_key]");
   if (modelKey) modelKey.value = "";
+  renderSystemToggle();
 }
 
 async function refreshWeeklyReportRecipients() {
@@ -744,6 +1223,7 @@ async function refreshAll() {
     refreshOutbound(),
     refreshExceptions(),
     refreshInitialReviewRules(),
+    refreshWorkflowRules(),
     refreshConfig(),
     refreshWeeklyReportRecipients(),
     refreshJobs(),
@@ -756,6 +1236,7 @@ async function refreshAll() {
 
 const defaultTableStates = JSON.parse(JSON.stringify(tableStates));
 const tableRefreshers = {
+  workflows: refreshWorkflowRules,
   departments: refreshDepartments,
   mails: refreshMails,
   outbound: refreshOutbound,
@@ -878,13 +1359,6 @@ $("#template-form").addEventListener("submit", async (event) => {
   await refreshAll();
 });
 
-$("#initial-review-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await saveInitialReviewRules();
-  toast("初审规则已保存");
-  await refreshAll();
-});
-
 $("#initial-review-rule-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -893,20 +1367,27 @@ $("#initial-review-rule-form").addEventListener("submit", async (event) => {
     toast("请填写规则名称、字段和判断方式");
     return;
   }
+  const candidateRule = {
+    id: reviewRuleId(),
+    name: data.name,
+    field: data.field,
+    operator: data.operator,
+    value: data.value || "",
+    message: data.message || `${optionLabel(initialReviewState.field_options || [], data.field)} 未通过初审规则：${data.name}`,
+    enabled: true,
+  };
+  const candidateSignature = reviewRuleSignature(candidateRule);
+  if ((initialReviewState.rules || []).some((rule) => !isReadonlyReviewRule(rule) && reviewRuleSignature(rule) === candidateSignature)) {
+    toast("规则已存在，已忽略重复添加");
+    return;
+  }
   initialReviewState.rules = [
     ...(initialReviewState.rules || []),
-    {
-      id: reviewRuleId(),
-      name: data.name,
-      field: data.field,
-      operator: data.operator,
-      value: data.value || "",
-      message: data.message || `${optionLabel(initialReviewState.field_options || [], data.field)} 未通过初审规则：${data.name}`,
-      enabled: true,
-    },
+    candidateRule,
   ];
   await saveInitialReviewRules();
   form.reset();
+  closeInitialReviewRuleModal();
   toast("自定义初审规则已添加");
 });
 
@@ -915,15 +1396,279 @@ $("#initial-review-rules-list").addEventListener("click", async (event) => {
   if (!target) return;
   const id = target.dataset.id;
   if (target.dataset.action === "delete-review-rule") {
+    if ((initialReviewState.rules || []).some((rule) => String(rule.id || "") === id && isReadonlyReviewRule(rule))) {
+      toast("系统内置规则只能查看，不能删除");
+      return;
+    }
     initialReviewState.rules = (initialReviewState.rules || []).filter((rule) => rule.id !== id);
   }
   if (target.dataset.action === "toggle-review-rule") {
+    if ((initialReviewState.rules || []).some((rule) => String(rule.id || "") === id && isReadonlyReviewRule(rule))) {
+      toast("系统内置规则只能查看，不能停用");
+      return;
+    }
     initialReviewState.rules = (initialReviewState.rules || []).map((rule) =>
       rule.id === id ? { ...rule, enabled: rule.enabled === false } : rule
     );
   }
   await saveInitialReviewRules();
   toast("初审规则已更新");
+});
+
+$("#workflow-chat-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const input = form.querySelector("[name=message]");
+  const button = form.querySelector("button[type=submit]");
+  const message = String(input.value || "").trim();
+  if (!message) {
+    toast("请输入流程描述或补充信息");
+    return;
+  }
+  appendChatMessage("user", "你", message, "#workflow-chat-log");
+  workflowChatState.messages.push({ role: "user", content: message });
+  input.value = "";
+  button.disabled = true;
+  try {
+    const result = await api("/api/workflows/chat/generate", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: workflowChatState.messages,
+        current_rule: workflowChatState.compiledRule || undefined,
+        edit_version_id: workflowChatState.editVersionId || undefined,
+      }),
+    });
+    const reply = String(result.reply || "已更新流程草稿。");
+    appendChatMessage("assistant", "流程助手", reply, "#workflow-chat-log");
+    workflowChatState.messages.push({ role: "assistant", content: reply });
+    workflowChatState.ready = Boolean(result.ready);
+    workflowChatState.validationErrors = Array.isArray(result.validation_errors) ? result.validation_errors : [];
+    workflowChatState.editVersionId = String(result.edit_version_id || workflowChatState.editVersionId || "");
+    workflowChatState.editWorkflowName = String(result.edit_workflow_name || workflowChatState.editWorkflowName || "");
+    if (result.compiled_rule && typeof result.compiled_rule === "object") {
+      workflowChatState.compiledRule = result.compiled_rule;
+    }
+    if (result.next_question && String(result.next_question).trim() && !reply.includes(String(result.next_question).trim())) {
+      const nextQuestion = String(result.next_question).trim();
+      appendChatMessage("assistant", "流程助手", nextQuestion, "#workflow-chat-log");
+      workflowChatState.messages.push({ role: "assistant", content: nextQuestion });
+    }
+    renderWorkflowChatPreview();
+    const notification = String(result.notification || "").trim();
+    if (workflowChatState.ready) {
+      toast(notification || "流程草稿已就绪，可直接保存");
+    } else if (workflowChatState.validationErrors.length) {
+      toast(`草稿已更新，仍有 ${workflowChatState.validationErrors.length} 条校验提示`);
+    } else {
+      toast("流程草稿已更新");
+    }
+  } catch (error) {
+    appendChatMessage("error", "错误", error.message || "流程对话生成失败", "#workflow-chat-log");
+    toast(error.message || "流程对话生成失败");
+  } finally {
+    button.disabled = false;
+    input.focus();
+  }
+});
+
+$("#workflow-chat-reset").addEventListener("click", () => {
+  resetWorkflowChat();
+  toast("流程对话已清空");
+});
+
+$("#workflow-chat-save").addEventListener("click", async () => {
+  if (!workflowChatState.compiledRule) {
+    toast("请先完成流程对话并生成草稿");
+    return;
+  }
+  const activate = $("#workflow-chat-activate")?.checked || false;
+  const result = await api("/api/workflows/chat/save", {
+    method: "POST",
+    body: JSON.stringify({
+      compiled_rule: workflowChatState.compiledRule,
+      activate,
+      edit_version_id: workflowChatState.editVersionId || undefined,
+    }),
+  });
+  const resultNode = $("#workflow-import-result");
+  resultNode.classList.add("show");
+  resultNode.textContent = JSON.stringify(result, null, 2);
+  await refreshWorkflowRules();
+  const validationErrors = Array.isArray(result.validation_errors) ? result.validation_errors : [];
+  if (!activate && Array.isArray(result.created_versions) && result.created_versions.length) {
+    const versionId = result.created_versions[0].id;
+    const row = findWorkflowVersion(versionId);
+    if (row) openWorkflowRuleEditor(row.version_id, row.rules);
+  }
+  if (validationErrors.length) {
+    toast("流程存在校验问题，请查看结果并编辑原流程");
+    return;
+  }
+  if (workflowChatState.editVersionId) {
+    toast(activate ? "已有流程已保存并启用" : "已有流程已保存为草稿");
+  } else {
+    toast(activate ? "对话生成流程已保存并启用" : "对话生成流程已保存为草稿");
+  }
+});
+
+$("#workflow-import-open")?.addEventListener("click", openWorkflowImportModal);
+
+$("#workflow-import-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const selectedFile = form.get("workflow_file") instanceof File ? form.get("workflow_file") : null;
+  const payload = {
+    raw_text: String(form.get("raw_text") || "").trim(),
+    prefer_llm: $("#workflow-import-form [name=prefer_llm]").checked,
+    auto_publish: $("#workflow-import-form [name=auto_publish]").checked,
+  };
+  if (selectedFile && selectedFile.size > 0) {
+    payload.file_name = selectedFile.name;
+    payload.file_content_base64 = arrayBufferToBase64(await selectedFile.arrayBuffer());
+  }
+  if (!payload.file_content_base64 && !payload.raw_text) {
+    toast("请选择流程文档或粘贴流程文本");
+    return;
+  }
+  const resultNode = $("#workflow-import-result");
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在导入并生成流程规则...";
+  const result = await api("/api/workflows/import", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  resultNode.textContent = JSON.stringify(result, null, 2);
+  await refreshWorkflowRules();
+  const validationErrors = Array.isArray(result.validation_errors) ? result.validation_errors : [];
+  if (!payload.auto_publish && Array.isArray(result.created_versions) && result.created_versions.length) {
+    const versionId = result.created_versions[0].id;
+    const row = findWorkflowVersion(versionId);
+    if (row) {
+      closeWorkflowImportModal();
+      openWorkflowRuleEditor(row.version_id, row.rules);
+    }
+  }
+  if (validationErrors.length) {
+    toast("流程存在重复或校验问题，请查看导入结果并编辑原流程");
+    return;
+  }
+  toast(payload.auto_publish ? "流程规则已导入并启用" : "流程规则已导入为草稿，请人工复核后启用");
+});
+
+$("#workflow-rules-list").addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  const versionId = target.dataset.id;
+  if (!versionId) return;
+  const row = findWorkflowVersion(versionId);
+  if (target.dataset.action === "view-workflow-version") {
+    openWorkflowRuleEditor(versionId, row?.rules || {}, { readonly: true });
+    return;
+  }
+  if (target.dataset.action === "edit-workflow-version") {
+    if (!row || !row.editable) {
+      toast("流程启用中，需先停用后再编辑");
+      return;
+    }
+    openWorkflowRuleEditor(versionId, row?.rules || {});
+    return;
+  }
+  if (target.dataset.action === "llm-edit-workflow-version") {
+    if (!row || !row.editable) {
+      toast("流程启用中，需先停用后再用 LLM 编辑");
+      return;
+    }
+    startWorkflowChatEdit(row);
+    toast("已载入已有流程，后续对话将编辑该流程");
+    return;
+  }
+  if (target.dataset.action === "activate-workflow-version") {
+    await api(`/api/workflows/versions/${versionId}/activate`, { method: "POST" });
+    toast("流程规则已启用");
+    await refreshWorkflowRules();
+    return;
+  }
+  if (target.dataset.action === "deactivate-workflow-version") {
+    await api(`/api/workflows/versions/${versionId}/deactivate`, { method: "POST" });
+    if ($("#workflow-rule-editor-form [name=version_id]")?.value === versionId) closeWorkflowRuleEditor();
+    toast("流程规则已停用");
+    await refreshWorkflowRules();
+    return;
+  }
+  if (target.dataset.action === "delete-workflow-version") {
+    if (!row || !row.deletable) {
+      toast("流程启用中，需先停用后再删除");
+      return;
+    }
+    const ok = window.confirm("删除后将无法恢复，确认删除该流程版本？");
+    if (!ok) return;
+    await api(`/api/workflows/versions/${versionId}`, { method: "DELETE" });
+    if ($("#workflow-rule-editor-form [name=version_id]")?.value === versionId) closeWorkflowRuleEditor();
+    toast("流程规则已删除");
+    await refreshWorkflowRules();
+  }
+});
+
+$("#workflow-rule-editor-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await saveWorkflowRuleEditor();
+});
+
+$("#workflow-rule-editor-form").addEventListener("click", async (event) => {
+  const target = event.target.closest("button[data-action]");
+  if (!target) return;
+  const action = target.dataset.action;
+  if (action === "add-workflow-review-rule") {
+    syncWorkflowRuleEditorState();
+    const select = $("#workflow-rule-editor-form [name=review_rule_source]");
+    const sourceId = select?.value || "";
+    const sourceRule = (initialReviewState.rules || []).find((rule) => String(rule.id || "") === sourceId);
+    if (!sourceRule || !workflowRulesState.editingRules) {
+      toast("请选择要添加的初审规则");
+      return;
+    }
+    const exists = (workflowRulesState.editingRules.review_rules || []).some((rule) => String(rule.id || "") === sourceId);
+    if (exists) {
+      toast("该规则已在当前流程中");
+      return;
+    }
+    workflowRulesState.editingRules.review_rules = [
+      ...(workflowRulesState.editingRules.review_rules || []),
+      { ...sourceRule, enabled: sourceRule.enabled !== false },
+    ];
+    renderWorkflowRuleEditor();
+    toast("已添加到当前流程规则");
+    return;
+  }
+  if (action === "remove-workflow-review-rule") {
+    syncWorkflowRuleEditorState();
+    if (!workflowRulesState.editingRules) return;
+    const id = target.dataset.id || "";
+    if ((workflowRulesState.editingRules.review_rules || []).some((rule) => String(rule.id || "") === id && isReadonlyReviewRule(rule))) {
+      toast("系统内置规则只能查看，不能移除");
+      return;
+    }
+    workflowRulesState.editingRules.review_rules = (workflowRulesState.editingRules.review_rules || []).filter(
+      (rule) => String(rule.id || "") !== id
+    );
+    renderWorkflowRuleEditor();
+    toast("已从当前流程移除规则");
+    return;
+  }
+  if (action === "save-activate") {
+    if (workflowRulesState.readonly) return;
+    await saveWorkflowRuleEditor();
+    return;
+  }
+  if (action === "cancel-edit") {
+    closeWorkflowRuleEditor();
+  }
+});
+
+$("#workflow-rule-editor-form")?.addEventListener("change", (event) => {
+  if (event.target.matches("[name=workflow_required_field], [name=routing_to_names], [name=routing_cc_names], [name=max_question_rounds], [name=conversation_exceeded_message]")) {
+    syncWorkflowRuleEditorState();
+  }
 });
 
 $("#runtime-mail-form").addEventListener("submit", async (event) => {
@@ -939,6 +1684,7 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
     toast("邮箱登录/发信间隔不能低于 60 秒");
     return;
   }
+  values.bot_enabled = $("#runtime-mail-form [name=bot_enabled]").checked;
   values.llm_fallback_enabled = $("#runtime-mail-form [name=llm_fallback_enabled]").checked;
   await api("/api/config/mail", {
     method: "PUT",
@@ -1018,28 +1764,18 @@ $("#enqueue-weekly-report").addEventListener("click", async () => {
   });
 });
 
-$("#sync-mailbox").addEventListener("click", async () => {
-  await guardedAction(["邮箱", "同步"], async () => {
-    const result = await api("/api/mailbox/sync", { method: "POST" });
-    toast(`已同步 ${result.imported} 封邮件，入队 ${result.queued} 条`);
-    await refreshAll();
+$("#system-toggle")?.addEventListener("click", async () => {
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
+  const nextEnabled = !enabled;
+  await api("/api/config/mail", {
+    method: "PUT",
+    body: JSON.stringify({ bot_enabled: nextEnabled }),
   });
-});
-
-$("#run-jobs").addEventListener("click", async () => {
-  await guardedAction(["队列", "运行入库"], async () => {
-    const result = await api("/api/jobs/run-pending", { method: "POST" });
-    toast(`队列完成 ${result.completed} 条，失败 ${result.failed} 条`);
-    await refreshAll();
-  });
-});
-
-$("#send-pending").addEventListener("click", async () => {
-  await guardedAction(["外发", "发送待发邮件"], async () => {
-    const result = await api("/api/outbound-mails/send-pending", { method: "POST" });
-    toast(`已发送 ${result.sent} 封邮件，失败 ${result.failed || 0} 封`);
-    await refreshAll();
-  });
+  runtimeConfigState = { ...runtimeConfigState, bot_enabled: String(nextEnabled) };
+  const runtimeToggle = $("#runtime-mail-form [name=bot_enabled]");
+  if (runtimeToggle) runtimeToggle.checked = nextEnabled;
+  renderSystemToggle();
+  toast(nextEnabled ? "系统已启用" : "系统已停用");
 });
 
 $("#outbound-list").addEventListener("click", async (event) => {
@@ -1153,12 +1889,39 @@ $("#tasks").addEventListener("click", async (event) => {
   const action = target.dataset.action;
   if (action === "workflow") {
     await openWorkflow(id);
+    return;
+  }
+  if (action === "manual-close-task") {
+    const note = window.prompt("关闭说明", "商务人工强制关闭");
+    if (note === null) return;
+    await api(`/api/tasks/${id}/manual-close`, {
+      method: "POST",
+      body: JSON.stringify({ note: note.trim() }),
+    });
+    toast("任务已手动关闭，并已通知销售和生产");
+    await refreshAll();
   }
 });
 
 $("#workflow-close").addEventListener("click", closeWorkflow);
 $("#workflow-modal").addEventListener("click", (event) => {
   if (event.target.id === "workflow-modal") closeWorkflow();
+});
+
+$("#workflow-editor-close")?.addEventListener("click", closeWorkflowRuleEditor);
+$("#workflow-editor-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "workflow-editor-modal") closeWorkflowRuleEditor();
+});
+
+$("#workflow-import-close")?.addEventListener("click", closeWorkflowImportModal);
+$("#workflow-import-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "workflow-import-modal") closeWorkflowImportModal();
+});
+
+$("#initial-review-rule-open")?.addEventListener("click", openInitialReviewRuleModal);
+$("#initial-review-rule-close")?.addEventListener("click", closeInitialReviewRuleModal);
+$("#initial-review-rule-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "initial-review-rule-modal") closeInitialReviewRuleModal();
 });
 
 $("#weekly-preview-close").addEventListener("click", closeWeeklyReportPreview);
@@ -1219,6 +1982,7 @@ function formatE2EResult(result) {
   return lines.join("\n");
 }
 
+resetWorkflowChat();
 setActivePage();
 ensureAuthenticated()
   .then((authenticated) => {

@@ -9,7 +9,7 @@ from backend.app.database import SessionLocal
 from backend.app.models import OutboundMailJob
 from backend.app.services.jobs import run_pending_jobs
 from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, send_pending_auto_workflow_mails_smtp, sync_imap_mailbox
-from backend.app.services.workflow import get_config
+from backend.app.services.workflow import bot_enabled, get_config
 
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 def run_mail_auto_worker_once() -> dict:
     with SessionLocal() as session:
+        if not bot_enabled(session):
+            return {
+                "enabled": False,
+                "synced": {"imported": 0, "queued": 0, "skipped": "bot is disabled"},
+                "processed": {"completed": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"},
+                "auto_workflow_mails": {"sent": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"},
+            }
         if not get_config(session, "bot_email_password", ""):
             return {"enabled": True, "skipped": "bot_email_password is not configured"}
 

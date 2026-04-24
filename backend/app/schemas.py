@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -40,6 +42,10 @@ class SalesReplyRequest(BaseModel):
     reply_text: str
 
 
+class TaskManualCloseRequest(BaseModel):
+    note: str = ""
+
+
 class ExceptionResolveRequest(BaseModel):
     note: str = ""
 
@@ -77,6 +83,7 @@ class MailRuntimeConfigUpdate(BaseModel):
     zip_max_depth: int | None = None
     storage_budget_bytes: int | None = None
     non_target_retention_days: int | None = None
+    bot_enabled: bool | None = None
     llm_fallback_enabled: bool | None = None
     conversation_max_rounds: int | None = None
     e2e_sales_email: str | None = None
@@ -115,3 +122,38 @@ class ModelProviderUpdate(BaseModel):
 class ModelChatTestRequest(BaseModel):
     message: str
     system_prompt: str | None = None
+
+
+class WorkflowImportRequest(BaseModel):
+    file_path: str | None = None
+    file_name: str | None = None
+    file_content_base64: str | None = None
+    raw_text: str | None = None
+    prefer_llm: bool = True
+    auto_publish: bool = True
+
+
+class WorkflowContactMapUpdate(BaseModel):
+    mapping: dict[str, str | list[str]] = {}
+
+
+class WorkflowVersionUpdateRequest(BaseModel):
+    compiled_rules: dict[str, Any]
+    activate: bool = False
+
+
+class WorkflowChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class WorkflowChatGenerateRequest(BaseModel):
+    messages: list[WorkflowChatMessage] = []
+    current_rule: dict[str, Any] | None = None
+    edit_version_id: str | None = None
+
+
+class WorkflowChatSaveRequest(BaseModel):
+    compiled_rule: dict[str, Any]
+    activate: bool = False
+    edit_version_id: str | None = None

@@ -20,17 +20,27 @@ from backend.app.models import (
     ProcessingJob,
     ProductionDepartment,
     QuestionAndReply,
+    RequirementWorkflowBinding,
     ProductionTask,
     ProductionTaskVersion,
     SystemConfig,
+    WorkflowVersion,
     now_utc,
 )
 from backend.app.services.jsonutil import as_list, dumps, loads
-from backend.app.services.initial_review import evaluate_initial_review, find_recent_duplicate_requirement, serialize_review_failures
+from backend.app.services.initial_review import ReviewFailure, evaluate_initial_review, find_recent_duplicate_requirement, serialize_review_failures
 from backend.app.services.llm_fallback import LLMMailClassification, classify_mail_with_llm, extract_requirement_with_llm
 from backend.app.services.model_provider import call_model, extract_chat_content
 from backend.app.services.parser import ExtractedRequirement, classify_mail, extract_requirement
 from backend.app.services.templates import render_template
+from backend.app.services.workflow_rules import (
+    CORE_FIELD_LABELS,
+    extract_workflow_fields,
+    match_workflow_for_mail,
+    resolve_contact_emails,
+    upsert_mail_workflow_match,
+    workflow_binding_for_requirement,
+)
 
 
 TASK_NO_PATTERN = re.compile(r"PT-\d{8}-\d{4}", re.IGNORECASE)
@@ -42,6 +52,7 @@ STATUS_QUERY_KEYWORDS = ["查询", "查一下", "查看", "统计", "状态", "�
 STATUS_QUERY_INTENT_KEYWORDS = ["状态", "进度", "处理到哪", "到哪了", "统计", "汇总", "列表", "明细", "多少", "有哪些", "查询", "查看"]
 PRODUCTION_CONFIRM_KEYWORDS = ["确认", "确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS = ["确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
+PRODUCTION_TERMINATE_KEYWORDS = ["终止生产", "停止生产", "暂停生产", "取消生产", "终止排产", "停止排单", "停止该任务", "终止该任务"]
 SALES_ACK_CLASSIFICATIONS = {
     "SalesOrderRequirement",
     "SalesClarificationReply",
@@ -54,6 +65,10 @@ REPORT_TIMEZONE = timezone(timedelta(hours=8))
 def get_config(session: Session, key: str, fallback: str = "") -> str:
     config = session.get(SystemConfig, key)
     return config.value if config is not None else fallback
+
+
+def bot_enabled(session: Session) -> bool:
+    return get_config(session, "bot_enabled", "true").lower() in {"1", "true", "yes", "on"}
 
 
 def add_audit(session: Session, event_type: str, object_type: str, object_id: str, detail: dict, actor: str = "System") -> None:
@@ -203,6 +218,11 @@ def looks_like_pending_task_query(text: str) -> bool:
     return any(keyword in text for keyword in PRODUCTION_PENDING_QUERY_KEYWORDS)
 
 
+def looks_like_production_termination(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in PRODUCTION_TERMINATE_KEYWORDS)
+
+
 def looks_like_production_confirmation(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if any(keyword in compact for keyword in PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS):
@@ -216,7 +236,20 @@ def looks_like_production_confirmation(text: str) -> bool:
     return False
 
 
-def conversation_max_rounds(session: Session) -> int:
+def conversation_max_rounds(session: Session, task: ProductionTask | None = None) -> int:
+    if task is not None:
+        binding = workflow_binding_for_requirement(session, task.requirement_id)
+        if binding is not None and binding.workflow_version_id:
+            version = session.get(WorkflowVersion, binding.workflow_version_id)
+            rules = loads(version.compiled_rules_json, {}) if version is not None else {}
+            policy = rules.get("conversation_policy") if isinstance(rules, dict) else {}
+            if isinstance(policy, dict):
+                try:
+                    workflow_rounds = int(policy.get("max_question_rounds") or 0)
+                except (TypeError, ValueError):
+                    workflow_rounds = 0
+                if workflow_rounds > 0:
+                    return max(1, workflow_rounds)
     raw = get_config(session, "conversation_max_rounds", "3")
     try:
         value = int(raw)
@@ -395,6 +428,28 @@ def mail_text_with_attachments(session: Session, mail: MailMessage) -> str:
     return "\n\n".join([mail.body_text, *attachment_parts]).strip()
 
 
+def workflow_context_text_for_requirement(
+    session: Session,
+    requirement: OrderRequirement,
+    current_mail: MailMessage,
+    current_source_text: str,
+) -> str:
+    parts: list[str] = []
+    origin_mail = session.get(MailMessage, requirement.source_mail_id) if requirement.source_mail_id else None
+    if origin_mail is not None and origin_mail.id != current_mail.id:
+        origin_text = mail_text_with_attachments(session, origin_mail)
+        if origin_text:
+            parts.append(origin_text)
+    if current_source_text:
+        parts.append(current_source_text)
+    deduped: list[str] = []
+    for item in parts:
+        text = item.strip()
+        if text and text not in deduped:
+            deduped.append(text)
+    return "\n\n".join(deduped).strip()
+
+
 def create_extraction_evidence(session: Session, requirement: OrderRequirement, mail: MailMessage, source_text: str) -> None:
     values = {
         "customer_name": requirement.customer_name,
@@ -440,6 +495,173 @@ def find_evidence_line(text: str, value: str) -> str:
 
 def route_is_configured(session: Session) -> bool:
     return bool(as_list(primary_department(session).mail_to_json))
+
+
+WORKFLOW_EXTRA_FIELD_LABELS = {
+    "material_details": "物料详情描述",
+    "logistics_method": "物流发货方式",
+    "shipping_time_requirement": "出货时间要求",
+    "customer_receiver_info": "客户收件信息",
+    "delivery_requirement": "交付要求",
+    "shipping_warehouse": "出货仓/借货仓",
+    "borrow_time": "借用时间",
+    "return_time": "归还时间",
+    "sample_approval_screenshot": "样机借用审批截图",
+}
+
+
+def workflow_field_label(field: str) -> str:
+    return CORE_FIELD_LABELS.get(field) or WORKFLOW_EXTRA_FIELD_LABELS.get(field) or field
+
+
+def workflow_required_field_missing(requirement: OrderRequirement, extracted_fields: dict[str, str], field: str) -> bool:
+    if field in CORE_FIELD_LABELS:
+        return not bool(getattr(requirement, field, "") or "")
+    return not bool((extracted_fields or {}).get(field))
+
+
+def upsert_requirement_workflow_binding(
+    session: Session,
+    requirement: OrderRequirement,
+    mail: MailMessage,
+    source_text: str,
+) -> tuple[RequirementWorkflowBinding | None, list[ReviewFailure], list[str], list[str]]:
+    match = match_workflow_for_mail(session, mail, source_text)
+    upsert_mail_workflow_match(session, mail, match)
+    if match is None:
+        return None, [], [], []
+
+    rule = match.rule
+    routing = rule.get("routing") if isinstance(rule.get("routing"), dict) else {}
+    to_names = [str(item) for item in routing.get("to_names", []) if str(item).strip()]
+    cc_names = [str(item) for item in routing.get("cc_names", []) if str(item).strip()]
+    to_emails, unresolved_to = resolve_contact_emails(
+        session,
+        to_names,
+        salesperson_email=requirement.salesperson_email,
+    )
+    cc_emails, unresolved_cc = resolve_contact_emails(
+        session,
+        cc_names,
+        salesperson_email=requirement.salesperson_email,
+    )
+    required_fields = [str(item) for item in rule.get("required_fields", []) if str(item).strip()]
+    extracted_fields = extract_workflow_fields(source_text, required_fields)
+    missing_labels: list[str] = []
+    failures: list[ReviewFailure] = []
+    risk_flags: list[str] = []
+
+    for field in required_fields:
+        if workflow_required_field_missing(requirement, extracted_fields, field):
+            label = workflow_field_label(field)
+            if label not in missing_labels:
+                missing_labels.append(label)
+            failures.append(
+                ReviewFailure(
+                    field=field,
+                    field_label=label,
+                    rule_name="流程规则必填字段",
+                    message=f"{label}缺失，未通过流程规则校验。",
+                )
+            )
+
+    required_attachments = [str(item) for item in rule.get("required_attachments", []) if str(item).strip()]
+    for attachment_hint in required_attachments:
+        if attachment_hint and attachment_hint not in source_text:
+            message = f"缺少流程要求附件：{attachment_hint}"
+            failures.append(
+                ReviewFailure(
+                    field="source_text",
+                    field_label="邮件全文",
+                    rule_name="流程附件校验",
+                    message=message,
+                )
+            )
+            risk_flags.append(message)
+
+    review_rules = [item for item in rule.get("review_rules", []) if isinstance(item, dict)]
+    if review_rules:
+        review_result = evaluate_initial_review(
+            session,
+            requirement,
+            source_text=source_text,
+            parser_risk_flags=[],
+            required_fields_override=[],
+            rules_override=review_rules,
+            include_duplicate_check=False,
+        )
+        failures.extend(review_result.failures)
+        for flag in review_result.risk_flags:
+            if flag and flag not in risk_flags:
+                risk_flags.append(flag)
+
+    unresolved_contacts = sorted(set(unresolved_to + unresolved_cc))
+    for name in unresolved_contacts:
+        message = f"流程收件人未映射邮箱：{name}"
+        failures.append(
+            ReviewFailure(
+                field="source_text",
+                field_label="流程路由",
+                rule_name="流程路由校验",
+                message=message,
+            )
+        )
+        risk_flags.append(message)
+
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    if binding is None:
+        binding = RequirementWorkflowBinding(requirement_id=requirement.id)
+        session.add(binding)
+    binding.workflow_version_id = match.version.id
+    binding.workflow_code = str(rule.get("workflow_code") or "")
+    binding.workflow_name = str(rule.get("workflow_name") or "")
+    binding.match_confidence = match.confidence
+    binding.route_to_json = dumps(to_emails)
+    binding.route_cc_json = dumps(cc_emails)
+    binding.subject_template = str(rule.get("subject_template") or "") or "[生产任务单][{{task_no}}][{{customer_name}}][{{product_summary}}][V{{version_no}}]"
+    binding.body_template = str(rule.get("body_template") or "") or (
+        "生产部同事好：\n\n"
+        "请根据以下信息安排生产评估和排产。\n\n"
+        "任务单编号：{{task_no}}\n"
+        "版本：V{{version_no}}\n"
+        "客户名称：{{customer_name}}\n"
+        "销售人员：{{salesperson_name}} <{{salesperson_email}}>\n\n"
+        "产品/规格：{{product_summary}}\n"
+        "数量：{{quantity_text}}\n"
+        "期望交期：{{expected_delivery_date}}\n\n"
+        "请确认是否可以安排生产。如信息不足，请直接回复本邮件说明疑问点。\n\n"
+        "{{bot_signature}}\n"
+    )
+    binding.required_fields_json = dumps(required_fields)
+    binding.required_attachments_json = dumps(required_attachments)
+    binding.extracted_fields_json = dumps(extracted_fields)
+    binding.missing_fields_json = dumps(missing_labels)
+    binding.unresolved_contacts_json = dumps(unresolved_contacts)
+    binding.updated_at = now_utc()
+    session.flush()
+    return binding, failures, missing_labels, risk_flags
+
+
+def routing_for_requirement(
+    session: Session,
+    requirement: OrderRequirement,
+) -> tuple[list[str], list[str], RequirementWorkflowBinding | None]:
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    if binding is not None and as_list(binding.route_to_json):
+        return as_list(binding.route_to_json), as_list(binding.route_cc_json), binding
+    department = primary_department(session)
+    return as_list(department.mail_to_json), as_list(department.mail_cc_json), binding
+
+
+def task_template_for_requirement(
+    session: Session,
+    requirement: OrderRequirement,
+) -> tuple[str, str, RequirementWorkflowBinding | None]:
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    if binding is not None and binding.subject_template and binding.body_template:
+        return binding.subject_template, binding.body_template, binding
+    template = active_task_template(session)
+    return template.subject_template, template.body_template, binding
 
 
 def merge_extracted_requirement(
@@ -567,37 +789,70 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
     session.flush()
     create_extraction_evidence(session, requirement, mail, source_text)
 
-    review = evaluate_initial_review(session, requirement, source_text=source_text, parser_risk_flags=extracted.risk_flags)
-    requirement.missing_fields_json = dumps(review.missing_fields)
-    requirement.risk_flags_json = dumps(review.risk_flags)
-    requirement.status = "ReviewFailed" if not review.passed else "TaskCreated"
+    workflow_binding, workflow_failures, workflow_missing_fields, workflow_risk_flags = upsert_requirement_workflow_binding(
+        session,
+        requirement,
+        mail,
+        source_text,
+    )
+    if workflow_binding is None:
+        review = evaluate_initial_review(session, requirement, source_text=source_text, parser_risk_flags=extracted.risk_flags)
+    else:
+        review = evaluate_initial_review(
+            session,
+            requirement,
+            source_text=source_text,
+            parser_risk_flags=extracted.risk_flags,
+            required_fields_override=[],
+            rules_override=[],
+        )
+    all_failures = [*review.failures, *workflow_failures]
+    merged_missing_fields: list[str] = []
+    for label in [*review.missing_fields, *workflow_missing_fields]:
+        if label and label not in merged_missing_fields:
+            merged_missing_fields.append(label)
+    merged_risk_flags: list[str] = []
+    for flag in [*review.risk_flags, *workflow_risk_flags]:
+        if flag and flag not in merged_risk_flags:
+            merged_risk_flags.append(flag)
+    requirement.missing_fields_json = dumps(merged_missing_fields)
+    requirement.risk_flags_json = dumps(merged_risk_flags)
+    requirement.status = "ReviewFailed" if all_failures else "TaskCreated"
 
-    if not review.passed:
+    if all_failures:
         record_exception_case(
             session,
             exception_type="ReviewNeedManual",
-            severity="High" if review.risk_flags else "Medium",
+            severity="High" if merged_risk_flags else "Medium",
             detail={
                 "requirement_id": requirement.id,
                 "source_mail_id": mail.id,
-                "missing_fields": review.missing_fields,
-                "risk_flags": review.risk_flags,
-                "review_failures": serialize_review_failures(review.failures),
+                "missing_fields": merged_missing_fields,
+                "risk_flags": merged_risk_flags,
+                "review_failures": serialize_review_failures(all_failures),
+                "workflow_code": workflow_binding.workflow_code if workflow_binding is not None else None,
+                "workflow_name": workflow_binding.workflow_name if workflow_binding is not None else None,
             },
             source_mail_id=mail.id,
         )
-        enqueue_initial_review_rejection(session, requirement, review.failures)
+        enqueue_initial_review_rejection(session, requirement, all_failures)
         add_audit(
             session,
             "RequirementReviewFailed",
             "OrderRequirement",
             requirement.id,
-            {"missing": review.missing_fields, "risk_flags": review.risk_flags},
+            {"missing": merged_missing_fields, "risk_flags": merged_risk_flags},
         )
         return None
 
-    if not route_is_configured(session):
+    to_addresses, _cc_addresses, binding = routing_for_requirement(session, requirement)
+    if not to_addresses:
         requirement.status = "ReviewFailed"
+        routing_message = "生产部门邮箱未配置"
+        routing_hint = "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。"
+        if binding is not None and binding.workflow_code:
+            routing_message = f"流程 {binding.workflow_name or binding.workflow_code} 的收件邮箱未配置"
+            routing_hint = "请先在【流程规则】中配置联系人映射（workflow_contact_map_json），再重新处理该订单。"
         record_exception_case(
             session,
             exception_type="RoutingMissing",
@@ -606,9 +861,10 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
                 "requirement_id": requirement.id,
                 "source_mail_id": mail.id,
                 "missing_fields": [],
-                "risk_flags": ["生产部门邮箱未配置"],
-                "message": "订单初审已通过，但未配置生产部门邮箱，系统无法自动创建生产任务。",
-                "action_hint": "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。",
+                "risk_flags": [routing_message],
+                "message": f"订单初审已通过，但{routing_message}，系统无法自动创建生产任务。",
+                "action_hint": routing_hint,
+                "workflow_code": binding.workflow_code if binding is not None else None,
             },
             source_mail_id=mail.id,
         )
@@ -727,40 +983,78 @@ def handle_requirement_supplement_reply(session: Session, mail: MailMessage) -> 
         return existing_task
 
     source_text = mail_text_with_attachments(session, mail)
+    review_source_text = workflow_context_text_for_requirement(session, requirement, mail, source_text)
     updates, parser_risk_flags = apply_requirement_supplement_updates(session, requirement, mail, source_text)
-    review = evaluate_initial_review(session, requirement, source_text=source_text, parser_risk_flags=parser_risk_flags)
-    requirement.missing_fields_json = dumps(review.missing_fields)
-    requirement.risk_flags_json = dumps(review.risk_flags)
+    workflow_binding, workflow_failures, workflow_missing_fields, workflow_risk_flags = upsert_requirement_workflow_binding(
+        session,
+        requirement,
+        mail,
+        review_source_text,
+    )
+    if workflow_binding is None:
+        review = evaluate_initial_review(
+            session,
+            requirement,
+            source_text=review_source_text,
+            parser_risk_flags=parser_risk_flags,
+        )
+    else:
+        review = evaluate_initial_review(
+            session,
+            requirement,
+            source_text=review_source_text,
+            parser_risk_flags=parser_risk_flags,
+            required_fields_override=[],
+            rules_override=[],
+        )
+    all_failures = [*review.failures, *workflow_failures]
+    merged_missing_fields: list[str] = []
+    for label in [*review.missing_fields, *workflow_missing_fields]:
+        if label and label not in merged_missing_fields:
+            merged_missing_fields.append(label)
+    merged_risk_flags: list[str] = []
+    for flag in [*review.risk_flags, *workflow_risk_flags]:
+        if flag and flag not in merged_risk_flags:
+            merged_risk_flags.append(flag)
+    requirement.missing_fields_json = dumps(merged_missing_fields)
+    requirement.risk_flags_json = dumps(merged_risk_flags)
 
-    if not review.passed:
+    if all_failures:
         requirement.status = "ReviewFailed"
         record_exception_case(
             session,
             exception_type="ReviewNeedManual",
-            severity="High" if review.risk_flags else "Medium",
+            severity="High" if merged_risk_flags else "Medium",
             detail={
                 "requirement_id": requirement.id,
                 "source_mail_id": mail.id,
                 "original_source_mail_id": requirement.source_mail_id,
-                "missing_fields": review.missing_fields,
-                "risk_flags": review.risk_flags,
-                "review_failures": serialize_review_failures(review.failures),
+                "missing_fields": merged_missing_fields,
+                "risk_flags": merged_risk_flags,
+                "review_failures": serialize_review_failures(all_failures),
                 "supplement_updates": updates,
+                "workflow_code": workflow_binding.workflow_code if workflow_binding is not None else None,
             },
             source_mail_id=mail.id,
         )
-        enqueue_initial_review_rejection(session, requirement, review.failures, idempotency_source=mail.id)
+        enqueue_initial_review_rejection(session, requirement, all_failures, idempotency_source=mail.id)
         add_audit(
             session,
             "RequirementSupplementStillFailed",
             "OrderRequirement",
             requirement.id,
-            {"source_mail_id": mail.id, "missing": review.missing_fields, "risk_flags": review.risk_flags, "updates": updates},
+            {"source_mail_id": mail.id, "missing": merged_missing_fields, "risk_flags": merged_risk_flags, "updates": updates},
         )
         return None
 
-    if not route_is_configured(session):
+    to_addresses, _cc_addresses, binding = routing_for_requirement(session, requirement)
+    if not to_addresses:
         requirement.status = "ReviewFailed"
+        routing_message = "生产部门邮箱未配置"
+        routing_hint = "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。"
+        if binding is not None and binding.workflow_code:
+            routing_message = f"流程 {binding.workflow_name or binding.workflow_code} 的收件邮箱未配置"
+            routing_hint = "请先在【流程规则】中配置联系人映射（workflow_contact_map_json），再重新处理该订单。"
         record_exception_case(
             session,
             exception_type="RoutingMissing",
@@ -769,9 +1063,10 @@ def handle_requirement_supplement_reply(session: Session, mail: MailMessage) -> 
                 "requirement_id": requirement.id,
                 "source_mail_id": mail.id,
                 "missing_fields": [],
-                "risk_flags": ["生产部门邮箱未配置"],
-                "message": "订单初审已通过，但未配置生产部门邮箱，系统无法自动创建生产任务。",
-                "action_hint": "请先在【生产邮箱】页面配置主送邮箱，保存后重新处理该订单。",
+                "risk_flags": [routing_message],
+                "message": f"订单初审已通过，但{routing_message}，系统无法自动创建生产任务。",
+                "action_hint": routing_hint,
+                "workflow_code": binding.workflow_code if binding is not None else None,
             },
             source_mail_id=mail.id,
         )
@@ -893,6 +1188,7 @@ def draft_task_from_requirement(
     if existing_task is not None:
         return existing_task
 
+    route_to, route_cc, _binding = routing_for_requirement(session, requirement)
     department = primary_department(session)
     task = ProductionTask(
         task_no=make_task_no(session),
@@ -900,21 +1196,21 @@ def draft_task_from_requirement(
         current_version_no=1,
         status="TaskDrafted",
         production_department_id=department.id,
-        target_mail_to_json=department.mail_to_json,
-        target_mail_cc_json=department.mail_cc_json,
+        target_mail_to_json=dumps(route_to),
+        target_mail_cc_json=dumps(route_cc),
     )
     session.add(task)
     session.flush()
 
     if mail is not None:
         mail.related_task_id = task.id
-    template = active_task_template(session)
+    subject_template, body_template, _binding = task_template_for_requirement(session, requirement)
     context = task_context(session, task, version_no=1)
     version = ProductionTaskVersion(
         task_id=task.id,
         version_no=1,
-        subject=render_template(template.subject_template, context),
-        body=render_template(template.body_template, context),
+        subject=render_template(subject_template, context),
+        body=render_template(body_template, context),
         status="Draft",
     )
     session.add(version)
@@ -927,7 +1223,7 @@ def draft_task_from_requirement(
 
 def task_context(session: Session, task: ProductionTask, version_no: int | None = None) -> dict[str, str | int | None]:
     requirement = task.requirement
-    return {
+    context: dict[str, str | int | None] = {
         "task_no": task.task_no,
         "version_no": version_no or task.current_version_no,
         "customer_name": requirement.customer_name,
@@ -936,8 +1232,19 @@ def task_context(session: Session, task: ProductionTask, version_no: int | None 
         "product_summary": requirement.product_summary,
         "quantity_text": requirement.quantity_text,
         "expected_delivery_date": requirement.expected_delivery_date,
+        "external_order_no": requirement.external_order_no,
         "bot_signature": get_config(session, "bot_signature", "积木易搭AI机器人"),
     }
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    if binding is not None:
+        context["workflow_code"] = binding.workflow_code
+        context["workflow_name"] = binding.workflow_name or binding.workflow_code
+        extracted_fields = loads(binding.extracted_fields_json, {})
+        if isinstance(extracted_fields, dict):
+            for key, value in extracted_fields.items():
+                if key and value not in (None, ""):
+                    context[str(key)] = str(value)
+    return context
 
 
 def approve_task(session: Session, task_id: str, actor: str = "business-owner") -> OutboundMailJob:
@@ -1003,6 +1310,10 @@ def record_production_question(
     task = session.get(ProductionTask, task_id)
     if task is None:
         raise ValueError("task not found")
+    if task.status == "Closed":
+        if source_mail is not None:
+            source_mail.related_task_id = task.id
+        raise ValueError(f"task is closed: {task.closed_reason or 'Closed'}")
     requirement = task.requirement
     salesperson_email = requirement.salesperson_email or ""
     ops_email = get_config(session, "ops_cc_email", "jinlei@jimuyida.com")
@@ -1016,7 +1327,7 @@ def record_production_question(
             .filter_by(task_id=task.id, production_question_mail_id=source_mail.id)
             .one_or_none()
         )
-    if existing_question is None and conversation_round_count(session, task) >= conversation_max_rounds(session):
+    if existing_question is None and conversation_round_count(session, task) >= conversation_max_rounds(session, task):
         return close_conversation_for_max_rounds(session, task, source_mail=source_mail)
 
     if source_mail is not None:
@@ -1125,13 +1436,21 @@ def close_conversation_for_max_rounds(
     if existing is not None:
         return existing
 
-    max_rounds = conversation_max_rounds(session)
+    max_rounds = conversation_max_rounds(session, task)
+    close_message = ""
+    binding = workflow_binding_for_requirement(session, task.requirement_id)
+    if binding is not None and binding.workflow_version_id:
+        version = session.get(WorkflowVersion, binding.workflow_version_id)
+        rules = loads(version.compiled_rules_json, {}) if version is not None else {}
+        policy = rules.get("conversation_policy") if isinstance(rules, dict) else {}
+        if isinstance(policy, dict):
+            close_message = str(policy.get("message") or "").strip()
     body = "\n".join(
         [
             "各位好，",
             "",
-            f"任务 {task.task_no} 的订单沟通会话已达到后台配置的最大往返次数（{max_rounds} 轮）。",
-            "本次订单需求已关闭，请销售重新发起完整的订单需求邮件。",
+            close_message or f"任务 {task.task_no} 的订单沟通会话已达到当前流程允许的最大往返次数（{max_rounds} 轮）。",
+            "本次订单需求已关闭，请销售重新发起完整的订单需求邮件，或由商务人工介入处理。",
             "",
             "当前订单信息：",
             f"客户名称：{requirement.customer_name or ''}",
@@ -1598,6 +1917,187 @@ def enqueue_production_confirmation_receipt(session: Session, task: ProductionTa
     return job
 
 
+def enqueue_closed_task_reply_rejected_notice(
+    session: Session,
+    task: ProductionTask,
+    source_mail: MailMessage,
+    *,
+    reason: str | None = None,
+) -> OutboundMailJob | None:
+    to_address = (source_mail.from_address or "").strip()
+    if not to_address:
+        return None
+    to_addresses = [to_address]
+    cc_addresses: list[str] = []
+    idem = f"closed-task-reply-rejected:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "您好，",
+            "",
+            f"任务 {task.task_no} 已关闭，系统不会再自动处理本次回复。",
+            f"关闭原因：{reason or task.closed_reason or 'Closed'}",
+            "",
+            "如需继续处理，请重新发起完整需求邮件，或联系商务部人工介入。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="ClosedTaskReplyRejected",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[任务已关闭][{task.task_no}] 本次回复未自动处理",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "ClosedTaskReplyRejectedQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def enqueue_sales_reply_no_open_question_notice(session: Session, task: ProductionTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    to_address = (source_mail.from_address or "").strip()
+    if not to_address:
+        return None
+    to_addresses = [to_address]
+    cc_addresses: list[str] = []
+    idem = f"sales-reply-no-open-question:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"任务 {task.task_no} 当前没有待您答复的生产疑问，系统未重新下发生产任务单。",
+            "",
+            "如需变更订单，请回复“订单变更 + 任务号”；如需撤回，请回复“撤回需求 + 任务号”（生产确认排单前有效）。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="SalesReplyNoOpenQuestion",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[未重新下发][{task.task_no}] 当前无待答复生产疑问",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "SalesReplyNoOpenQuestionQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def enqueue_production_terminate_sales_notice(session: Session, task: ProductionTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    sales_email = (task.requirement.salesperson_email or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    idem = f"production-terminate-sales:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"生产侧已终止任务 {task.task_no}，系统已关闭该任务。",
+            "",
+            "生产侧说明：",
+            (source_mail.body_text or "").strip() or "生产侧未填写说明。",
+            "",
+            "如需继续处理，请重新发起完整需求邮件，或联系商务部人工介入。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="ProductionTerminateSalesNotice",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[生产终止][{task.task_no}] 任务已关闭",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "ProductionTerminateSalesNoticeQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def enqueue_production_terminate_receipt(session: Session, task: ProductionTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    to_address = (source_mail.from_address or "").strip()
+    if not to_address:
+        return None
+    to_addresses = [to_address]
+    cc_addresses: list[str] = []
+    idem = f"production-terminate-receipt:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "生产部同事好，",
+            "",
+            f"任务 {task.task_no} 的生产终止请求已记录，系统已关闭任务并通知销售侧。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="ProductionTerminateProductionNotice",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[生产终止已记录][{task.task_no}] 任务已关闭",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "ProductionTerminateProductionNoticeQueued", "ProductionTask", task.id, {"source_mail_id": source_mail.id})
+    return job
+
+
+def record_production_termination(session: Session, task: ProductionTask, source_mail: MailMessage) -> list[OutboundMailJob]:
+    source_mail.related_task_id = task.id
+    if task.status == "Closed":
+        job = enqueue_closed_task_reply_rejected_notice(session, task, source_mail)
+        return [job] if job is not None else []
+    task.status = "Closed"
+    task.closed_reason = "ProductionTerminated"
+    task.updated_at = now_utc()
+    task.requirement.status = "Closed"
+    task.requirement.updated_at = now_utc()
+    open_questions = (
+        session.query(QuestionAndReply)
+        .filter_by(task_id=task.id, status="AwaitingSalesReply")
+        .all()
+    )
+    for question in open_questions:
+        question.status = "Answered"
+        if not (question.reply_text or "").strip():
+            question.reply_text = "生产侧已终止生产，任务关闭。"
+        question.updated_at = now_utc()
+    jobs = [
+        enqueue_production_terminate_sales_notice(session, task, source_mail),
+        enqueue_production_terminate_receipt(session, task, source_mail),
+    ]
+    valid_jobs = [job for job in jobs if job is not None]
+    add_audit(session, "ProductionTerminatedTask", "ProductionTask", task.id, {"source_mail_id": source_mail.id, "outbound_job_ids": [job.id for job in valid_jobs]})
+    return valid_jobs
+
+
 def handle_production_mail_command(session: Session, mail: MailMessage) -> object | None:
     if (mail.from_address or "").lower() not in production_department_addresses(session):
         return None
@@ -1606,6 +2106,12 @@ def handle_production_mail_command(session: Session, mail: MailMessage) -> objec
         mail.classification = "ProductionPendingTaskQuery"
         mail.classification_confidence = max(mail.classification_confidence, 92)
         return enqueue_production_pending_tasks_reply(session, mail)
+    if looks_like_production_termination(text):
+        task = find_task_for_mail(session, mail)
+        if task is not None:
+            mail.classification = "ProductionTerminateRequest"
+            mail.classification_confidence = max(mail.classification_confidence, 93)
+            return record_production_termination(session, task, mail)
     if not looks_like_production_confirmation(text):
         return None
     task = find_task_for_mail(session, mail)
@@ -1663,6 +2169,10 @@ def record_sales_reply(
     task = session.get(ProductionTask, task_id)
     if task is None:
         raise ValueError("task not found")
+    if task.status == "Closed":
+        if source_mail is not None:
+            source_mail.related_task_id = task.id
+        raise ValueError(f"task is closed: {task.closed_reason or 'Closed'}")
     clean_reply = reply_text.strip()
     if not clean_reply:
         raise ValueError("sales reply is empty")
@@ -1675,6 +2185,16 @@ def record_sales_reply(
         .order_by(QuestionAndReply.created_at.desc())
         .first()
     )
+    if open_question is None:
+        record_exception_case(
+            session,
+            related_task_id=task.id,
+            exception_type="SalesReplyWithoutOpenQuestion",
+            severity="Medium",
+            detail={"source_mail_id": source_mail.id if source_mail else None, "task_no": task.task_no, "reply_text": clean_reply[:1000]},
+            source_mail_id=source_mail.id if source_mail else None,
+        )
+        raise ValueError("no open production question for sales reply")
     if any(keyword in clean_reply for keyword in INCOMPLETE_REPLY_KEYWORDS):
         if open_question is not None:
             open_question.reply_text = clean_reply
@@ -1702,18 +2222,15 @@ def record_sales_reply(
             return version
 
     updates = _apply_reply_updates(task, clean_reply)
-    if open_question is None:
-        open_question = QuestionAndReply(task_id=task.id, question_text="销售补充答复", status="Answered")
-        session.add(open_question)
     open_question.reply_text = clean_reply
     open_question.sales_reply_mail_id = source_mail.id if source_mail else None
     open_question.status = "Answered"
     open_question.updated_at = now_utc()
 
     version_no = task.current_version_no + 1
-    template = active_task_template(session)
+    subject_template, body_template, _ = task_template_for_requirement(session, task.requirement)
     context = task_context(session, task, version_no=version_no)
-    body = render_template(template.body_template, context)
+    body = render_template(body_template, context)
     body = "\n".join(
         [
             body.rstrip(),
@@ -1728,7 +2245,7 @@ def record_sales_reply(
     version = ProductionTaskVersion(
         task_id=task.id,
         version_no=version_no,
-        subject=render_template(template.subject_template, context),
+        subject=render_template(subject_template, context),
         body=body,
         status="Draft",
     )
@@ -2002,6 +2519,128 @@ def enqueue_sales_withdraw_rejected_notice(
     return job
 
 
+def enqueue_manual_close_sales_notice(
+    session: Session,
+    task: ProductionTask,
+    *,
+    reason: str,
+) -> OutboundMailJob | None:
+    sales_email = (task.requirement.salesperson_email or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    idem = f"manual-close-sales:{task.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body_lines = [
+        "销售同事好，",
+        "",
+        f"任务 {task.task_no} 已由商务人员手动强制关闭。",
+    ]
+    if reason:
+        body_lines.extend(["", f"关闭说明：{reason}"])
+    body_lines.extend(["", get_config(session, "bot_signature", "积木易搭AI机器人")])
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="TaskManualClosedSales",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[任务手动关闭][{task.task_no}] 商务已关闭任务",
+        body="\n".join(body_lines),
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "TaskManualClosedSalesQueued", "ProductionTask", task.id, {"task_no": task.task_no})
+    return job
+
+
+def enqueue_manual_close_production_notice(
+    session: Session,
+    task: ProductionTask,
+    *,
+    reason: str,
+) -> OutboundMailJob | None:
+    to_addresses = as_list(task.target_mail_to_json)
+    cc_addresses = as_list(task.target_mail_cc_json)
+    if not to_addresses:
+        return None
+    idem = f"manual-close-production:{task.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body_lines = [
+        "生产部同事好，",
+        "",
+        f"任务 {task.task_no} 已由商务人员手动强制关闭，请停止后续处理。",
+    ]
+    if reason:
+        body_lines.extend(["", f"关闭说明：{reason}"])
+    body_lines.extend(["", get_config(session, "bot_signature", "积木易搭AI机器人")])
+    job = OutboundMailJob(
+        related_task_id=task.id,
+        mail_type="TaskManualClosedProduction",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[任务手动关闭][{task.task_no}] 请停止处理",
+        body="\n".join(body_lines),
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "TaskManualClosedProductionQueued", "ProductionTask", task.id, {"task_no": task.task_no})
+    return job
+
+
+def force_close_task_manual(
+    session: Session,
+    task_id: str,
+    *,
+    reason: str = "",
+    actor: str = "business-owner",
+) -> list[OutboundMailJob]:
+    task = session.get(ProductionTask, task_id)
+    if task is None:
+        raise ValueError("task not found")
+    if task.status == "Closed":
+        raise ValueError("task is already closed")
+
+    task.status = "Closed"
+    task.closed_reason = "ManualForceClosed"
+    task.manual_takeover = True
+    task.updated_at = now_utc()
+    task.requirement.status = "Closed"
+    task.requirement.updated_at = now_utc()
+
+    open_questions = (
+        session.query(QuestionAndReply)
+        .filter_by(task_id=task.id, status="AwaitingSalesReply")
+        .all()
+    )
+    for question in open_questions:
+        question.status = "Answered"
+        if not (question.reply_text or "").strip():
+            question.reply_text = "任务已由商务部手动关闭。"
+        question.updated_at = now_utc()
+
+    outbound_jobs = [
+        enqueue_manual_close_sales_notice(session, task, reason=reason.strip()),
+        enqueue_manual_close_production_notice(session, task, reason=reason.strip()),
+    ]
+    valid_jobs = [job for job in outbound_jobs if job is not None]
+    add_audit(
+        session,
+        "TaskManualForceClosed",
+        "ProductionTask",
+        task.id,
+        {"reason": reason.strip(), "outbound_job_ids": [job.id for job in valid_jobs]},
+        actor,
+    )
+    return valid_jobs
+
+
 def record_order_change_or_cancel(session: Session, mail: MailMessage, task: ProductionTask) -> ProductionTaskVersion | None:
     mail.related_task_id = task.id
     if mail.classification == "OrderCancelRequest":
@@ -2090,11 +2729,11 @@ def record_order_change_or_cancel(session: Session, mail: MailMessage, task: Pro
 
     updates = _apply_reply_updates(task, mail_text_with_attachments(session, mail))
     version_no = task.current_version_no + 1
-    template = active_task_template(session)
+    subject_template, body_template, _ = task_template_for_requirement(session, task.requirement)
     context = task_context(session, task, version_no=version_no)
     body = "\n".join(
         [
-            render_template(template.body_template, context).rstrip(),
+            render_template(body_template, context).rstrip(),
             "",
             "订单变更说明：",
             mail.body_text.strip(),
@@ -2106,7 +2745,7 @@ def record_order_change_or_cancel(session: Session, mail: MailMessage, task: Pro
     version = ProductionTaskVersion(
         task_id=task.id,
         version_no=version_no,
-        subject=render_template(template.subject_template, context),
+        subject=render_template(subject_template, context),
         body=body,
         status="Draft",
     )
@@ -2175,6 +2814,27 @@ def handle_classified_mail(session: Session, mail: MailMessage) -> object | None
             source_mail_id=mail.id,
         )
         return None
+
+    if task.status == "Closed" and mail.classification in {"OrderChangeRequest", "ProductionScheduleConfirmation", "ProductionQuestion", "SalesClarificationReply"}:
+        return enqueue_closed_task_reply_rejected_notice(session, task, mail)
+    if mail.classification == "SalesClarificationReply":
+        open_question = (
+            session.query(QuestionAndReply)
+            .filter_by(task_id=task.id, status="AwaitingSalesReply")
+            .order_by(QuestionAndReply.created_at.desc())
+            .first()
+        )
+        if open_question is None:
+            mail.related_task_id = task.id
+            record_exception_case(
+                session,
+                related_task_id=task.id,
+                exception_type="SalesReplyWithoutOpenQuestion",
+                severity="Medium",
+                detail={"source_mail_id": mail.id, "task_no": task.task_no, "reply_text": mail.body_text[:1000]},
+                source_mail_id=mail.id,
+            )
+            return enqueue_sales_reply_no_open_question_notice(session, task, mail)
 
     if mail.classification in {"OrderChangeRequest", "OrderCancelRequest"}:
         return record_order_change_or_cancel(session, mail, task)
@@ -2262,6 +2922,27 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
         )
         return None
 
+    if task.status == "Closed" and mail.classification in {"OrderChangeRequest", "ProductionScheduleConfirmation", "ProductionQuestion", "SalesClarificationReply"}:
+        return enqueue_closed_task_reply_rejected_notice(session, task, mail)
+    if mail.classification == "SalesClarificationReply":
+        open_question = (
+            session.query(QuestionAndReply)
+            .filter_by(task_id=task.id, status="AwaitingSalesReply")
+            .order_by(QuestionAndReply.created_at.desc())
+            .first()
+        )
+        if open_question is None:
+            mail.related_task_id = task.id
+            record_exception_case(
+                session,
+                related_task_id=task.id,
+                exception_type="SalesReplyWithoutOpenQuestion",
+                severity="Medium",
+                detail={"source_mail_id": mail.id, "task_no": task.task_no, "reply_text": mail.body_text[:1000]},
+                source_mail_id=mail.id,
+            )
+            return enqueue_sales_reply_no_open_question_notice(session, task, mail)
+
     if mail.classification in {"OrderChangeRequest", "OrderCancelRequest"}:
         return record_order_change_or_cancel(session, mail, task)
     if mail.classification == "ProductionScheduleConfirmation":
@@ -2337,18 +3018,55 @@ def apply_exception_requirement_patch(
             updates[key] = value
     missing_fields = required_missing_fields(requirement)
     risk_flags = [] if clear_risk_flags else as_list(requirement.risk_flags_json)
-    requirement.missing_fields_json = dumps(missing_fields)
-    requirement.risk_flags_json = dumps(risk_flags)
+    workflow_failures: list[ReviewFailure] = []
+    workflow_missing_fields: list[str] = []
+    workflow_risk_flags: list[str] = []
+    workflow_binding: RequirementWorkflowBinding | None = None
+    mail = session.get(MailMessage, requirement.source_mail_id)
+    if mail is not None:
+        source_text = mail_text_with_attachments(session, mail)
+        workflow_binding, workflow_failures, workflow_missing_fields, workflow_risk_flags = upsert_requirement_workflow_binding(
+            session,
+            requirement,
+            mail,
+            source_text,
+        )
+    merged_missing_fields: list[str] = []
+    for label in [*missing_fields, *workflow_missing_fields]:
+        if label and label not in merged_missing_fields:
+            merged_missing_fields.append(label)
+    merged_risk_flags: list[str] = []
+    for flag in [*risk_flags, *workflow_risk_flags]:
+        if flag and flag not in merged_risk_flags:
+            merged_risk_flags.append(flag)
+
+    requirement.missing_fields_json = dumps(merged_missing_fields)
+    requirement.risk_flags_json = dumps(merged_risk_flags)
     requirement.updated_at = now_utc()
 
-    detail.update({"missing_fields": missing_fields, "risk_flags": risk_flags, "updates": updates})
+    detail.update(
+        {
+            "missing_fields": merged_missing_fields,
+            "risk_flags": merged_risk_flags,
+            "updates": updates,
+            "workflow_review_failures": serialize_review_failures(workflow_failures),
+            "workflow_code": workflow_binding.workflow_code if workflow_binding is not None else None,
+        }
+    )
     case.detail = dumps(detail)
-    if missing_fields or risk_flags:
+    if merged_missing_fields or merged_risk_flags or workflow_failures:
         requirement.status = "ReviewFailed"
         add_audit(session, "ExceptionPatchIncomplete", "ExceptionCase", case.id, detail, actor)
         return None
 
-    mail = session.get(MailMessage, requirement.source_mail_id)
+    route_to, _route_cc, _binding = routing_for_requirement(session, requirement)
+    if not route_to:
+        requirement.status = "ReviewFailed"
+        detail.update({"risk_flags": ["流程路由邮箱未配置"]})
+        case.detail = dumps(detail)
+        add_audit(session, "ExceptionPatchRoutingMissing", "ExceptionCase", case.id, detail, actor)
+        return None
+
     task = draft_task_from_requirement(session, requirement, mail)
     approve_task(session, task.id, actor="System")
     case.related_task_id = task.id
@@ -2361,6 +3079,8 @@ def record_production_feedback(session: Session, task_id: str, feedback_type: st
     task = session.get(ProductionTask, task_id)
     if task is None:
         raise ValueError("task not found")
+    if task.status == "Closed":
+        raise ValueError(f"task is closed: {task.closed_reason or 'Closed'}")
     requirement = task.requirement
     ops_email = get_config(session, "ops_cc_email", "jinlei@jimuyida.com")
     ceo_email = get_config(session, "ceo_email", "dingyong@jimuyida.com")
