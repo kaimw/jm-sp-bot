@@ -658,6 +658,7 @@ def mails(
         pattern = f"%{q.strip()}%"
         query = query.filter(
             or_(
+                MailMessage.id.ilike(pattern),
                 MailMessage.subject.ilike(pattern),
                 MailMessage.from_address.ilike(pattern),
                 MailMessage.body_text.ilike(pattern),

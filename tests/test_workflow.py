@@ -173,6 +173,24 @@ def test_mail_rate_limit_interval_is_clamped_to_one_minute():
     assert clamp_mail_interval_seconds(120) == 120
 
 
+def test_mail_list_search_matches_mail_id():
+    from backend.app.main import mails
+
+    session = make_session()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="按ID检索邮件",
+        body_text="邮件正文",
+    )
+    session.commit()
+
+    result = mails(q=mail.id, page=1, page_size=10, session=session)
+
+    assert result["total"] == 1
+    assert result["items"][0]["id"] == mail.id
+
+
 def test_auth_token_roundtrip_and_tamper_detection():
     token = create_session_token("admin")
     assert parse_session_token(token) == "admin"

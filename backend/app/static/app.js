@@ -1024,7 +1024,7 @@ async function refreshMails() {
       .map(
         (row) => `
         <div class="row clickable-row" data-mail-id="${h(row.id)}" role="button" tabindex="0" title="查看邮件详情">
-          <div><strong>${h(row.subject)}</strong><br /><small>${h(row.from_address)}</small></div>
+          <div><strong>${h(row.subject)}</strong><br /><small>${h(row.id)}</small><br /><small>${h(row.from_address)}</small></div>
           <div><small>分类</small><br />${h(row.classification)} (${h(row.classification_confidence)})</div>
           <div><small>任务</small><br />${h(row.related_task_id || "未关联")}</div>
           <div><small>${h(row.created_at)}</small></div>
@@ -1039,6 +1039,7 @@ async function openMailDetail(mailId) {
   $("#mail-detail-title").textContent = detail.subject || "邮件详情";
   $("#mail-detail-meta").textContent = `${detail.direction || "邮件"} · ${detail.created_at || ""}`;
   $("#mail-detail-fields").innerHTML = `
+    <div><small>邮件ID</small><strong>${h(detail.id || "未记录")}</strong></div>
     <div><small>发件人</small><strong>${h(detail.from_address || "未记录")}</strong></div>
     <div><small>收件人</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
     <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
