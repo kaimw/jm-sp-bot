@@ -31,6 +31,7 @@ from backend.app.models import (
     QuestionAndReply,
     RequirementWorkflowBinding,
     SystemConfig,
+    WorkflowDefinition,
     WorkflowImportJob,
     WorkflowVersion,
 )
@@ -59,6 +60,7 @@ from backend.app.services.workflow import (
     approve_task,
     create_inbound_mail,
     create_task_from_mail,
+    dashboard,
     enqueue_weekly_report,
     force_close_task_manual,
     record_exception_case,
@@ -76,7 +78,9 @@ from backend.app.services.workflow_rules import (
     import_workflow_document,
     list_workflow_rules,
     match_workflow_for_mail,
+    rollback_workflow_version,
     save_workflow_version_rules,
+    workflow_version_diff,
 )
 from backend.app.models import now_utc
 
@@ -129,9 +133,29 @@ def test_seed_defaults_omit_plaintext_secrets():
     assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "60"
     assert session.get(SystemConfig, "mail_rate_limit_interval_seconds").value == "60"
     assert session.get(SystemConfig, "bot_enabled").value == "false"
+    assert session.get(SystemConfig, "outbound_failed_alert_threshold").value == "1"
+    assert session.get(SystemConfig, "outbound_pending_age_alert_seconds").value == "3600"
     model = session.query(ModelProviderConfig).one()
     assert model.title == "Dify deepseekV3"
     assert model.credential_ref == "env:MODEL_API_KEY"
+
+
+def test_baidu_map_ak_is_treated_as_secret_config():
+    from backend.app.main import config, update_mail_config
+    from backend.app.schemas import MailRuntimeConfigUpdate
+
+    session = make_session()
+
+    map_config = session.get(SystemConfig, "baidu_map_ak")
+    assert map_config.is_secret is True
+    assert config(session)["configs"]["baidu_map_ak"] == "***"
+
+    update_mail_config(MailRuntimeConfigUpdate(baidu_map_ak="new-baidu-ak"), session)
+
+    map_config = session.get(SystemConfig, "baidu_map_ak")
+    assert map_config.value == "new-baidu-ak"
+    assert map_config.is_secret is True
+    assert config(session)["configs"]["baidu_map_ak"] == "***"
 
 
 def test_system_enable_requires_model_bot_and_department_config():
@@ -167,6 +191,64 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert session.get(SystemConfig, "bot_enabled").value == "True"
 
 
+def test_dashboard_includes_period_analytics_for_workbench_charts():
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, "SO-DASH-001")
+    task.status = "ProductionQuestioned"
+    source_mail = session.get(MailMessage, task.requirement.source_mail_id)
+    source_mail.body_text = f"{source_mail.body_text}\n客户收件信息：深圳南山区科技园"
+    session.commit()
+
+    data = dashboard(session)
+
+    assert data["tasks_total"] == 1
+    assert data["questioned"] == 1
+    periods = data["analytics"]["periods"]
+    assert set(periods) == {"month", "year"}
+    assert periods["month"]["label"] == "月度"
+    assert periods["year"]["label"] == "年度"
+    assert periods["month"]["trend"][0]["label"] == "1日"
+    assert periods["month"]["trend"][-1]["label"].endswith("日")
+    assert len(periods["year"]["trend"]) == 12
+    assert periods["year"]["trend"][0]["label"] == "1月"
+    assert periods["year"]["trend"][-1]["label"] == "12月"
+    for period in periods.values():
+        assert period["task_stats"]["demand_total"] == 1
+        assert period["trend"]
+        assert period["status_distribution"][0]["label"] == "生产疑问"
+        assert period["sales_top10"][0]["salesperson"] == "sales@jimuyida.com"
+        assert period["product_top10"][0]["product"] == "积木展示架 A1"
+        assert period["location_points"][0]["city"] == "深圳"
+
+
+def test_health_reports_readiness_and_queue_counts():
+    from backend.app.main import health
+
+    session = make_session()
+    session.add(
+        OutboundMailJob(
+            mail_type="WeeklyReport",
+            to_json=dumps(["finance@jimuyida.com"]),
+            cc_json=dumps([]),
+            subject="周报",
+            body="hello",
+            idempotency_key="health-weekly-report",
+            status="Pending",
+        )
+    )
+    session.add(ProcessingJob(job_type="process_inbound_mail", payload_json=dumps({"mail_id": "demo"}), status="Pending"))
+    session.commit()
+
+    result = health(session)
+
+    assert result["status"] == "ok"
+    assert result["ready"] is False
+    assert result["queues"]["outbound"]["counts"]["Pending"] == 1
+    assert result["queues"]["outbound"]["pending_auto_dispatchable"] == 1
+    assert result["queues"]["processing"]["counts"]["Pending"] == 1
+
+
 def test_mail_rate_limit_interval_is_clamped_to_one_minute():
     assert clamp_mail_interval_seconds(30) == 60
     assert clamp_mail_interval_seconds("45") == 60
@@ -189,6 +271,23 @@ def test_mail_list_search_matches_mail_id():
 
     assert result["total"] == 1
     assert result["items"][0]["id"] == mail.id
+
+
+def test_task_trace_graph_contains_core_linked_objects():
+    from backend.app.main import task_trace
+
+    session = make_session()
+    configure_department(session)
+    task = create_valid_task(session, order_no="TRACE-001")
+
+    result = task_trace(task.id, session)
+    node_types = {node["type"] for node in result["nodes"]}
+    edge_labels = {edge["label"] for edge in result["edges"]}
+
+    assert {"mail", "requirement", "task", "task_version", "outbound_mail"}.issubset(node_types)
+    assert {"抽取", "生成任务", "版本"}.issubset(edge_labels)
+    assert result["task"]["task_no"] == task.task_no
+    assert result["timeline"]
 
 
 def test_auth_token_roundtrip_and_tamper_detection():
@@ -1159,6 +1258,151 @@ def test_smtp_send_skips_when_bot_disabled():
 
     assert result == {"sent": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"}
     assert pending.status == "Pending"
+
+
+def test_outbound_list_explains_pending_when_bot_disabled():
+    from backend.app.main import outbound_mails
+
+    session = make_session()
+    set_config(session, "bot_enabled", "false", is_secret=False)
+    pending = OutboundMailJob(
+        mail_type="WeeklyReport",
+        to_json=dumps(["finance@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="待发送周报",
+        body="hello",
+        idempotency_key="diagnose-pending-disabled",
+        status="Pending",
+    )
+    session.add(pending)
+    session.commit()
+
+    result = outbound_mails(status="Pending", page=1, page_size=10, session=session)
+    diagnosis = result["items"][0]["pending_diagnosis"]
+
+    assert diagnosis["severity"] == "blocked"
+    assert "系统已停用" in diagnosis["reason"]
+    assert diagnosis["queue_position"] == 1
+    assert diagnosis["auto_dispatchable"] is True
+
+
+def test_outbound_list_marks_non_auto_pending_as_manual_only():
+    from backend.app.main import outbound_mails
+
+    session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    pending = OutboundMailJob(
+        mail_type="ManualReviewNotice",
+        to_json=dumps(["ops@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="人工通知",
+        body="hello",
+        idempotency_key="diagnose-pending-manual",
+        status="Pending",
+    )
+    session.add(pending)
+    session.commit()
+
+    result = outbound_mails(status="Pending", page=1, page_size=10, session=session)
+    diagnosis = result["items"][0]["pending_diagnosis"]
+
+    assert diagnosis["severity"] == "manual"
+    assert "不在自动 worker 消费范围" in diagnosis["reason"]
+    assert diagnosis["auto_dispatchable"] is False
+
+
+def test_outbound_diagnostics_reports_failed_jobs_and_failure_types():
+    from backend.app.main import outbound_mail_diagnostics
+    from backend.app.services.mail_adapter import mark_outbound_failure
+
+    session = make_session()
+    failed = OutboundMailJob(
+        mail_type="TaskIssue",
+        to_json=dumps(["production@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="失败任务单",
+        body="hello",
+        idempotency_key="diagnostics-failed",
+        status="Pending",
+    )
+    session.add(failed)
+    session.flush()
+    mark_outbound_failure(session, failed, "smtp send failed")
+    session.commit()
+
+    result = outbound_mail_diagnostics(hours=24, limit=10, session=session)
+
+    assert result["status_counts"]["Failed"] == 1
+    assert result["failed_by_type"][0] == {"mail_type": "TaskIssue", "count": 1}
+    assert result["recent_failures"][0]["error"] == "smtp send failed"
+    assert result["dead_letters"][0]["id"] == failed.id
+    assert result["alerts"][0]["type"] == "outbound_failed_threshold"
+
+
+def test_outbound_diagnostics_csv_exports_failures():
+    from backend.app.main import outbound_mail_diagnostics_csv
+    from backend.app.services.mail_adapter import mark_outbound_failure
+
+    session = make_session()
+    failed = OutboundMailJob(
+        mail_type="WeeklyReport",
+        to_json=dumps(["finance@jimuyida.com"]),
+        cc_json=dumps(["ops@jimuyida.com"]),
+        subject="失败周报",
+        body="hello",
+        idempotency_key="diagnostics-csv-failed",
+        status="Pending",
+    )
+    session.add(failed)
+    session.flush()
+    mark_outbound_failure(session, failed, "smtp export failed")
+    session.commit()
+
+    response = outbound_mail_diagnostics_csv(hours=24, limit=100, session=session)
+    body = response.body.decode("utf-8")
+
+    assert response.media_type.startswith("text/csv")
+    assert "recent_failure" in body
+    assert "dead_letter" in body
+    assert "smtp export failed" in body
+    assert "finance@jimuyida.com" in body
+
+
+def test_outbound_diagnostics_notify_queues_idempotent_alert_mail():
+    from backend.app.main import notify_outbound_diagnostics
+    from backend.app.services.mail_adapter import mark_outbound_failure
+
+    class DummyState:
+        username = "tester"
+
+    class DummyRequest:
+        state = DummyState()
+
+    session = make_session()
+    set_config(session, "ops_cc_email", "ops@jimuyida.com", is_secret=False)
+    failed = OutboundMailJob(
+        mail_type="TaskIssue",
+        to_json=dumps(["production@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="失败任务单",
+        body="hello",
+        idempotency_key="diagnostics-notify-failed",
+        status="Pending",
+    )
+    session.add(failed)
+    session.flush()
+    mark_outbound_failure(session, failed, "smtp notify failed")
+    session.commit()
+
+    first = notify_outbound_diagnostics(DummyRequest(), hours=24, session=session)
+    second = notify_outbound_diagnostics(DummyRequest(), hours=24, session=session)
+
+    assert first["queued"] is True
+    assert first["to"] == ["ops@jimuyida.com"]
+    assert session.get(OutboundMailJob, first["outbound_job_id"]).mail_type == "OutboundAlert"
+    assert second["queued"] is False
+    assert second["reason"] == "already queued in this hour"
 
 
 def test_cancel_pending_outbound_marks_only_matching_pending_jobs():
@@ -2377,6 +2621,92 @@ def test_workflow_list_includes_builtin_default_order_flow():
     assert "production@jimuyida.com" in (builtin["rules"].get("routing", {}).get("to_names") or [])
     assert builtin["rules"]["subject_template"]
     assert builtin["rules"]["body_template"]
+
+
+def test_workflow_version_diff_and_rollback_activate_selected_version():
+    session = make_session()
+    definition = WorkflowDefinition(
+        workflow_code="diff_flow",
+        workflow_name="版本差异流程",
+        status="Active",
+    )
+    session.add(definition)
+    session.flush()
+    base_rule = {
+        "workflow_code": "diff_flow",
+        "workflow_name": "版本差异流程",
+        "match": {"any_keywords": ["差异"], "all_keywords": [], "warehouse": "", "order_type": "", "subject_patterns": []},
+        "routing": {"to_names": ["production@jimuyida.com"], "cc_names": []},
+        "subject_template": "[V1][{{task_no}}]",
+        "body_template": "任务 {{task_no}} {{customer_name}} {{product_summary}} {{quantity_text}} {{expected_delivery_date}} {{workflow_name}} V{{version_no}}",
+        "required_fields": ["customer_name"],
+        "required_attachments": [],
+        "review_rules": [],
+    }
+    changed_rule = {**base_rule, "subject_template": "[V2][{{task_no}}]", "required_fields": ["customer_name", "product_summary"]}
+    v1 = WorkflowVersion(
+        workflow_id=definition.id,
+        version_no=1,
+        compiled_rules_json=dumps(base_rule),
+        status="Archived",
+        created_by="tester",
+    )
+    v2 = WorkflowVersion(
+        workflow_id=definition.id,
+        version_no=2,
+        compiled_rules_json=dumps(changed_rule),
+        status="Active",
+        created_by="tester",
+        approved_by="tester",
+        approved_at=now_utc(),
+    )
+    session.add_all([v1, v2])
+    session.commit()
+
+    diff = workflow_version_diff(session, v2.id)
+    assert diff["base"]["id"] == v1.id
+    assert diff["changed"] is True
+    assert {item["field"] for item in diff["changes"]} >= {"subject_template", "required_fields"}
+
+    rollback = rollback_workflow_version(session, v1.id, actor="tester")
+    session.commit()
+
+    assert rollback.id == v1.id
+    assert session.get(WorkflowVersion, v1.id).status == "Active"
+    assert session.get(WorkflowVersion, v2.id).status == "Archived"
+
+
+def test_workflow_simulation_reports_task_creation_without_persisting():
+    from backend.app.main import workflow_simulate
+    from backend.app.schemas import WorkflowSimulationRequest
+
+    session = make_session()
+    configure_department(session)
+    before_mail_count = session.query(MailMessage).count()
+    before_task_count = session.query(ProductionTask).count()
+
+    result = workflow_simulate(
+        WorkflowSimulationRequest(
+            from_address="sales@jimuyida.com",
+            subject="生产订单需求 - 模拟客户",
+            body_text="\n".join(
+                [
+                    "客户名称：模拟客户",
+                    "产品：模拟产品A",
+                    "数量：10套",
+                    "期望交期：2026-05-20",
+                    "订单号：SIM-001",
+                ]
+            ),
+        ),
+        session,
+    )
+
+    assert result["classification"] == "SalesOrderRequirement"
+    assert result["would_create_task"] is True
+    assert result["task"]["task_no"].startswith("PT-")
+    assert session.query(MailMessage).count() == before_mail_count
+    assert session.query(ProductionTask).count() == before_task_count
 
 
 def test_workflow_import_falls_back_when_llm_timeout(monkeypatch):

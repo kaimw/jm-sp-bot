@@ -103,6 +103,9 @@ class MailRuntimeConfigUpdate(BaseModel):
     bot_enabled: bool | None = None
     llm_fallback_enabled: bool | None = None
     conversation_max_rounds: int | None = None
+    outbound_failed_alert_threshold: int | None = None
+    outbound_pending_age_alert_seconds: int | None = None
+    baidu_map_ak: str | None = None
     e2e_sales_email: str | None = None
     e2e_sales_password: str | None = None
     e2e_production_email: str | None = None
@@ -157,6 +160,13 @@ class WorkflowContactMapUpdate(BaseModel):
 class WorkflowVersionUpdateRequest(BaseModel):
     compiled_rules: dict[str, Any]
     activate: bool = False
+
+
+class WorkflowSimulationRequest(BaseModel):
+    from_address: str = "sales@jimuyida.com"
+    subject: str
+    body_text: str
+    use_llm: bool = False
 
 
 class WorkflowChatMessage(BaseModel):

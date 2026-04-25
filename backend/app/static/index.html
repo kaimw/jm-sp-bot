@@ -56,6 +56,8 @@
 
       <section class="page is-active" data-page="dashboard" data-title="工作台" data-subtitle="核心状态、队列水位和待处理风险。">
         <div id="dashboard" class="metrics"></div>
+        <div id="dashboard-insights" class="dashboard-insights"></div>
+        <div id="system-health" class="health-panel"></div>
       </section>
 
       <section class="page" data-page="reports" data-title="周报" data-subtitle="统计摘要、收件人和导出文件。">
@@ -131,6 +133,7 @@
           <select name="status" aria-label="状态"><option value="">全部状态</option></select>
           <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
           <button id="workflow-import-open" type="button" class="icon-button filter-action" title="批量导入" aria-label="批量导入">⇪</button>
+          <button id="workflow-simulate-open" type="button" class="icon-button filter-action" title="流程模拟测试" aria-label="流程模拟测试">◇</button>
           <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
         </form>
         <div id="workflow-rules-list" class="list rule-list"></div>
@@ -189,6 +192,9 @@
           <label>ZIP 最大字节 <input name="zip_max_bytes" type="number" /></label>
           <label>ZIP 解压层级 <input name="zip_max_depth" type="number" /></label>
           <label>最大沟通轮数 <input name="conversation_max_rounds" type="number" min="1" /></label>
+          <label>外发失败告警阈值 <input name="outbound_failed_alert_threshold" type="number" min="1" /></label>
+          <label>Pending 超时告警秒数 <input name="outbound_pending_age_alert_seconds" type="number" min="60" step="60" /></label>
+          <label>百度地图 AK <input name="baidu_map_ak" type="password" placeholder="留空不修改" autocomplete="off" /></label>
           <label class="switch-line">
             <input name="bot_enabled" type="checkbox" />
             <span>启用机器人邮箱监听/发送</span>
@@ -220,7 +226,7 @@
           <h2>模型对话测试</h2>
           <p>直接调用当前启用的模型配置。</p>
         </div>
-        <div class="chat-shell">
+        <div class="chat-shell model-chat-shell">
           <div id="model-chat-log" class="chat-log">
             <div class="chat-message assistant">
               <small>模型</small>
@@ -320,6 +326,7 @@
           <h2>外发队列</h2>
           <p>失败邮件可重新加入队列。</p>
         </div>
+        <div id="outbound-diagnostics" class="diagnostics-panel"></div>
         <form id="outbound-filter-form" class="table-filter-bar" data-table-filter="outbound">
           <div class="filter-search">
             <span aria-hidden="true">⌕</span>
@@ -330,6 +337,8 @@
           <input name="recipient" aria-label="收件人" placeholder="收件人" />
           <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
           <button id="cancel-pending-outbound" type="button" class="icon-button filter-action danger-action" title="批量取消当前筛选条件下的 Pending 外发" aria-label="批量取消 Pending 外发">⊘</button>
+          <a class="icon-button filter-action" href="/api/outbound-mails/diagnostics/export.csv" target="_blank" title="导出失败诊断 CSV" aria-label="导出失败诊断 CSV">⇩</a>
+          <button id="notify-outbound-alerts" type="button" class="icon-button filter-action" title="发送外发告警通知" aria-label="发送外发告警通知">✉</button>
           <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
         </form>
         <div id="outbound-list" class="list"></div>

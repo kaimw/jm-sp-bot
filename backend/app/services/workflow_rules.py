@@ -659,6 +659,73 @@ def _rules_diff(old: dict[str, Any], new: dict[str, Any]) -> list[dict[str, Any]
     return changes
 
 
+def workflow_version_diff(
+    session: Session,
+    version_id: str,
+    *,
+    compare_to_version_id: str | None = None,
+) -> dict[str, Any]:
+    version = session.get(WorkflowVersion, version_id)
+    if version is None:
+        raise ValueError("workflow version not found")
+    definition = session.get(WorkflowDefinition, version.workflow_id)
+    if definition is None:
+        raise ValueError("workflow definition not found")
+
+    base: WorkflowVersion | None = None
+    if compare_to_version_id:
+        base = session.get(WorkflowVersion, compare_to_version_id)
+        if base is None:
+            raise ValueError("compare workflow version not found")
+        if base.workflow_id != version.workflow_id:
+            raise ValueError("compare workflow version belongs to another workflow")
+    else:
+        base = (
+            session.query(WorkflowVersion)
+            .filter(WorkflowVersion.workflow_id == version.workflow_id, WorkflowVersion.version_no < version.version_no)
+            .order_by(WorkflowVersion.version_no.desc())
+            .first()
+        )
+
+    current_rules = loads(version.compiled_rules_json, {})
+    if not isinstance(current_rules, dict):
+        current_rules = {}
+    base_rules = loads(base.compiled_rules_json, {}) if base is not None else {}
+    if not isinstance(base_rules, dict):
+        base_rules = {}
+    changes = _rules_diff(base_rules, current_rules)
+    return {
+        "workflow_id": definition.id,
+        "workflow_code": definition.workflow_code,
+        "workflow_name": definition.workflow_name,
+        "current": {
+            "id": version.id,
+            "version_no": version.version_no,
+            "status": version.status,
+            "rules": current_rules,
+        },
+        "base": {
+            "id": base.id,
+            "version_no": base.version_no,
+            "status": base.status,
+            "rules": base_rules,
+        }
+        if base is not None
+        else None,
+        "changed": bool(changes),
+        "changes": changes,
+    }
+
+
+def rollback_workflow_version(session: Session, version_id: str, *, actor: str = "system") -> WorkflowVersion:
+    version = session.get(WorkflowVersion, version_id)
+    if version is None:
+        raise ValueError("workflow version not found")
+    if version.status == "Active":
+        return version
+    return activate_workflow_version(session, version_id, actor=actor)
+
+
 def _validate_rule(rule: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     workflow_name = str(rule.get("workflow_name") or rule.get("workflow_code") or "流程")

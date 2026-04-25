@@ -5,6 +5,9 @@ let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, 
 let workflowChatState = { messages: [], compiledRule: null, validationErrors: [], ready: false, editVersionId: "", editWorkflowName: "" };
 let runtimeConfigState = {};
 let startupReadinessState = { ready: false, missing: [] };
+let dashboardViewState = { period: "year" };
+let baiduMapLoadPromise = null;
+let baiduDemandMap = null;
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
 const tableStates = {
   workflows: { q: "", status: "", page: 1, page_size: 10 },
@@ -106,6 +109,14 @@ function splitRoutingNames(value) {
     .split(/[,，;；、\n]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function formatDuration(seconds) {
+  const value = Number(seconds || 0);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.floor(value / 60)} 分 ${Math.round(value % 60)} 秒`;
+  return `${Math.floor(value / 3600)} 小时 ${Math.floor((value % 3600) / 60)} 分`;
 }
 
 function queryFromState(state) {
@@ -239,19 +250,350 @@ function setActivePage(pageName = currentPageName()) {
 }
 
 async function refreshDashboard() {
-  const data = await api("/api/dashboard");
+  const [data, health] = await Promise.all([api("/api/dashboard"), api("/api/system/health")]);
   const labels = [
-    ["任务总数", data.tasks_total],
-    ["草稿待确认", data.drafted],
-    ["已下达", data.issued],
-    ["生产疑问", data.questioned],
-    ["已关闭", data.closed],
-    ["发送失败", data.outbound_failed],
-    ["变更/取消", data.change_review],
+    ["任务总数", data.tasks_total, "全部销售需求任务"],
+    ["草稿待确认", data.drafted, "等待初审或人工补充"],
+    ["已下达", data.issued, "已发送生产任务单"],
+    ["生产疑问", data.questioned, "生产侧待答疑"],
+    ["已关闭", data.closed, "已确认、取消或终止"],
+    ["发送失败", data.outbound_failed, "需运维处理的外发"],
+    ["变更/取消", data.change_review, "待复核的变更请求"],
   ];
   $("#dashboard").innerHTML = labels
-    .map(([label, value]) => `<div class="metric"><span>${h(label)}</span><strong>${h(value)}</strong></div>`)
+    .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></div>`)
     .join("");
+  renderSystemHealth(health);
+  renderDashboardInsights(data.analytics || {});
+}
+
+function renderSystemHealth(health) {
+  const node = $("#system-health");
+  if (!node) return;
+  const readiness = health.readiness || { ready: false, missing: [] };
+  const worker = health.worker || {};
+  const outbound = health.queues?.outbound || {};
+  const processing = health.queues?.processing || {};
+  const outboundCounts = outbound.counts || {};
+  const processingCounts = processing.counts || {};
+  node.innerHTML = `
+    <div class="health-card ${readiness.ready ? "is-ok" : "is-warn"}">
+      <small>启动就绪</small>
+      <strong>${readiness.ready ? "已就绪" : "未就绪"}</strong>
+      <span>${readiness.ready ? "配置完整" : `缺少：${h((readiness.missing || []).join("、") || "未知")}`}</span>
+    </div>
+    <div class="health-card ${health.bot_enabled ? "is-ok" : "is-warn"}">
+      <small>系统开关</small>
+      <strong>${health.bot_enabled ? "运行中" : "已停用"}</strong>
+      <span>${health.bot_enabled ? "自动流程允许执行" : "不会自动消费邮件和队列"}</span>
+    </div>
+    <div class="health-card">
+      <small>自动 worker</small>
+      <strong>${worker.auto_worker_enabled ? `${h(worker.configured_interval_seconds)} 秒/轮` : "未启用"}</strong>
+      <span>${worker.last_finished_at ? `最近完成：${h(formatTime(worker.last_finished_at))}` : "当前进程尚无完成记录"}</span>
+    </div>
+    <div class="health-card ${Number(outboundCounts.Pending || 0) ? "is-warn" : "is-ok"}">
+      <small>外发队列</small>
+      <strong>Pending ${h(outboundCounts.Pending || 0)}</strong>
+      <span>自动 ${h(outbound.pending_auto_dispatchable || 0)} / 手动 ${h(outbound.pending_manual_only || 0)} / 失败 ${h(outboundCounts.Failed || 0)}</span>
+    </div>
+    <div class="health-card ${Number(processingCounts.Pending || 0) ? "is-warn" : "is-ok"}">
+      <small>入库队列</small>
+      <strong>Pending ${h(processingCounts.Pending || 0)}</strong>
+      <span>Running ${h(processingCounts.Running || 0)} / Failed ${h(processingCounts.Failed || 0)}</span>
+    </div>
+  `;
+}
+
+function pct(value, total) {
+  const number = Number(value || 0);
+  const base = Number(total || 0);
+  if (!base) return 0;
+  return Math.max(0, Math.min(100, Math.round((number / base) * 100)));
+}
+
+function topRows(rows, valueKey, labelKey, limit = 6) {
+  return (rows || []).slice(0, limit).map((row) => ({
+    label: row[labelKey] || "未识别",
+    value: Number(row[valueKey] || 0),
+    secondary: Number(row.confirmed_total || 0),
+  }));
+}
+
+function renderPeriodTabs(periods) {
+  const labels = { month: "月度", year: "年度" };
+  return Object.keys(labels)
+    .filter((key) => periods[key])
+    .map(
+      (key) => `
+        <button type="button" class="${dashboardViewState.period === key ? "active" : ""}" data-dashboard-period="${h(key)}">
+          ${h(labels[key])}
+        </button>`
+    )
+    .join("");
+}
+
+function renderTrendChart(trend) {
+  const rows = trend || [];
+  const width = 360;
+  const height = 190;
+  const pad = { top: 12, right: 34, bottom: 34, left: 8 };
+  const chartWidth = width - pad.left - pad.right;
+  const chartHeight = height - pad.top - pad.bottom;
+  const maxValue = Math.max(1, ...rows.map((row) => Number(row.total || 0)));
+  const x = (index) => pad.left + (rows.length <= 1 ? chartWidth / 2 : (index / (rows.length - 1)) * chartWidth);
+  const y = (value) => pad.top + chartHeight - (Number(value || 0) / maxValue) * chartHeight;
+  const areaPath = (values) => {
+    if (!rows.length) return "";
+    const topLine = values.map((value, index) => `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(value).toFixed(1)}`).join(" ");
+    const baseY = pad.top + chartHeight;
+    return `${topLine} L ${x(rows.length - 1).toFixed(1)} ${baseY.toFixed(1)} L ${x(0).toFixed(1)} ${baseY.toFixed(1)} Z`;
+  };
+  const totalValues = rows.map((row) => Number(row.total || 0));
+  const confirmedValues = rows.map((row) => Number(row.confirmed_total || 0));
+  const labelStep = Math.max(1, Math.ceil(rows.length / 6));
+  const axisLabels = rows
+    .map((row, index) => ({ row, index }))
+    .filter((item) => item.index === 0 || item.index === rows.length - 1 || item.index % labelStep === 0);
+  const gridValues = [0.25, 0.5, 0.75, 1].map((ratio) => Math.round(maxValue * ratio));
+  return `
+    <div class="trend-chart area-trend-chart">
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="任务趋势面积图" preserveAspectRatio="none">
+        ${gridValues
+          .map(
+            (value) => `
+              <line class="trend-grid-line" x1="${pad.left}" x2="${width - pad.right}" y1="${y(value).toFixed(1)}" y2="${y(value).toFixed(1)}"></line>
+              <text class="trend-axis-y" x="${width - 4}" y="${(y(value) + 3).toFixed(1)}">${h(value)}</text>`
+          )
+          .join("")}
+        <path class="trend-area trend-area-total" d="${areaPath(totalValues)}"></path>
+        <path class="trend-area trend-area-confirmed" d="${areaPath(confirmedValues)}"></path>
+        ${axisLabels
+          .map(
+            (item, index) => `
+              <text class="trend-axis-x" x="${x(item.index).toFixed(1)}" y="${height - 18}" text-anchor="${index === 0 ? "start" : index === axisLabels.length - 1 ? "end" : "middle"}">${h(item.row.label)}</text>`
+          )
+          .join("")}
+      </svg>
+      <div class="trend-legend">
+        <span><i class="legend-confirmed"></i>已确认</span>
+        <span><i class="legend-total"></i>新需求</span>
+      </div>
+    </div>`;
+}
+
+function renderStatusDonut(rows) {
+  const total = (rows || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
+  const palette = ["#0f766e", "#2563eb", "#b45309", "#b42318", "#64748b", "#7c3aed"];
+  let cursor = 0;
+  const segments = (rows || []).map((row, index) => {
+    const value = pct(row.count, total);
+    const start = cursor;
+    cursor += value;
+    return `${palette[index % palette.length]} ${start}% ${cursor}%`;
+  });
+  return `
+    <div class="donut-wrap">
+      <div class="donut" style="background: conic-gradient(${segments.join(", ") || "#e2e8f0 0% 100%"});">
+        <span>${h(total)}</span>
+        <small>总单数</small>
+      </div>
+      <div class="chart-legend">
+        ${((rows || []).length ? rows : [{ label: "暂无数据", count: 0 }])
+          .map(
+            (row, index) => `
+              <span><i style="background:${palette[index % palette.length]}"></i>${h(row.label)} ${h(row.count)}</span>`
+          )
+          .join("")}
+      </div>
+    </div>`;
+}
+
+function renderRankingChart(rows, emptyLabel) {
+  const maxValue = Math.max(1, ...rows.map((row) => row.value));
+  const list = rows.length ? rows : [{ label: emptyLabel, value: 0, secondary: 0 }];
+  return `
+    <div class="ranking-chart">
+      ${list
+        .map(
+          (row) => `
+            <div class="ranking-row">
+              <span>${h(row.label)}</span>
+              <div><i style="width:${pct(row.value, maxValue)}%"></i></div>
+              <strong>${h(row.value)}</strong>
+              <small>确认 ${h(row.secondary)}</small>
+            </div>`
+        )
+        .join("")}
+    </div>`;
+}
+
+function chartPanel(title, subtitle, body, extraClass = "") {
+  return `
+    <section class="floating-chart-card ${extraClass}">
+      <div class="chart-head">
+        <h3>${h(title)}</h3>
+        <span>${h(subtitle)}</span>
+      </div>
+      ${body}
+    </section>`;
+}
+
+function renderDemandMap(points, current, periods) {
+  const rows = (points || []).slice(0, 12);
+  const trend = current.trend || [];
+  const salesRows = topRows(current.sales_top10 || [], "demand_total", "salesperson", 7);
+  const productRows = topRows(current.product_top10 || [], "total", "product", 7);
+  return `
+    <div class="geo-dashboard">
+      <div id="baidu-demand-map" class="baidu-map" aria-label="产品需求地理分布"></div>
+      <div id="baidu-map-empty" class="baidu-map-empty" ${rows.length ? "hidden" : ""}>当前周期暂无可识别的需求地。</div>
+      <div class="map-period-control segmented-control" role="tablist" aria-label="统计周期">
+        ${renderPeriodTabs(periods)}
+      </div>
+      <div class="map-overlay map-overlay-left">
+        ${chartPanel("状态分布", "环形图", renderStatusDonut(current.status_distribution || []), "floating-status-card")}
+        ${chartPanel("任务趋势", "面积图：新需求 / 已确认", renderTrendChart(trend), "floating-trend-card")}
+      </div>
+      <div class="map-overlay map-overlay-right">
+        ${chartPanel("人员排行", "销售需求量 Top 7", renderRankingChart(salesRows, "暂无人员数据"), "floating-ranking-card")}
+        ${chartPanel("产品排行", "产品需求量 Top 7", renderRankingChart(productRows, "暂无产品数据"), "floating-ranking-card")}
+      </div>
+    </div>`;
+}
+
+function loadBaiduMap(ak) {
+  if (window.BMapGL?.Map && window.BMapGL?.Point) return Promise.resolve(window.BMapGL);
+  if (!ak) return Promise.reject(new Error("未配置百度地图 AK"));
+  if (!baiduMapLoadPromise) {
+    const callbackName = `initBaiduMap_${Date.now()}`;
+    baiduMapLoadPromise = new Promise((resolve, reject) => {
+      const cleanup = () => {
+        window.clearTimeout(timer);
+        delete window[callbackName];
+      };
+      const timer = window.setTimeout(() => {
+        cleanup();
+        baiduMapLoadPromise = null;
+        reject(new Error("百度地图 API 加载超时，请检查 AK、域名白名单或网络访问。"));
+      }, 10000);
+      window[callbackName] = () => {
+        if (window.BMapGL?.Map && window.BMapGL?.Point) {
+          cleanup();
+          resolve(window.BMapGL);
+          return;
+        }
+        cleanup();
+        baiduMapLoadPromise = null;
+        reject(new Error("百度地图 API 未完成初始化。"));
+      };
+      const script = document.createElement("script");
+      script.src = `https://api.map.baidu.com/api?v=1.0&type=webgl&ak=${encodeURIComponent(ak)}&callback=${callbackName}`;
+      script.async = true;
+      script.onerror = () => {
+        cleanup();
+        baiduMapLoadPromise = null;
+        reject(new Error("百度地图 API 加载失败"));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return baiduMapLoadPromise;
+}
+
+function resolveBaiduPoint(BMapGL, row) {
+  return new Promise((resolve) => {
+    const fallback = new BMapGL.Point(Number(row.lng), Number(row.lat));
+    let settled = false;
+    const finish = (point) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve(point || fallback);
+    };
+    const timer = window.setTimeout(() => finish(fallback), 1500);
+    if (!row.city || row.city === "海外") {
+      finish(fallback);
+      return;
+    }
+    try {
+      const geocoder = new BMapGL.Geocoder();
+      geocoder.getPoint(row.city, (point) => finish(point), row.province || row.city);
+    } catch {
+      finish(fallback);
+    }
+  });
+}
+
+async function renderBaiduDemandMap(points, mapConfig) {
+  const container = $("#baidu-demand-map");
+  const empty = $("#baidu-map-empty");
+  if (!container) return;
+  const rows = (points || []).filter((point) => Number.isFinite(Number(point.lng)) && Number.isFinite(Number(point.lat)));
+  if (!mapConfig?.ak) {
+    empty.hidden = false;
+    empty.textContent = "请配置 baidu_map_ak 后加载百度地图。";
+    return;
+  }
+  try {
+    const BMapGL = await loadBaiduMap(mapConfig.ak);
+    if (!document.body.contains(container)) return;
+    baiduDemandMap = new BMapGL.Map(container);
+    const center = rows.length
+      ? new BMapGL.Point(Number(rows[0].lng), Number(rows[0].lat))
+      : new BMapGL.Point(104.1954, 35.8617);
+    baiduDemandMap.centerAndZoom(center, rows.length > 1 ? 5 : 8);
+    baiduDemandMap.enableScrollWheelZoom(true);
+    const resolvedRows = await Promise.all(
+      rows.map(async (row) => ({
+        row,
+        point: await resolveBaiduPoint(BMapGL, row),
+      }))
+    );
+    resolvedRows.forEach(({ row, point }) => {
+      const label = new BMapGL.Label(
+        `<span class="baidu-pin-count" data-count="${h(row.demand_total || 0)}"></span><span class="baidu-pin-name">${h(row.city || "")}</span>`,
+        { position: point, offset: new BMapGL.Size(-18, -42) }
+      );
+      label.setStyle({
+        border: "0",
+        padding: "0",
+        backgroundColor: "transparent",
+        color: "inherit",
+      });
+      baiduDemandMap.addOverlay(label);
+    });
+    if (resolvedRows.length > 1) {
+      const viewport = resolvedRows.map((item) => item.point);
+      baiduDemandMap.setViewport(viewport, { margins: [80, 360, 80, 360] });
+    }
+    if (empty) empty.hidden = rows.length > 0;
+  } catch (error) {
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = messageFromError(error);
+    }
+  }
+}
+
+function renderDashboardInsights(analytics) {
+  const node = $("#dashboard-insights");
+  if (!node) return;
+  const periods = analytics.periods || {};
+  if (!periods[dashboardViewState.period]) {
+    dashboardViewState.period = analytics.default_period || Object.keys(periods)[0] || "day";
+  }
+  const current = periods[dashboardViewState.period] || {};
+  const stats = current.task_stats || {};
+  const locationRows = current.location_points || [];
+  node.innerHTML = `
+    <div class="chart-grid">
+      <section class="chart-card chart-card-map chart-card-wide">
+        ${renderDemandMap(locationRows, current, periods)}
+      </section>
+    </div>
+  `;
+  renderBaiduDemandMap(locationRows, analytics.map || {});
 }
 
 async function refreshDepartments() {
@@ -345,9 +687,27 @@ function mailStatusClass(status) {
   }[status] || "status-muted";
 }
 
+function renderPendingDiagnosis(row) {
+  const diagnosis = row.pending_diagnosis;
+  if (!diagnosis) return "";
+  const details = Array.isArray(diagnosis.details) ? diagnosis.details : [];
+  return `
+    <div class="pending-diagnosis pending-${h(diagnosis.severity || "waiting")}">
+      <strong>${h(diagnosis.reason || "等待处理")}</strong>
+      <small>已等待 ${h(formatDuration(diagnosis.pending_age_seconds))}${diagnosis.queue_position ? ` · 队列第 ${h(diagnosis.queue_position)} 位` : ""}</small>
+      ${details.length ? `<ul>${details.map((item) => `<li>${h(item)}</li>`).join("")}</ul>` : ""}
+    </div>
+  `;
+}
+
 async function refreshOutbound() {
-  const data = normalizeListPayload(await api(`/api/outbound-mails?${queryFromState(tableStates.outbound)}`), tableStates.outbound);
+  const [listPayload, diagnostics] = await Promise.all([
+    api(`/api/outbound-mails?${queryFromState(tableStates.outbound)}`),
+    api("/api/outbound-mails/diagnostics"),
+  ]);
+  const data = normalizeListPayload(listPayload, tableStates.outbound);
   const rows = data.items || [];
+  renderOutboundDiagnostics(diagnostics);
   setSelectOptions("#outbound-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.outbound.status);
   setSelectOptions("#outbound-filter-form [name=mail_type]", data.mail_type_options || [], "全部类型", tableStates.outbound.mail_type);
   $("#outbound-list").innerHTML =
@@ -360,6 +720,7 @@ async function refreshOutbound() {
           <div><small>抄送</small><br />${h(row.cc.join(", ") || "无")}</div>
           <div>
             <small class="status-text ${mailStatusClass(row.status)}">${h(row.status)}</small>
+            ${renderPendingDiagnosis(row)}
             ${
               row.status === "Failed"
                 ? `<div class="actions row-actions"><button class="button ghost" data-action="retry-outbound" data-id="${h(row.id)}">重试</button></div>`
@@ -370,6 +731,56 @@ async function refreshOutbound() {
       )
       .join("") || `<div class="row"><div>暂无外发任务</div></div>`;
   renderListPagination("#outbound-pagination", "outbound", data);
+}
+
+function renderOutboundDiagnostics(data) {
+  const node = $("#outbound-diagnostics");
+  if (!node) return;
+  const status = data.status_counts || {};
+  const failedTypes = data.failed_by_type || [];
+  const recent = data.recent_failures || [];
+  const deadLetters = data.dead_letters || [];
+  const alerts = data.alerts || [];
+  node.innerHTML = `
+    ${
+      alerts.length
+        ? `<div class="alert-strip">${alerts.map((alert) => `<span>${h(alert.message)}</span>`).join("")}</div>`
+        : ""
+    }
+    <div class="diagnostics-grid">
+      <div class="diagnostic-card ${Number(status.Failed || 0) ? "is-warn" : "is-ok"}">
+        <small>失败/死信</small>
+        <strong>${h(status.Failed || 0)}</strong>
+        <span>Pending ${h(status.Pending || 0)} / Sent ${h(status.Sent || 0)} / Cancelled ${h(status.Cancelled || 0)}</span>
+      </div>
+      <div class="diagnostic-card">
+        <small>近 ${h(data.window_hours || 24)} 小时失败类型</small>
+        <strong>${failedTypes.length ? h(failedTypes[0].mail_type) : "无"}</strong>
+        <span>${failedTypes.length ? failedTypes.map((item) => `${h(item.mail_type)} ${h(item.count)}`).join("，") : "没有 SMTP 失败记录"}</span>
+      </div>
+      <div class="diagnostic-card ${recent.length ? "is-warn" : "is-ok"}">
+        <small>最近失败</small>
+        <strong>${recent.length ? h(recent[0].error || "发送失败") : "无"}</strong>
+        <span>${recent.length ? h(recent[0].subject || recent[0].outbound_job_id || "") : "当前窗口内无异常"}</span>
+      </div>
+    </div>
+    ${
+      deadLetters.length
+        ? `<div class="dead-letter-list">
+            ${deadLetters
+              .slice(0, 5)
+              .map(
+                (job) => `
+                  <div>
+                    <strong>${h(job.subject)}</strong>
+                    <small>${h(job.mail_type)} · ${h(formatTime(job.created_at))} · ${h((job.to || []).join(", ") || "无收件人")}</small>
+                  </div>`
+              )
+              .join("")}
+          </div>`
+        : ""
+    }
+  `;
 }
 
 function fillForm(formSelector, values) {
@@ -812,11 +1223,13 @@ function renderWorkflowRules() {
               <small>${h(isBuiltin ? "内置默认流程（只读）" : row.approved_at || row.created_at || "")}</small>
               <div class="actions row-actions">
                 <button class="button ghost" data-action="view-workflow-version" data-id="${h(row.version_id)}">查看规则</button>
+                <button class="button ghost" data-action="diff-workflow-version" data-id="${h(row.version_id)}">版本差异</button>
                 ${
                   isBuiltin
                     ? ""
                     : `
                   ${activatable ? `<button class="button" data-action="activate-workflow-version" data-id="${h(row.version_id)}">启用流程</button>` : ""}
+                  ${activatable ? `<button class="button ghost" data-action="rollback-workflow-version" data-id="${h(row.version_id)}">回滚到此版本</button>` : ""}
                   ${deactivatable ? `<button class="button ghost" data-action="deactivate-workflow-version" data-id="${h(row.version_id)}">停用流程</button>` : ""}
                   ${editable ? `<button class="button ghost" data-action="llm-edit-workflow-version" data-id="${h(row.version_id)}">LLM编辑</button>` : ""}
                   ${editable ? `<button class="button ghost" data-action="edit-workflow-version" data-id="${h(row.version_id)}">编辑规则</button>` : ""}
@@ -960,6 +1373,8 @@ async function refreshConfig() {
   }
   const password = $("#runtime-mail-form [name=bot_email_password]");
   if (password) password.value = "";
+  const baiduMapAk = $("#runtime-mail-form [name=baidu_map_ak]");
+  if (baiduMapAk) baiduMapAk.value = "";
   document.querySelectorAll("#e2e-mail-form input[type=password]").forEach((input) => {
     input.value = "";
   });
@@ -1582,6 +1997,26 @@ $("#workflow-chat-save").addEventListener("click", async () => {
 
 $("#workflow-import-open")?.addEventListener("click", openWorkflowImportModal);
 
+$("#workflow-simulate-open")?.addEventListener("click", async () => {
+  const subject = window.prompt("模拟邮件主题", "采购订单-JM-CGDD-2026001 测试客户 2026-05-20");
+  if (subject === null) return;
+  const body = window.prompt(
+    "模拟邮件正文",
+    "客户名称：测试客户\n产品：积木展示架 A1\n数量：120套\n期望交期：2026-05-20\n订单号：SIM-001"
+  );
+  if (body === null) return;
+  const fromAddress = window.prompt("销售发件人", "sales@jimuyida.com");
+  if (fromAddress === null) return;
+  const result = await api("/api/workflows/simulate", {
+    method: "POST",
+    body: JSON.stringify({ from_address: fromAddress, subject, body_text: body }),
+  });
+  const workflow = result.workflow?.workflow_name || result.workflow_match?.detail?.workflow_name || "未命中流程";
+  const review = result.would_create_task ? "会创建任务" : "不会创建任务";
+  const reasons = (result.exceptions || []).map((item) => item.detail?.message || item.exception_type).filter(Boolean).join("\n");
+  window.alert(`模拟结果：${review}\n分类：${result.classification || "-"}\n命中流程：${workflow}${reasons ? `\n\n异常/原因：\n${reasons}` : ""}`);
+});
+
 $("#workflow-import-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
@@ -1634,6 +2069,12 @@ $("#workflow-rules-list").addEventListener("click", async (event) => {
     openWorkflowRuleEditor(versionId, row?.rules || {}, { readonly: true });
     return;
   }
+  if (target.dataset.action === "diff-workflow-version") {
+    const diff = await api(`/api/workflows/versions/${versionId}/diff`);
+    const lines = (diff.changes || []).map((item) => `- ${item.field}`).join("\n");
+    window.alert(lines ? `版本差异：\n${lines}` : "该版本与上一版本无差异。");
+    return;
+  }
   if (target.dataset.action === "edit-workflow-version") {
     if (!row || !row.editable) {
       toast("流程启用中，需先停用后再编辑");
@@ -1654,6 +2095,14 @@ $("#workflow-rules-list").addEventListener("click", async (event) => {
   if (target.dataset.action === "activate-workflow-version") {
     await api(`/api/workflows/versions/${versionId}/activate`, { method: "POST" });
     toast("流程规则已启用");
+    await refreshWorkflowRules();
+    return;
+  }
+  if (target.dataset.action === "rollback-workflow-version") {
+    const ok = window.confirm("确认将该历史版本启用为当前流程版本？现有 Active 版本会自动归档。");
+    if (!ok) return;
+    await api(`/api/workflows/versions/${versionId}/rollback`, { method: "POST" });
+    toast("已回滚到指定流程版本");
     await refreshWorkflowRules();
     return;
   }
@@ -1745,6 +2194,7 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
   const form = new FormData(event.currentTarget);
   const values = Object.fromEntries(form.entries());
   if (!values.bot_email_password) delete values.bot_email_password;
+  if (!values.baidu_map_ak) delete values.baidu_map_ak;
   if (values.mail_auto_worker_interval_seconds && Number(values.mail_auto_worker_interval_seconds) < 60) {
     toast("Worker 执行周期不能低于 60 秒");
     return;
@@ -1860,6 +2310,13 @@ $("#system-toggle")?.addEventListener("click", async () => {
   }
 });
 
+$("#dashboard-insights")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-dashboard-period]");
+  if (!button) return;
+  dashboardViewState.period = button.dataset.dashboardPeriod || "day";
+  refreshDashboard();
+});
+
 $("#outbound-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");
   if (!target || target.dataset.action !== "retry-outbound") return;
@@ -1894,6 +2351,14 @@ $("#cancel-pending-outbound")?.addEventListener("click", async () => {
       }),
     });
     toast(`已取消 ${result.cancelled || 0} 条 Pending 外发任务`);
+    await refreshAll();
+  });
+});
+
+$("#notify-outbound-alerts")?.addEventListener("click", async () => {
+  await guardedAction(["外发", "发送告警通知"], async () => {
+    const result = await api("/api/outbound-mails/diagnostics/notify", { method: "POST" });
+    toast(result.queued ? `告警通知已入队：${result.status}` : result.reason || "当前没有需要通知的外发告警");
     await refreshAll();
   });
 });

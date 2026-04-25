@@ -7,6 +7,8 @@ from backend.app.models import MailTemplate, ModelProviderConfig, ProductionDepa
 from backend.app.services.jsonutil import dumps
 
 
+LEGACY_DEFAULT_BAIDU_MAP_AK = "DC5abb7ad1c9c694af28f4732aa163c3"
+
 DEFAULT_TASK_SUBJECT = "[生产任务单][{{task_no}}][{{customer_name}}][{{product_summary}}][V{{version_no}}]"
 DEFAULT_TASK_BODY = """生产部同事好：
 
@@ -85,7 +87,17 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "bot_enabled", "false", is_secret=False)
     ensure_config(session, "llm_fallback_enabled", "true", is_secret=False)
     ensure_config(session, "conversation_max_rounds", "3", is_secret=False)
+    ensure_config(session, "outbound_failed_alert_threshold", "1", is_secret=False)
+    ensure_config(session, "outbound_pending_age_alert_seconds", "3600", is_secret=False)
     ensure_config(session, "workflow_contact_map_json", "{}", is_secret=False)
+    if settings.baidu_map_ak:
+        map_config = session.get(SystemConfig, "baidu_map_ak")
+        if map_config is None or not (map_config.value or "").strip() or map_config.value == LEGACY_DEFAULT_BAIDU_MAP_AK:
+            set_config(session, "baidu_map_ak", settings.baidu_map_ak, is_secret=True)
+        elif not map_config.is_secret:
+            map_config.is_secret = True
+    else:
+        ensure_config(session, "baidu_map_ak", "", is_secret=True)
 
     template = (
         session.query(MailTemplate)

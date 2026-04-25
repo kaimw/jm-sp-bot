@@ -368,6 +368,7 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "SalesReplyTaskReissue",
     "SalesReplyReissueReceipt",
     "WeeklyReport",
+    "OutboundAlert",
 }
 
 

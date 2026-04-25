@@ -58,6 +58,7 @@ class Settings:
     model_provider: str = os.getenv("MODEL_PROVIDER", "openai")
     model_name: str = os.getenv("MODEL_NAME", "DeepSeek-V3")
     model_api_base: str = os.getenv("MODEL_API_BASE", "http://192.168.10.55:5000/v1")
+    baidu_map_ak: str = os.getenv("BAIDU_MAP_AK", "WlbmVQwUBkBnqJgXjmkK6mReKCyEdWSi")
 
     zip_max_bytes: int = int_env("ZIP_MAX_BYTES", 104857600)
     zip_max_depth: int = int_env("ZIP_MAX_DEPTH", 1)

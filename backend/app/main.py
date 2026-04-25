@@ -4,16 +4,18 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import csv
 import hmac
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from io import StringIO
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -25,6 +27,7 @@ from backend.app.models import (
     ExceptionCase,
     ExtractionEvidence,
     MailMessage,
+    MailWorkflowMatch,
     MailTemplate,
     ModelProviderConfig,
     OrderRequirement,
@@ -36,6 +39,7 @@ from backend.app.models import (
     ProductionTask,
     ProductionTaskVersion,
     SystemConfig,
+    WorkflowDefinition,
     WorkflowImportJob,
     WorkflowVersion,
     now_utc,
@@ -62,6 +66,7 @@ from backend.app.schemas import (
     WorkflowChatGenerateRequest,
     WorkflowChatSaveRequest,
     WorkflowImportRequest,
+    WorkflowSimulationRequest,
     WorkflowVersionUpdateRequest,
     WeeklyReportRecipientsUpdate,
 )
@@ -79,8 +84,8 @@ from backend.app.services.initial_review import (
 )
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.jobs import run_pending_jobs
-from backend.app.services.mail_adapter import send_pending_smtp, sync_imap_mailbox
-from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, run_mail_auto_worker_once
+from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, send_pending_smtp, sync_imap_mailbox
+from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, get_mail_worker_status, run_mail_auto_worker_once
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
@@ -93,11 +98,14 @@ from backend.app.services.workflow_rules import (
     import_structured_workflow_rules,
     import_workflow_document,
     list_workflow_rules,
+    rollback_workflow_version,
     save_workflow_version_rules,
+    workflow_version_diff,
 )
 from backend.app.services.workflow import (
     approve_task,
     create_inbound_mail,
+    create_task_from_mail,
     dashboard,
     enqueue_weekly_report,
     force_close_task_manual,
@@ -202,8 +210,26 @@ async def mail_auto_worker_loop() -> None:
 
 
 @app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+def health(session: Session = Depends(get_session)) -> dict:
+    readiness = runtime_startup_readiness(session)
+    queues = system_queue_health(session)
+    return {
+        "status": "ok",
+        "ready": readiness["ready"],
+        "missing": readiness["missing"],
+        "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "queues": queues,
+    }
+
+
+@app.get("/api/system/health")
+def system_health(session: Session = Depends(get_session)) -> dict:
+    return {
+        "readiness": runtime_startup_readiness(session),
+        "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "worker": get_mail_worker_status(configured_worker_interval_seconds(session)),
+        "queues": system_queue_health(session),
+    }
 
 
 @app.post("/api/auth/login")
@@ -267,6 +293,75 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
     return {"ready": not missing, "missing": missing}
 
 
+def system_config_bool(session: Session, key: str, default: bool = False) -> bool:
+    row = session.get(SystemConfig, key)
+    if row is None or row.value in (None, ""):
+        return default
+    return str(row.value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configured_worker_interval_seconds(session: Session) -> int:
+    row = session.get(SystemConfig, "mail_auto_worker_interval_seconds")
+    try:
+        value = int(row.value) if row is not None else settings.mail_auto_worker_interval_seconds
+    except (TypeError, ValueError):
+        value = settings.mail_auto_worker_interval_seconds
+    return max(MAIL_WORKER_MIN_INTERVAL_SECONDS, value)
+
+
+def seconds_since(value: datetime | None) -> int | None:
+    if value is None:
+        return None
+    now = now_utc()
+    if value.tzinfo is None:
+        now = now.replace(tzinfo=None)
+    return max(0, int((now - value).total_seconds()))
+
+
+def config_int(session: Session, key: str, default: int) -> int:
+    row = session.get(SystemConfig, key)
+    try:
+        return int(row.value) if row is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def system_queue_health(session: Session) -> dict:
+    outbound_counts = dict(
+        session.query(OutboundMailJob.status, func.count(OutboundMailJob.id))
+        .group_by(OutboundMailJob.status)
+        .all()
+    )
+    processing_counts = dict(
+        session.query(ProcessingJob.status, func.count(ProcessingJob.id))
+        .group_by(ProcessingJob.status)
+        .all()
+    )
+    oldest_pending = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Pending")
+        .order_by(OutboundMailJob.created_at)
+        .first()
+    )
+    pending_auto = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Pending", OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES))
+        .count()
+    )
+    pending_manual = max(0, int(outbound_counts.get("Pending", 0) or 0) - pending_auto)
+    return {
+        "outbound": {
+            "counts": outbound_counts,
+            "pending_auto_dispatchable": pending_auto,
+            "pending_manual_only": pending_manual,
+            "oldest_pending_id": oldest_pending.id if oldest_pending else None,
+            "oldest_pending_age_seconds": seconds_since(oldest_pending.created_at) if oldest_pending else None,
+            "single_run_send_limit": 1,
+        },
+        "processing": {"counts": processing_counts},
+    }
+
+
 def require_admin_password(admin_password: str) -> None:
     if not hmac.compare_digest(admin_password or "", settings.admin_password or ""):
         raise HTTPException(status_code=403, detail="invalid admin password")
@@ -308,7 +403,7 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
         readiness = runtime_startup_readiness(session, values)
         if not readiness["ready"]:
             raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
-    secret_keys = {"bot_email_password", "e2e_sales_password", "e2e_production_password"}
+    secret_keys = {"bot_email_password", "baidu_map_ak", "e2e_sales_password", "e2e_production_password"}
     for key, value in values.items():
         if value in (None, ""):
             continue
@@ -523,6 +618,108 @@ def update_workflow_version(
         raise HTTPException(status_code=status, detail=detail) from exc
     session.commit()
     return serialize_workflow_version(version)
+
+
+@app.get("/api/workflows/versions/{version_id}/diff")
+def workflow_version_diff_api(
+    version_id: str,
+    compare_to: str | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        return workflow_version_diff(session, version_id, compare_to_version_id=compare_to)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+
+@app.post("/api/workflows/versions/{version_id}/rollback")
+def workflow_version_rollback_api(version_id: str, request: Request, session: Session = Depends(get_session)) -> dict:
+    try:
+        version = rollback_workflow_version(session, version_id, actor=getattr(request.state, "username", "system"))
+        sync_workflow_review_rules_to_initial_review(session)
+    except ValueError as exc:
+        detail = str(exc)
+        status = 404 if "not found" in detail else 400
+        raise HTTPException(status_code=status, detail=detail) from exc
+    session.commit()
+    return serialize_workflow_version(version)
+
+
+@app.post("/api/workflows/simulate")
+def workflow_simulate(payload: WorkflowSimulationRequest, session: Session = Depends(get_session)) -> dict:
+    before_outbound_ids = {row.id for row in session.query(OutboundMailJob.id).all()}
+    before_exception_ids = {row.id for row in session.query(ExceptionCase.id).all()}
+    before_audit_ids = {row.id for row in session.query(AuditEvent.id).all()}
+    mail: MailMessage | None = None
+    task: ProductionTask | None = None
+    error = ""
+    try:
+        if not payload.use_llm:
+            for model in session.query(ModelProviderConfig).filter_by(status="Active").all():
+                model.status = "SimulationDisabled"
+            session.flush()
+        mail = create_inbound_mail(
+            session,
+            from_address=payload.from_address,
+            subject=payload.subject,
+            body_text=payload.body_text,
+            dedupe_key=f"simulation:{uuid.uuid4()}",
+        )
+        task = create_task_from_mail(session, mail)
+        session.flush()
+        requirement = (
+            session.query(OrderRequirement)
+            .filter_by(source_mail_id=mail.id)
+            .order_by(OrderRequirement.created_at.desc())
+            .first()
+            if mail is not None
+            else None
+        )
+        binding = (
+            session.query(RequirementWorkflowBinding).filter_by(requirement_id=requirement.id).one_or_none()
+            if requirement is not None
+            else None
+        )
+        match = (
+            session.query(MailWorkflowMatch)
+            .filter_by(mail_id=mail.id)
+            .order_by(MailWorkflowMatch.created_at.desc())
+            .first()
+            if mail is not None
+            else None
+        )
+        outbounds = session.query(OutboundMailJob).filter(~OutboundMailJob.id.in_(before_outbound_ids)).order_by(OutboundMailJob.created_at).all()
+        exceptions = session.query(ExceptionCase).filter(~ExceptionCase.id.in_(before_exception_ids)).order_by(ExceptionCase.created_at).all()
+        audits = session.query(AuditEvent).filter(~AuditEvent.id.in_(before_audit_ids)).order_by(AuditEvent.created_at).all()
+        result = {
+            "classification": mail.classification if mail is not None else None,
+            "classification_confidence": mail.classification_confidence if mail is not None else 0,
+            "would_create_task": task is not None,
+            "task": serialize_task(task, include_versions=True) if task is not None else None,
+            "requirement": serialize_requirement_summary(requirement) if requirement is not None else None,
+            "workflow": serialize_requirement_workflow_binding(binding) if binding is not None else None,
+            "workflow_match": {
+                "workflow_version_id": match.workflow_version_id,
+                "workflow_code": match.workflow_code,
+                "confidence": match.confidence,
+                "detail": loads(match.match_detail_json, {}),
+            }
+            if match is not None
+            else None,
+            "outbound_mails": [serialize_outbound_mail(row, session) for row in outbounds],
+            "exceptions": [serialize_exception(row) for row in exceptions],
+            "audits": [serialize_audit_event(row) for row in audits],
+        }
+    except Exception as exc:
+        error = str(exc)
+        result = {"would_create_task": False, "error": error}
+    finally:
+        session.rollback()
+    if error:
+        return result
+    return result
 
 
 @app.get("/api/workflow-import-jobs")
@@ -868,6 +1065,88 @@ def task_detail(task_id: str, session: Session = Depends(get_session)) -> dict:
     return data
 
 
+def task_trace_graph(session: Session, task: ProductionTask) -> dict:
+    requirement = task.requirement
+    source_mail = session.get(MailMessage, requirement.source_mail_id) if requirement.source_mail_id else None
+    versions = session.query(ProductionTaskVersion).filter_by(task_id=task.id).order_by(ProductionTaskVersion.version_no).all()
+    version_ids = [row.id for row in versions]
+    outbound_query = session.query(OutboundMailJob).filter(OutboundMailJob.related_task_id == task.id)
+    if version_ids:
+        outbound_query = session.query(OutboundMailJob).filter(
+            or_(OutboundMailJob.related_task_id == task.id, OutboundMailJob.related_version_id.in_(version_ids))
+        )
+    outbounds = outbound_query.order_by(OutboundMailJob.created_at).all()
+    questions = session.query(QuestionAndReply).filter_by(task_id=task.id).order_by(QuestionAndReply.created_at).all()
+    exceptions = session.query(ExceptionCase).filter_by(related_task_id=task.id).order_by(ExceptionCase.created_at).all()
+    evidences = session.query(ExtractionEvidence).filter_by(requirement_id=requirement.id).order_by(ExtractionEvidence.created_at).all()
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=requirement.id).one_or_none()
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+
+    def add_node(node_id: str, node_type: str, label: str, *, status: str = "", meta: dict | None = None) -> None:
+        if not any(item["id"] == node_id for item in nodes):
+            nodes.append({"id": node_id, "type": node_type, "label": label, "status": status, "meta": meta or {}})
+
+    def add_edge(source: str, target: str, label: str) -> None:
+        if source and target and not any(item["source"] == source and item["target"] == target and item["label"] == label for item in edges):
+            edges.append({"source": source, "target": target, "label": label})
+
+    if source_mail is not None:
+        add_node(source_mail.id, "mail", source_mail.subject or "来源邮件", status=source_mail.classification or "", meta=serialize_mail(source_mail))
+        add_edge(source_mail.id, requirement.id, "抽取")
+    add_node(requirement.id, "requirement", requirement.internal_order_no, status=requirement.status, meta=serialize_requirement_summary(requirement))
+    add_node(task.id, "task", task.task_no, status=task.status, meta=serialize_task(task))
+    add_edge(requirement.id, task.id, "生成任务")
+    if binding is not None:
+        workflow_node_id = binding.workflow_version_id or f"workflow:{binding.workflow_code or 'unknown'}"
+        add_node(workflow_node_id, "workflow", binding.workflow_name or binding.workflow_code or "命中流程", status=str(binding.match_confidence), meta=serialize_requirement_workflow_binding(binding))
+        add_edge(workflow_node_id, requirement.id, "规则初审")
+
+    for version in versions:
+        add_node(version.id, "task_version", f"V{version.version_no}", status=version.status, meta={"subject": version.subject})
+        add_edge(task.id, version.id, "版本")
+    for job in outbounds:
+        add_node(job.id, "outbound_mail", job.subject, status=job.status, meta=serialize_outbound_mail(job, session))
+        add_edge(job.related_version_id or task.id, job.id, job.mail_type)
+    for question in questions:
+        add_node(question.id, "question", question.question_text[:80], status=question.status, meta=serialize_question(question))
+        add_edge(task.id, question.id, "生产疑问")
+        if question.production_question_mail_id:
+            add_edge(question.production_question_mail_id, question.id, "提出疑问")
+        if question.sales_reply_mail_id:
+            add_edge(question.sales_reply_mail_id, question.id, "销售答复")
+    for exception in exceptions:
+        add_node(exception.id, "exception", exception.exception_type, status=exception.status, meta=serialize_exception(exception))
+        add_edge(task.id, exception.id, "异常")
+    for evidence in evidences:
+        add_node(evidence.id, "evidence", evidence.field_name, status=str(evidence.confidence), meta=serialize_evidence(evidence))
+        add_edge(evidence.source_mail_id or requirement.id, evidence.id, "证据")
+        add_edge(evidence.id, requirement.id, "支撑字段")
+
+    object_ids = {task.id, requirement.id, *(row.id for row in versions), *(row.id for row in outbounds), *(row.id for row in questions), *(row.id for row in exceptions)}
+    if source_mail is not None:
+        object_ids.add(source_mail.id)
+    audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.related_object_id.in_(object_ids))
+        .order_by(AuditEvent.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    timeline = [
+        {
+            "type": "audit",
+            "title": row.event_type,
+            "status": row.related_object_type,
+            "detail": loads(row.detail, {}),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in audits
+    ]
+    return {"nodes": nodes, "edges": edges, "timeline": timeline}
+
+
 @app.get("/api/tasks/{task_id}/workflow")
 def task_workflow(task_id: str, session: Session = Depends(get_session)) -> dict:
     task = session.get(ProductionTask, task_id)
@@ -992,7 +1271,16 @@ def task_workflow(task_id: str, session: Session = Depends(get_session)) -> dict
         "task": serialize_task(task, include_versions=True),
         "steps": steps,
         "timeline": timeline[:80],
+        "trace": task_trace_graph(session, task),
     }
+
+
+@app.get("/api/tasks/{task_id}/trace")
+def task_trace(task_id: str, session: Session = Depends(get_session)) -> dict:
+    task = session.get(ProductionTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return {"task": serialize_task(task), **task_trace_graph(session, task)}
 
 
 @app.post("/api/tasks/{task_id}/approve")
@@ -1103,7 +1391,7 @@ def outbound_mails(
         query = query.filter(or_(OutboundMailJob.to_json.ilike(pattern), OutboundMailJob.cc_json.ilike(pattern)))
     return page_response(
         query.order_by(OutboundMailJob.created_at.desc()),
-        serialize_outbound_mail,
+        lambda row: serialize_outbound_mail(row, session),
         page,
         page_size,
         {
@@ -1141,6 +1429,98 @@ def filtered_outbound_query(
         pattern = f"%{recipient.strip()}%"
         query = query.filter(or_(OutboundMailJob.to_json.ilike(pattern), OutboundMailJob.cc_json.ilike(pattern)))
     return query
+
+
+def outbound_pending_diagnosis(session: Session, row: OutboundMailJob) -> dict | None:
+    if row.status != "Pending":
+        return None
+
+    recipients = as_list(row.to_json) + as_list(row.cc_json)
+    age_seconds = seconds_since(row.created_at) or 0
+    queue_position = (
+        session.query(func.count(OutboundMailJob.id))
+        .filter(OutboundMailJob.status == "Pending", OutboundMailJob.created_at <= row.created_at)
+        .scalar()
+        or 1
+    )
+    interval_seconds = configured_worker_interval_seconds(session)
+    auto_dispatchable = row.mail_type in AUTO_WORKFLOW_MAIL_TYPES
+    details: list[str] = []
+
+    if not recipients:
+        return {
+            "severity": "invalid",
+            "reason": "缺少收件人，发送时会失败",
+            "details": ["请补充主送或取消该外发任务"],
+            "pending_age_seconds": age_seconds,
+            "queue_position": queue_position,
+            "auto_dispatchable": auto_dispatchable,
+        }
+
+    if not system_config_bool(session, "bot_enabled", False):
+        return {
+            "severity": "blocked",
+            "reason": "系统已停用，自动 worker 不会消费",
+            "details": ["可在右上角启动系统，或手动发送待发邮件"],
+            "pending_age_seconds": age_seconds,
+            "queue_position": queue_position,
+            "auto_dispatchable": auto_dispatchable,
+        }
+
+    if not (session.get(SystemConfig, "bot_email_password") and session.get(SystemConfig, "bot_email_password").value):
+        return {
+            "severity": "blocked",
+            "reason": "Bot 邮箱密码未配置",
+            "details": ["请在接入配置中配置邮箱密码后再发送"],
+            "pending_age_seconds": age_seconds,
+            "queue_position": queue_position,
+            "auto_dispatchable": auto_dispatchable,
+        }
+
+    if not auto_dispatchable:
+        return {
+            "severity": "manual",
+            "reason": "该类型不在自动 worker 消费范围内",
+            "details": ["需要手动触发发送，或把该类型纳入自动发送白名单"],
+            "pending_age_seconds": age_seconds,
+            "queue_position": queue_position,
+            "auto_dispatchable": False,
+        }
+
+    worker = get_mail_worker_status(interval_seconds)
+    if not worker.get("auto_worker_enabled"):
+        return {
+            "severity": "blocked",
+            "reason": "自动 worker 未启用",
+            "details": ["需要手动发送，或以 MAIL_AUTO_WORKER_ENABLED=true 启动服务"],
+            "pending_age_seconds": age_seconds,
+            "queue_position": queue_position,
+            "auto_dispatchable": True,
+        }
+
+    expected_wait_seconds = max(0, (int(queue_position) - 1) * interval_seconds)
+    details.append(f"当前队列位置第 {queue_position} 位")
+    details.append(f"worker 周期 {interval_seconds} 秒，单轮最多发送 1 封")
+    if expected_wait_seconds:
+        details.append(f"按当前限速预计至少等待 {expected_wait_seconds} 秒")
+    if worker.get("last_finished_at"):
+        details.append(f"最近 worker 完成时间：{worker['last_finished_at']}")
+    else:
+        details.append("当前进程尚未记录 worker 完成时间")
+
+    configured_threshold = config_int(session, "outbound_pending_age_alert_seconds", 3600)
+    delayed_threshold = max(configured_threshold, interval_seconds * max(1, int(queue_position)), interval_seconds)
+    severity = "delayed" if age_seconds > delayed_threshold else "waiting"
+    reason = "超过预计等待时间，需检查 worker 心跳或 SMTP 状态" if severity == "delayed" else "等待下一轮 worker 消费"
+    return {
+        "severity": severity,
+        "reason": reason,
+        "details": details,
+        "pending_age_seconds": age_seconds,
+        "queue_position": queue_position,
+        "estimated_min_wait_seconds": expected_wait_seconds,
+        "auto_dispatchable": True,
+    }
 
 
 @app.post("/api/outbound-mails/send-pending")
@@ -1199,6 +1579,224 @@ def retry_outbound(job_id: str, session: Session = Depends(get_session)) -> dict
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()
     return {"outbound_job_id": job.id, "status": job.status}
+
+
+@app.get("/api/outbound-mails/diagnostics")
+def outbound_mail_diagnostics(
+    hours: int = Query(24, ge=1, le=168),
+    limit: int = Query(10, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict:
+    return outbound_mail_diagnostics_data(session, hours=hours, limit=limit)
+
+
+def outbound_mail_diagnostics_data(session: Session, *, hours: int = 24, limit: int = 10) -> dict:
+    since = now_utc() - timedelta(hours=hours)
+    status_counts = dict(
+        session.query(OutboundMailJob.status, func.count(OutboundMailJob.id))
+        .group_by(OutboundMailJob.status)
+        .all()
+    )
+    failed_jobs = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Failed")
+        .order_by(OutboundMailJob.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    failed_cases = (
+        session.query(ExceptionCase)
+        .filter(ExceptionCase.exception_type == "OutboundMailSendFailed", ExceptionCase.created_at >= since)
+        .order_by(ExceptionCase.created_at.desc())
+        .limit(max(limit, 20))
+        .all()
+    )
+
+    by_type: dict[str, int] = {}
+    trend: dict[str, int] = {}
+    recent_failures = []
+    for case in failed_cases:
+        detail = loads(case.detail, {})
+        mail_type = str(detail.get("mail_type") or "Unknown")
+        by_type[mail_type] = by_type.get(mail_type, 0) + 1
+        bucket = case.created_at.strftime("%Y-%m-%d %H:00")
+        trend[bucket] = trend.get(bucket, 0) + 1
+        if len(recent_failures) < limit:
+            recent_failures.append(
+                {
+                    "id": case.id,
+                    "outbound_job_id": detail.get("outbound_job_id"),
+                    "mail_type": mail_type,
+                    "subject": detail.get("subject"),
+                    "error": detail.get("error"),
+                    "created_at": case.created_at.isoformat(),
+                    "status": case.status,
+                }
+            )
+
+    failed_total = int(status_counts.get("Failed", 0) or 0)
+    pending_age_threshold = config_int(session, "outbound_pending_age_alert_seconds", 3600)
+    failed_threshold = config_int(session, "outbound_failed_alert_threshold", 1)
+    oldest_pending = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Pending")
+        .order_by(OutboundMailJob.created_at)
+        .first()
+    )
+    oldest_pending_age = seconds_since(oldest_pending.created_at) if oldest_pending else None
+    alerts = []
+    if failed_total >= failed_threshold:
+        alerts.append(
+            {
+                "level": "High",
+                "type": "outbound_failed_threshold",
+                "message": f"外发失败数 {failed_total} 已达到阈值 {failed_threshold}",
+            }
+        )
+    if oldest_pending_age is not None and oldest_pending_age >= pending_age_threshold:
+        alerts.append(
+            {
+                "level": "Medium",
+                "type": "outbound_pending_age_threshold",
+                "message": f"最早 Pending 已等待 {oldest_pending_age} 秒，超过阈值 {pending_age_threshold} 秒",
+                "outbound_job_id": oldest_pending.id,
+            }
+        )
+
+    return {
+        "window_hours": hours,
+        "thresholds": {
+            "failed_count": failed_threshold,
+            "pending_age_seconds": pending_age_threshold,
+        },
+        "alert_recipients": outbound_alert_recipients(session),
+        "alerts": alerts,
+        "status_counts": status_counts,
+        "failed_by_type": [{"mail_type": key, "count": value} for key, value in sorted(by_type.items(), key=lambda item: item[1], reverse=True)],
+        "failure_trend": [{"hour": key, "count": trend[key]} for key in sorted(trend)],
+        "recent_failures": recent_failures,
+        "dead_letters": [serialize_outbound_mail(job, session) for job in failed_jobs],
+    }
+
+
+def outbound_alert_recipients(session: Session) -> list[str]:
+    configured = session.get(SystemConfig, "outbound_alert_to_json")
+    recipients = as_list(configured.value) if configured is not None else []
+    if not recipients:
+        ops = session.get(SystemConfig, "ops_cc_email")
+        if ops is not None and str(ops.value or "").strip():
+            recipients.append(str(ops.value).strip())
+    if not recipients:
+        ceo = session.get(SystemConfig, "ceo_email")
+        if ceo is not None and str(ceo.value or "").strip():
+            recipients.append(str(ceo.value).strip())
+    return list(dict.fromkeys(item for item in recipients if item))
+
+
+@app.post("/api/outbound-mails/diagnostics/notify")
+def notify_outbound_diagnostics(
+    request: Request,
+    hours: int = Query(24, ge=1, le=168),
+    session: Session = Depends(get_session),
+) -> dict:
+    data = outbound_mail_diagnostics_data(session, hours=hours, limit=10)
+    alerts = data.get("alerts") or []
+    if not alerts:
+        return {"queued": False, "reason": "no outbound diagnostics alerts", "alerts": []}
+    recipients = outbound_alert_recipients(session)
+    if not recipients:
+        raise HTTPException(status_code=400, detail="outbound alert recipients are not configured")
+
+    now = now_utc()
+    alert_types = ",".join(sorted(str(item.get("type") or "") for item in alerts))
+    idem = f"outbound-alert:{now.strftime('%Y%m%d%H')}:{alert_types}:{','.join(recipients)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return {"queued": False, "outbound_job_id": existing.id, "status": existing.status, "reason": "already queued in this hour"}
+
+    subject = f"[外发队列告警][{now.strftime('%Y-%m-%d %H:%M')}] 请处理异常邮件队列"
+    body_lines = [
+        "运维同事好，",
+        "",
+        "系统检测到外发队列存在需要处理的异常：",
+        *[f"- {item.get('message')}" for item in alerts],
+        "",
+        f"状态统计：{dumps(data.get('status_counts') or {})}",
+        "",
+        "请登录商务部小J后台查看【外发】诊断信息并处理。",
+    ]
+    job = OutboundMailJob(
+        mail_type="OutboundAlert",
+        to_json=dumps(recipients),
+        cc_json=dumps([]),
+        subject=subject,
+        body="\n".join(body_lines),
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    session.flush()
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="OutboundDiagnosticsAlertQueued",
+            actor=actor,
+            related_object_type="OutboundMailJob",
+            related_object_id=job.id,
+            detail=dumps({"alerts": alerts, "to": recipients}),
+            created_at=now,
+        )
+    )
+    session.commit()
+    return {"queued": True, "outbound_job_id": job.id, "status": job.status, "to": recipients, "alerts": alerts}
+
+
+@app.get("/api/outbound-mails/diagnostics/export.csv")
+def outbound_mail_diagnostics_csv(
+    hours: int = Query(24, ge=1, le=168),
+    limit: int = Query(100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> Response:
+    data = outbound_mail_diagnostics_data(session, hours=hours, limit=limit)
+    buffer = StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=["section", "created_at", "outbound_job_id", "mail_type", "subject", "status", "error", "to", "cc"],
+    )
+    writer.writeheader()
+    for failure in data["recent_failures"]:
+        writer.writerow(
+            {
+                "section": "recent_failure",
+                "created_at": failure.get("created_at", ""),
+                "outbound_job_id": failure.get("outbound_job_id", ""),
+                "mail_type": failure.get("mail_type", ""),
+                "subject": failure.get("subject", ""),
+                "status": failure.get("status", ""),
+                "error": failure.get("error", ""),
+                "to": "",
+                "cc": "",
+            }
+        )
+    for job in data["dead_letters"]:
+        writer.writerow(
+            {
+                "section": "dead_letter",
+                "created_at": job.get("created_at", ""),
+                "outbound_job_id": job.get("id", ""),
+                "mail_type": job.get("mail_type", ""),
+                "subject": job.get("subject", ""),
+                "status": job.get("status", ""),
+                "error": "",
+                "to": ", ".join(job.get("to") or []),
+                "cc": ", ".join(job.get("cc") or []),
+            }
+        )
+    return Response(
+        buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="outbound-mail-diagnostics.csv"'},
+    )
 
 
 @app.post("/api/mailbox/sync")
@@ -1782,7 +2380,7 @@ def serialize_department(row: ProductionDepartment) -> dict:
     }
 
 
-def serialize_outbound_mail(row: OutboundMailJob) -> dict:
+def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None) -> dict:
     return {
         "id": row.id,
         "mail_type": row.mail_type,
@@ -1791,6 +2389,7 @@ def serialize_outbound_mail(row: OutboundMailJob) -> dict:
         "subject": row.subject,
         "status": row.status,
         "created_at": row.created_at.isoformat(),
+        "pending_diagnosis": outbound_pending_diagnosis(session, row) if session is not None else None,
     }
 
 
@@ -1888,6 +2487,25 @@ def serialize_requirement_workflow_binding(row: RequirementWorkflowBinding) -> d
         "required_attachments": as_list(row.required_attachments_json),
         "missing_fields": as_list(row.missing_fields_json),
         "unresolved_contacts": as_list(row.unresolved_contacts_json),
+    }
+
+
+def serialize_requirement_summary(row: OrderRequirement) -> dict:
+    return {
+        "id": row.id,
+        "source_mail_id": row.source_mail_id,
+        "internal_order_no": row.internal_order_no,
+        "external_order_no": row.external_order_no,
+        "customer_name": row.customer_name,
+        "salesperson_name": row.salesperson_name,
+        "salesperson_email": row.salesperson_email,
+        "product_summary": row.product_summary,
+        "quantity_text": row.quantity_text,
+        "expected_delivery_date": row.expected_delivery_date,
+        "missing_fields": as_list(row.missing_fields_json),
+        "risk_flags": as_list(row.risk_flags_json),
+        "status": row.status,
+        "created_at": row.created_at.isoformat(),
     }
 
 

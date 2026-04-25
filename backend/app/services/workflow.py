@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.models import (
     AuditEvent,
     AttachmentAsset,
@@ -3128,13 +3129,221 @@ def record_production_feedback(session: Session, task_id: str, feedback_type: st
     return job
 
 
+TASK_STATUS_LABELS = {
+    "TaskDrafted": "草稿待确认",
+    "ReissueDrafted": "变更待确认",
+    "TaskIssued": "已下达",
+    "Reissued": "已重发",
+    "ProductionQuestioned": "生产疑问",
+    "CancelReview": "取消待确认",
+    "Closed": "已关闭",
+}
+
+DASHBOARD_LOCATION_CATALOG = [
+    {"city": "深圳", "province": "广东", "keywords": ["深圳", "南山", "宝安", "龙岗", "龙华"], "lat": 22.5431, "lng": 114.0579},
+    {"city": "广州", "province": "广东", "keywords": ["广州", "天河", "越秀", "番禺"], "lat": 23.1291, "lng": 113.2644},
+    {"city": "东莞", "province": "广东", "keywords": ["东莞"], "lat": 23.0207, "lng": 113.7518},
+    {"city": "佛山", "province": "广东", "keywords": ["佛山"], "lat": 23.0215, "lng": 113.1214},
+    {"city": "武汉", "province": "湖北", "keywords": ["武汉", "湖北"], "lat": 30.5928, "lng": 114.3055},
+    {"city": "上海", "province": "上海", "keywords": ["上海", "浦东", "闵行"], "lat": 31.2304, "lng": 121.4737},
+    {"city": "杭州", "province": "浙江", "keywords": ["杭州", "浙江"], "lat": 30.2741, "lng": 120.1551},
+    {"city": "南京", "province": "江苏", "keywords": ["南京", "江苏"], "lat": 32.0603, "lng": 118.7969},
+    {"city": "苏州", "province": "江苏", "keywords": ["苏州"], "lat": 31.2989, "lng": 120.5853},
+    {"city": "北京", "province": "北京", "keywords": ["北京"], "lat": 39.9042, "lng": 116.4074},
+    {"city": "天津", "province": "天津", "keywords": ["天津"], "lat": 39.3434, "lng": 117.3616},
+    {"city": "青岛", "province": "山东", "keywords": ["青岛"], "lat": 36.0671, "lng": 120.3826},
+    {"city": "济南", "province": "山东", "keywords": ["济南", "山东"], "lat": 36.6512, "lng": 117.1201},
+    {"city": "郑州", "province": "河南", "keywords": ["郑州", "河南"], "lat": 34.7466, "lng": 113.6254},
+    {"city": "长沙", "province": "湖南", "keywords": ["长沙", "湖南"], "lat": 28.2282, "lng": 112.9388},
+    {"city": "成都", "province": "四川", "keywords": ["成都", "四川"], "lat": 30.5728, "lng": 104.0668},
+    {"city": "重庆", "province": "重庆", "keywords": ["重庆"], "lat": 29.563, "lng": 106.5516},
+    {"city": "西安", "province": "陕西", "keywords": ["西安", "陕西"], "lat": 34.3416, "lng": 108.9398},
+    {"city": "厦门", "province": "福建", "keywords": ["厦门"], "lat": 24.4798, "lng": 118.0894},
+    {"city": "福州", "province": "福建", "keywords": ["福州", "福建"], "lat": 26.0745, "lng": 119.2965},
+    {"city": "香港", "province": "香港", "keywords": ["香港"], "lat": 22.3193, "lng": 114.1694},
+    {"city": "海外", "province": "海外", "keywords": ["海外", "国外", "跨境", "美国", "欧洲", "日本", "东南亚"], "lat": 18.2, "lng": 121.0},
+]
+
+
+def dashboard_period_definitions(generated_at: datetime) -> dict[str, dict[str, object]]:
+    generated_local = report_local_time(generated_at)
+    month_start = generated_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start = generated_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "month": {
+            "label": "月度",
+            "start_at": month_start.astimezone(timezone.utc),
+            "end_at": generated_at,
+            "bucket_type": "day",
+            "bucket_count": generated_local.day,
+        },
+        "year": {
+            "label": "年度",
+            "start_at": year_start.astimezone(timezone.utc),
+            "end_at": generated_at,
+            "bucket_type": "month",
+            "bucket_count": 12,
+        },
+    }
+
+
+def dashboard_bucket_label(start_local: datetime, bucket_type: str, index: int) -> str:
+    if bucket_type == "hour":
+        return f"{index:02d}时"
+    if bucket_type == "day":
+        return f"{index + 1}日"
+    month = start_local.month + index
+    return f"{month}月"
+
+
+def dashboard_bucket_index(value: datetime, start_local: datetime, bucket_type: str) -> int:
+    local_value = report_local_time(value)
+    if bucket_type == "hour":
+        return int((local_value - start_local).total_seconds() // 3600)
+    if bucket_type == "day":
+        return (local_value.date() - start_local.date()).days
+    return (local_value.year - start_local.year) * 12 + local_value.month - start_local.month
+
+
+def dashboard_product_stats(tasks: list[ProductionTask]) -> list[dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for task in tasks:
+        product = (task.requirement.product_summary or "未识别产品").strip() or "未识别产品"
+        row = stats.setdefault(product, {"product": product, "total": 0, "confirmed_total": 0})
+        row["total"] = int(row["total"]) + 1
+        if is_confirmed_task(task):
+            row["confirmed_total"] = int(row["confirmed_total"]) + 1
+    return sorted(stats.values(), key=lambda row: (-int(row["total"]), -int(row["confirmed_total"]), str(row["product"])))[:10]
+
+
+def dashboard_match_location(session: Session, task: ProductionTask) -> dict[str, object] | None:
+    requirement = task.requirement
+    source_mail = session.get(MailMessage, requirement.source_mail_id) if requirement.source_mail_id else None
+    source_text = " ".join(
+        [
+            requirement.customer_name or "",
+            requirement.product_summary or "",
+            requirement.expected_delivery_date or "",
+            source_mail.subject if source_mail else "",
+            source_mail.body_text if source_mail else "",
+        ]
+    )
+    for location in DASHBOARD_LOCATION_CATALOG:
+        if any(keyword in source_text for keyword in location["keywords"]):
+            return location
+    return None
+
+
+def dashboard_location_stats(session: Session, tasks: list[ProductionTask]) -> list[dict[str, object]]:
+    stats: dict[str, dict[str, object]] = {}
+    for task in tasks:
+        location = dashboard_match_location(session, task)
+        if location is None:
+            continue
+        city = str(location["city"])
+        product = (task.requirement.product_summary or "未识别产品").strip() or "未识别产品"
+        row = stats.setdefault(
+            city,
+            {
+                "city": city,
+                "province": location["province"],
+                "lat": location["lat"],
+                "lng": location["lng"],
+                "demand_total": 0,
+                "confirmed_total": 0,
+                "products": {},
+            },
+        )
+        row["demand_total"] = int(row["demand_total"]) + 1
+        if is_confirmed_task(task):
+            row["confirmed_total"] = int(row["confirmed_total"]) + 1
+        products = row["products"]
+        if isinstance(products, dict):
+            products[product] = int(products.get(product, 0)) + 1
+    rows: list[dict[str, object]] = []
+    for row in stats.values():
+        product_counts = row.pop("products")
+        top_products = []
+        if isinstance(product_counts, dict):
+            top_products = [
+                {"product": product, "total": count}
+                for product, count in sorted(product_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:3]
+            ]
+        row["top_products"] = top_products
+        rows.append(row)
+    return sorted(rows, key=lambda row: (-int(row["demand_total"]), str(row["city"])))[:12]
+
+
+def dashboard_period_stats(session: Session, generated_at: datetime) -> dict[str, dict[str, object]]:
+    periods: dict[str, dict[str, object]] = {}
+    for key, period in dashboard_period_definitions(generated_at).items():
+        start_at = period["start_at"]
+        bucket_type = str(period["bucket_type"])
+        bucket_count = int(period["bucket_count"])
+        tasks = (
+            session.query(ProductionTask)
+            .filter(ProductionTask.created_at >= start_at, ProductionTask.created_at <= generated_at)
+            .order_by(ProductionTask.created_at.asc())
+            .all()
+        )
+        start_local = report_local_time(start_at)
+        trend = [
+            {
+                "label": dashboard_bucket_label(start_local, bucket_type, index),
+                "total": 0,
+                "confirmed_total": 0,
+                "questioned_total": 0,
+                "closed_total": 0,
+            }
+            for index in range(bucket_count)
+        ]
+        status_counts: dict[str, int] = {}
+        for task in tasks:
+            status_counts[task.status] = status_counts.get(task.status, 0) + 1
+            bucket_index = dashboard_bucket_index(task.created_at, start_local, bucket_type)
+            if 0 <= bucket_index < len(trend):
+                trend[bucket_index]["total"] = int(trend[bucket_index]["total"]) + 1
+                if is_confirmed_task(task):
+                    trend[bucket_index]["confirmed_total"] = int(trend[bucket_index]["confirmed_total"]) + 1
+                if task.status == "ProductionQuestioned":
+                    trend[bucket_index]["questioned_total"] = int(trend[bucket_index]["questioned_total"]) + 1
+                if task.status == "Closed":
+                    trend[bucket_index]["closed_total"] = int(trend[bucket_index]["closed_total"]) + 1
+
+        confirmed_total = sum(1 for task in tasks if is_confirmed_task(task))
+        periods[key] = {
+            "label": period["label"],
+            "start_at": start_at.isoformat(),
+            "end_at": generated_at.isoformat(),
+            "range_label": format_report_period(start_at, generated_at),
+            "task_stats": {
+                "demand_total": len(tasks),
+                "confirmed_total": confirmed_total,
+                "unconfirmed_total": len(tasks) - confirmed_total,
+                "questioned_total": status_counts.get("ProductionQuestioned", 0),
+                "closed_total": status_counts.get("Closed", 0),
+            },
+            "trend": trend,
+            "status_distribution": [
+                {"status": status, "label": TASK_STATUS_LABELS.get(status, status), "count": count}
+                for status, count in sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "sales_top10": sales_top10_stats(tasks),
+            "product_top10": dashboard_product_stats(tasks),
+            "location_points": dashboard_location_stats(session, tasks),
+        }
+    return periods
+
+
 def dashboard(session: Session) -> dict:
+    generated_at = now_utc()
     statuses = dict(
         session.query(ProductionTask.status, func.count(ProductionTask.id))
         .group_by(ProductionTask.status)
         .all()
     )
     return {
+        "generated_at": generated_at.isoformat(),
         "tasks_total": session.query(ProductionTask).count(),
         "drafted": statuses.get("TaskDrafted", 0) + statuses.get("ReissueDrafted", 0),
         "issued": statuses.get("TaskIssued", 0) + statuses.get("Reissued", 0),
@@ -3144,6 +3353,14 @@ def dashboard(session: Session) -> dict:
         "outbound_pending": session.query(OutboundMailJob).filter(OutboundMailJob.status == "Pending").count(),
         "outbound_failed": session.query(OutboundMailJob).filter(OutboundMailJob.status == "Failed").count(),
         "change_review": statuses.get("ReissueDrafted", 0) + statuses.get("CancelReview", 0),
+        "analytics": {
+            "default_period": "year",
+            "map": {
+                "provider": "baidu",
+                "ak": get_config(session, "baidu_map_ak", settings.baidu_map_ak) or settings.baidu_map_ak,
+            },
+            "periods": dashboard_period_stats(session, generated_at),
+        },
     }
 
 

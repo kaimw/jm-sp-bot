@@ -8,4 +8,5 @@ data/*.sqlite
 data/*.sqlite3
 data/attachments/
 data/backups/
+data/test-reports/
 *.egg-info/
