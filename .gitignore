@@ -2,6 +2,7 @@
 __pycache__/
 .pytest_cache/
 .venv/
+node_modules/
 .env
 data/*.db
 data/*.sqlite
@@ -9,4 +10,5 @@ data/*.sqlite3
 data/attachments/
 data/backups/
 data/test-reports/
+test-results/
 *.egg-info/

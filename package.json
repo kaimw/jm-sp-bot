@@ -1,0 +1,15 @@
+{
+  "name": "jm-sp-bot-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:reuse": "E2E_SKIP_WEBSERVER=1 playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "playwright:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}

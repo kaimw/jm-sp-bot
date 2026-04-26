@@ -77,3 +77,18 @@ docker compose up --build
 ```bash
 python3 -m pytest
 ```
+
+本地浏览器端回归使用 Playwright：
+
+```bash
+npm install
+npm run playwright:install
+npm run test:e2e
+```
+
+默认会复用 `http://127.0.0.1:8000` 上已经运行的服务；未运行时会自动启动 `uvicorn`。可通过 `E2E_BASE_URL`、`E2E_ADMIN_USERNAME`、`E2E_ADMIN_PASSWORD` 覆盖测试目标和登录账号。
+如果当前环境不允许 Playwright 子进程绑定端口，先手动启动后端，再运行：
+
+```bash
+npm run test:e2e:reuse
+```
