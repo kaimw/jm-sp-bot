@@ -9,6 +9,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
+from backend.app.database import mask_database_url
 from backend.app.models import AttachmentAsset, BackupJob, CleanupJob, MailMessage, ProcessingJob, now_utc
 from backend.app.services.jsonutil import dumps
 from backend.app.services.workflow import add_audit, get_config, weekly_report
@@ -111,7 +112,7 @@ def create_backup(session: Session, backup_type: str = "Manual") -> BackupJob:
     manifest = {
         "backup_type": backup_type,
         "created_at": now_utc().isoformat(),
-        "database_url": settings.database_url,
+        "database_url": mask_database_url(settings.database_url),
         "attachment_storage_dir": settings.attachment_storage_dir,
     }
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:

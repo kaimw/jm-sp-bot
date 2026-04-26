@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from sqlalchemy.engine import make_url
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -12,6 +13,36 @@ from backend.app.config import settings
 
 class Base(DeclarativeBase):
     pass
+
+
+def normalize_database_url(database_url: str) -> str:
+    if database_url.startswith("postgres://"):
+        return database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    if database_url.startswith("postgresql://"):
+        return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return database_url
+
+
+def mask_database_url(database_url: str) -> str:
+    try:
+        return make_url(normalize_database_url(database_url)).render_as_string(hide_password=True)
+    except Exception:
+        return "<invalid database url>"
+
+
+def database_runtime_info() -> dict:
+    url = make_url(database_url)
+    return {
+        "dialect": url.get_backend_name(),
+        "driver": url.get_driver_name(),
+        "url": url.render_as_string(hide_password=True),
+    }
+
+
+def engine_kwargs(database_url: str) -> dict:
+    if database_url.startswith("sqlite"):
+        return {"connect_args": {"check_same_thread": False}}
+    return {"pool_pre_ping": True}
 
 
 def _sqlite_path(database_url: str) -> Path | None:
@@ -23,14 +54,13 @@ def _sqlite_path(database_url: str) -> Path | None:
     return Path(raw)
 
 
-db_path = _sqlite_path(settings.database_url)
+database_url = normalize_database_url(settings.database_url)
+
+db_path = _sqlite_path(database_url)
 if db_path is not None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
-)
+engine = create_engine(database_url, **engine_kwargs(database_url))
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

@@ -15,11 +15,11 @@ from io import StringIO
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.database import SessionLocal, init_db
+from backend.app.database import SessionLocal, database_runtime_info, init_db
 from backend.app.models import (
     AuditEvent,
     AttachmentAsset,
@@ -218,6 +218,7 @@ def health(session: Session = Depends(get_session)) -> dict:
         "ready": readiness["ready"],
         "missing": readiness["missing"],
         "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "database": database_health(session),
         "queues": queues,
     }
 
@@ -227,9 +228,19 @@ def system_health(session: Session = Depends(get_session)) -> dict:
     return {
         "readiness": runtime_startup_readiness(session),
         "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "database": database_health(session),
         "worker": get_mail_worker_status(configured_worker_interval_seconds(session)),
         "queues": system_queue_health(session),
     }
+
+
+def database_health(session: Session) -> dict:
+    info = database_runtime_info()
+    try:
+        session.execute(text("SELECT 1"))
+    except Exception as exc:
+        return {**info, "ok": False, "error_type": exc.__class__.__name__}
+    return {**info, "ok": True}
 
 
 @app.post("/api/auth/login")

@@ -296,6 +296,30 @@ def test_auth_token_roundtrip_and_tamper_detection():
     assert parse_session_token(token + "x") is None
 
 
+def test_database_url_normalization_masking_and_health():
+    from backend.app.database import engine_kwargs, mask_database_url, normalize_database_url
+    from backend.app.main import database_health
+
+    assert normalize_database_url("postgres://user:secret@db.example.com:5432/app") == (
+        "postgresql+psycopg://user:secret@db.example.com:5432/app"
+    )
+    assert normalize_database_url("postgresql://user:secret@db.example.com/app") == (
+        "postgresql+psycopg://user:secret@db.example.com/app"
+    )
+    assert normalize_database_url("sqlite:///data/app.db") == "sqlite:///data/app.db"
+    assert mask_database_url("postgresql://user:secret@db.example.com/app") == (
+        "postgresql+psycopg://user:***@db.example.com/app"
+    )
+    assert engine_kwargs("sqlite:///data/app.db") == {"connect_args": {"check_same_thread": False}}
+    assert engine_kwargs("postgresql+psycopg://user:secret@db.example.com/app") == {"pool_pre_ping": True}
+
+    session = make_session()
+    health = database_health(session)
+    assert health["ok"] is True
+    assert health["dialect"]
+    assert "url" in health
+
+
 def test_order_to_task_approval_flow():
     session = make_session()
     configure_department(session)

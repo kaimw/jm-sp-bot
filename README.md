@@ -21,6 +21,14 @@ http://127.0.0.1:8000
 默认登录账号为 `admin` / `admin`，可通过 `ADMIN_USERNAME`、`ADMIN_PASSWORD`、`AUTH_SECRET` 和 `AUTH_SESSION_SECONDS` 覆盖。
 管理台“模拟订单”默认使用测试销售信箱 `bot.sales@jimuyida.com`。
 
+默认数据库为 `sqlite:///data/app.db`。生产试运行可通过 `DATABASE_URL` 切换到 PostgreSQL，例如：
+
+```bash
+DATABASE_URL=postgresql+psycopg://jm_sp_bot:change-me@127.0.0.1:5432/jm_sp_bot
+```
+
+兼容 `postgres://` 和 `postgresql://` 写法，运行时会统一转为 SQLAlchemy 2 推荐的 `postgresql+psycopg://`。
+
 Docker 启动：
 
 ```bash
