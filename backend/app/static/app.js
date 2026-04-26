@@ -714,7 +714,7 @@ async function refreshOutbound() {
     rows
       .map(
         (row) => `
-        <div class="row">
+        <div class="row clickable-row" data-outbound-id="${h(row.id)}" role="button" tabindex="0" title="查看外发邮件详情">
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.mail_type)}</small></div>
           <div><small>主送</small><br />${h(row.to.join(", ") || "无")}</div>
           <div><small>抄送</small><br />${h(row.cc.join(", ") || "无")}</div>
@@ -1463,6 +1463,24 @@ async function openMailDetail(mailId) {
     <div><small>附件</small><strong>${h((detail.attachments || []).map((item) => item.file_name).join(", ") || "无")}</strong></div>
   `;
   $("#mail-detail-body").textContent = detail.body_text || "无正文内容";
+  $("#mail-detail-modal").hidden = false;
+}
+
+async function openOutboundDetail(outboundId) {
+  const detail = await api(`/api/outbound-mails/${outboundId}`);
+  $("#mail-detail-title").textContent = detail.subject || "外发邮件详情";
+  $("#mail-detail-meta").textContent = `外发队列 · ${detail.created_at || ""}`;
+  $("#mail-detail-fields").innerHTML = `
+    <div><small>外发ID</small><strong>${h(detail.id || "未记录")}</strong></div>
+    <div><small>邮件类型</small><strong>${h(detail.mail_type || "未记录")}</strong></div>
+    <div><small>主送</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
+    <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
+    <div><small>状态</small><strong>${h(detail.status || "未记录")}</strong></div>
+    <div><small>关联任务</small><strong>${h(detail.related_task_id || "未关联")}</strong></div>
+    <div><small>关联版本</small><strong>${h(detail.related_version_id || "未关联")}</strong></div>
+    <div><small>幂等键</small><strong>${h(detail.idempotency_key || "未记录")}</strong></div>
+  `;
+  $("#mail-detail-body").textContent = detail.body || "无正文内容";
   $("#mail-detail-modal").hidden = false;
 }
 
@@ -2319,12 +2337,27 @@ $("#dashboard-insights")?.addEventListener("click", (event) => {
 
 $("#outbound-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");
-  if (!target || target.dataset.action !== "retry-outbound") return;
-  await guardedAction(["外发", "重新入队"], async () => {
-    await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
-    toast("已重新加入外发队列");
-    await refreshAll();
-  });
+  if (target?.dataset.action === "retry-outbound") {
+    await guardedAction(["外发", "重新入队"], async () => {
+      await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
+      toast("已重新加入外发队列");
+      await refreshAll();
+    });
+    return;
+  }
+  if (event.target.closest("button,a")) return;
+  const row = event.target.closest("[data-outbound-id]");
+  if (!row) return;
+  await guardedAction(["外发", "详情"], async () => openOutboundDetail(row.dataset.outboundId));
+});
+
+$("#outbound-list").addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  if (event.target.closest("button,a")) return;
+  const row = event.target.closest("[data-outbound-id]");
+  if (!row) return;
+  event.preventDefault();
+  await guardedAction(["外发", "详情"], async () => openOutboundDetail(row.dataset.outboundId));
 });
 
 $("#cancel-pending-outbound")?.addEventListener("click", async () => {

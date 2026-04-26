@@ -1260,6 +1260,32 @@ def test_smtp_send_skips_when_bot_disabled():
     assert pending.status == "Pending"
 
 
+def test_outbound_mail_detail_includes_full_message_body():
+    from backend.app.main import outbound_mail_detail
+
+    session = make_session()
+    job = OutboundMailJob(
+        mail_type="TaskIssue",
+        to_json=dumps(["bot.production@jimuyida.com"]),
+        cc_json=dumps(["dingyong@jimuyida.com"]),
+        subject="测试外发详情",
+        body="这里是完整邮件正文\n包含第二行内容",
+        related_task_id="PT-DETAIL",
+        idempotency_key="outbound-detail",
+        status="Sent",
+    )
+    session.add(job)
+    session.commit()
+
+    detail = outbound_mail_detail(job.id, session)
+
+    assert detail["id"] == job.id
+    assert detail["body"] == "这里是完整邮件正文\n包含第二行内容"
+    assert detail["to"] == ["bot.production@jimuyida.com"]
+    assert detail["cc"] == ["dingyong@jimuyida.com"]
+    assert detail["related_task_id"] == "PT-DETAIL"
+
+
 def test_outbound_list_explains_pending_when_bot_disabled():
     from backend.app.main import outbound_mails
 

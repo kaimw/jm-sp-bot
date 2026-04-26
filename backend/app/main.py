@@ -1799,6 +1799,14 @@ def outbound_mail_diagnostics_csv(
     )
 
 
+@app.get("/api/outbound-mails/{job_id}")
+def outbound_mail_detail(job_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(OutboundMailJob, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="outbound mail not found")
+    return serialize_outbound_mail(row, session, include_body=True)
+
+
 @app.post("/api/mailbox/sync")
 def mailbox_sync(limit: int = 20, session: Session = Depends(get_session)) -> dict:
     try:
@@ -2380,8 +2388,8 @@ def serialize_department(row: ProductionDepartment) -> dict:
     }
 
 
-def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None) -> dict:
-    return {
+def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None, *, include_body: bool = False) -> dict:
+    payload = {
         "id": row.id,
         "mail_type": row.mail_type,
         "to": as_list(row.to_json),
@@ -2391,6 +2399,16 @@ def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None
         "created_at": row.created_at.isoformat(),
         "pending_diagnosis": outbound_pending_diagnosis(session, row) if session is not None else None,
     }
+    if include_body:
+        payload.update(
+            {
+                "body": row.body,
+                "related_task_id": row.related_task_id,
+                "related_version_id": row.related_version_id,
+                "idempotency_key": row.idempotency_key,
+            }
+        )
+    return payload
 
 
 def serialize_processing_job(row: ProcessingJob) -> dict:

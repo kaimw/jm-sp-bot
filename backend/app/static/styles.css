@@ -1067,6 +1067,11 @@ label {
   grid-template-columns: minmax(260px, 1.7fr) repeat(4, minmax(118px, 0.75fr)) 40px 40px;
 }
 
+.outbound-filter-bar {
+  grid-template-columns: minmax(280px, 1.6fr) minmax(120px, 0.7fr) minmax(120px, 0.7fr) minmax(150px, 0.85fr) repeat(5, 40px);
+  overflow-x: auto;
+}
+
 .clearable-filter-bar {
   grid-template-columns: minmax(260px, 1.7fr) repeat(3, minmax(118px, 0.75fr)) auto;
 }
@@ -2051,6 +2056,10 @@ textarea:focus {
     grid-template-columns: minmax(240px, 1.5fr) repeat(3, minmax(110px, 1fr)) 40px 40px;
   }
 
+  .outbound-filter-bar {
+    grid-template-columns: minmax(260px, 1.5fr) minmax(116px, 0.75fr) minmax(116px, 0.75fr) minmax(140px, 0.85fr) repeat(5, 40px);
+  }
+
   .row {
     grid-template-columns: minmax(220px, 1.3fr) minmax(150px, 0.9fr) minmax(120px, 0.7fr);
   }
@@ -2137,9 +2146,17 @@ textarea:focus {
     grid-template-columns: 1fr 1fr;
   }
 
+  .outbound-filter-bar {
+    grid-template-columns: minmax(240px, 1.4fr) minmax(112px, 0.7fr) minmax(112px, 0.7fr) minmax(132px, 0.8fr) repeat(5, 40px);
+  }
+
   .task-filter-bar .filter-search,
   .table-filter-bar .filter-search {
     grid-column: 1 / -1;
+  }
+
+  .outbound-filter-bar .filter-search {
+    grid-column: auto;
   }
 
   .pagination {
