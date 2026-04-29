@@ -29,12 +29,56 @@ DATABASE_URL=postgresql+psycopg://jm_sp_bot:change-me@127.0.0.1:5432/jm_sp_bot
 
 兼容 `postgres://` 和 `postgresql://` 写法，运行时会统一转为 SQLAlchemy 2 推荐的 `postgresql+psycopg://`。
 
+SQLite 内测库迁移到目标数据库可先 dry-run：
+
+```bash
+python scripts/migrate_sqlite_to_database.py \
+  --source sqlite:///data/app.db \
+  --target postgresql+psycopg://jm_sp_bot:change-me@127.0.0.1:5432/jm_sp_bot
+```
+
+确认表行数后再执行：
+
+```bash
+python scripts/migrate_sqlite_to_database.py \
+  --source sqlite:///data/app.db \
+  --target postgresql+psycopg://jm_sp_bot:change-me@127.0.0.1:5432/jm_sp_bot \
+  --execute
+```
+
 Docker 启动：
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
+
+生产 Compose 试运行：
+
+```bash
+cp .env.production.example .env.production
+# 修改 .env.production 中的数据库密码、管理员密码、AUTH_SECRET、邮箱和模型密钥
+docker compose -f docker-compose.prod.yml --env-file .env.production up --build -d
+```
+
+生产 Compose 会启动应用和 PostgreSQL，应用健康检查访问 `/health`。迁移内测 SQLite 数据到生产库时，先用上面的迁移脚本 dry-run，再加 `--execute` 写入；目标库已有数据时需要显式传 `--truncate-target`。
+
+## 自维护 MVP
+
+管理台“自维护”页面支持收集系统上下文、生成诊断、生成白名单配置修复草案、生成代码修复草案、生成代码交接包、运行白名单验证、查看维护时间线、查看维护会话详情、查看维护动作详情、回填补丁执行记录、记录补丁人工复核结论，以及归档已处理维护会话。会话列表默认隐藏归档记录，可通过“显示已归档会话”切换查看历史，并支持按状态、风险等级筛选和分页浏览；维护动作列表支持按动作类型和状态筛选，并支持分页浏览。配置修复必须输入管理员密码确认后才会写入运行期配置；代码修复草案不会在业务进程中直接改代码。
+
+外部维护 runner 可读取最新代码修复草案、生成交接包、导出 Markdown 报告，并运行白名单验证命令：
+
+```bash
+python scripts/maintenance_runner.py list
+python scripts/maintenance_runner.py handoff --action-id <maintenance_action_id>
+python scripts/maintenance_runner.py export --action-id <maintenance_action_id>
+python scripts/maintenance_runner.py validate --action-id <maintenance_action_id> --command "node --check backend/app/static/app.js"
+python scripts/maintenance_runner.py complete --action-id <maintenance_action_id> --summary "补丁已完成，等待人工复核" --changed-file backend/app/main.py --test "python3 -m pytest"
+python scripts/maintenance_runner.py review --action-id <maintenance_action_id> --decision ReviewAccepted --note "人工复核通过"
+```
+
+`handoff` 会在 `data/maintenance` 下生成 Markdown 和 JSON 交接包，包含修复草案、上下文、安全边界、推荐执行流程和 runner 命令；管理台也可以对代码修复动作一键生成交接包，并直接展开查看交接包内容。`validate` 会执行固定白名单命令，管理台也提供同等的“运行验证”入口。`complete` 用于外部维护者回填补丁摘要、改动文件、测试结果和残余风险，管理台也提供同等的“回填执行”入口；`review` 用于记录人工接受、驳回或继续修改结论，形成代码补丁闭环。runner 仅允许执行固定验证命令：`python3 -m compileall backend scripts`、`python3 -m pytest` 和 `node --check backend/app/static/app.js`。执行结果会写回维护动作并记录审计事件。
 
 ## 当前边界
 

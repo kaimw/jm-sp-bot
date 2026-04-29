@@ -182,6 +182,35 @@ class ModelCallLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
+class MaintenanceSession(Base):
+    __tablename__ = "maintenance_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_message: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Completed", nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(32), default="Low", nullable=False)
+    collected_context_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    diagnosis_md: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    proposed_actions_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), default="system", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class MaintenanceAction(Base):
+    __tablename__ = "maintenance_actions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("maintenance_sessions.id"), nullable=False)
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Proposed", nullable=False)
+    input_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class OrderRequirement(Base):
     __tablename__ = "order_requirements"
 

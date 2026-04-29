@@ -4,11 +4,13 @@ __pycache__/
 .venv/
 node_modules/
 .env
+.env.production
 data/*.db
 data/*.sqlite
 data/*.sqlite3
 data/attachments/
 data/backups/
+data/maintenance/
 data/test-reports/
 test-results/
 *.egg-info/

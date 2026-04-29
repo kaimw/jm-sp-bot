@@ -31,7 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 FLOW_HEADER_PATTERN = re.compile(r"流程([一二三四五六七八九十\d]+)[:：]\s*(.+)")
-LINE_SPLIT_PATTERN = re.compile(r"[、,，;/；\n]+")
+LINE_SPLIT_PATTERN = re.compile(r"[、,，;/；\s]+")
+EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+EMAIL_TOKEN_PATTERN = re.compile(r"[^@\s,;<>，；、]+@[^@\s,;<>，；、]+\.[^@\s,;<>，；、]+")
 CORE_FIELD_LABELS = {
     "customer_name": "客户名称",
     "product_summary": "产品/规格",
@@ -168,8 +170,138 @@ def _normalize_list(value: Any) -> list[str]:
     return result
 
 
+def _normalize_email_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in raw:
+        for match in EMAIL_TOKEN_PATTERN.findall(str(item or "")):
+            email = match.strip().strip("。.,，;；:：)]}）】>")
+            if _is_email_address(email) and email not in result:
+                result.append(email)
+    return result
+
+
 def _normalize_unique_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def _is_email_address(value: Any) -> bool:
+    return bool(EMAIL_ADDRESS_PATTERN.fullmatch(str(value or "").strip()))
+
+
+def _department_code_from_contact(value: str) -> str:
+    clean = re.sub(r"[^0-9A-Za-z_]+", "_", str(value or "").strip().lower()).strip("_")
+    digest = hashlib.sha1(str(value or "").strip().encode("utf-8")).hexdigest()[:8]
+    return f"auto_{clean[:32] or 'department'}_{digest}"
+
+
+def _production_department_lookup(session: Session) -> dict[str, ProductionDepartment]:
+    lookup: dict[str, ProductionDepartment] = {}
+    departments = session.query(ProductionDepartment).filter_by(status="Active").all()
+    for department in departments:
+        keys = [department.department_code, department.department_name]
+        keys.extend(as_list(department.mail_to_json))
+        for key in keys:
+            normalized = _normalize_unique_text(key)
+            if normalized and normalized not in lookup:
+                lookup[normalized] = department
+    return lookup
+
+
+def _production_department_main_emails(session: Session) -> set[str]:
+    emails: set[str] = set()
+    for department in session.query(ProductionDepartment).filter_by(status="Active").all():
+        for email in as_list(department.mail_to_json):
+            email_text = str(email or "").strip()
+            if _is_email_address(email_text):
+                emails.add(email_text.lower())
+    return emails
+
+
+def _ensure_production_department_for_contact(
+    session: Session,
+    contact: str,
+    lookup: dict[str, ProductionDepartment],
+    *,
+    create_missing: bool = True,
+) -> tuple[ProductionDepartment | None, list[str]]:
+    contact_text = str(contact or "").strip()
+    if not contact_text:
+        return None, []
+    existing = lookup.get(_normalize_unique_text(contact_text))
+    if existing is not None:
+        return existing, [email for email in as_list(existing.mail_to_json) if _is_email_address(email)]
+    if not create_missing:
+        return None, []
+
+    department = ProductionDepartment(
+        department_code=_department_code_from_contact(contact_text),
+        department_name=contact_text,
+        mail_to_json=dumps([contact_text] if _is_email_address(contact_text) else []),
+        mail_cc_json=dumps([]),
+        status="Active",
+    )
+    session.add(department)
+    session.flush()
+    lookup[_normalize_unique_text(department.department_code)] = department
+    lookup[_normalize_unique_text(department.department_name)] = department
+    for email in as_list(department.mail_to_json):
+        lookup[_normalize_unique_text(email)] = department
+    return department, [email for email in as_list(department.mail_to_json) if _is_email_address(email)]
+
+
+def _sync_rule_routing_with_production_departments(
+    session: Session,
+    rule: dict[str, Any],
+    *,
+    create_missing: bool = True,
+) -> dict[str, Any]:
+    routing = rule.get("routing") if isinstance(rule.get("routing"), dict) else {}
+    lookup = _production_department_lookup(session)
+    bound_to: list[str] = []
+    for contact in _normalize_list(routing.get("to_names") or routing.get("to")):
+        _department, emails = _ensure_production_department_for_contact(session, contact, lookup, create_missing=create_missing)
+        candidates = emails if emails else [contact]
+        for candidate in candidates:
+            if candidate and candidate not in bound_to:
+                bound_to.append(candidate)
+
+    bound_cc: list[str] = []
+    for contact in _normalize_list(routing.get("cc_names") or routing.get("cc")):
+        if _is_email_address(contact):
+            candidate = contact
+        else:
+            department = lookup.get(_normalize_unique_text(contact))
+            department_emails = as_list(department.mail_cc_json) if department is not None else []
+            candidate = next((email for email in department_emails if _is_email_address(email)), contact)
+        if candidate and candidate not in bound_cc:
+            bound_cc.append(candidate)
+
+    return {
+        **rule,
+        "routing": {
+            **routing,
+            "to_names": bound_to,
+            "cc_names": bound_cc,
+        },
+    }
+
+
+def _validate_production_main_recipient_selection(session: Session, rule: dict[str, Any]) -> list[str]:
+    routing = rule.get("routing") if isinstance(rule.get("routing"), dict) else {}
+    to_names = _normalize_list(routing.get("to_names") or routing.get("to"))
+    workflow_name = str(rule.get("workflow_name") or rule.get("workflow_code") or "流程")
+    if not to_names:
+        return [f"{workflow_name} 主送人必填。"]
+    allowed = _production_department_main_emails(session)
+    if not allowed:
+        return ["请先在【生产邮箱】配置至少一个启用生产部门的主送邮箱。"]
+    invalid = [item for item in to_names if not _is_email_address(item) or item.lower() not in allowed]
+    if invalid:
+        return [f"{workflow_name} 主送人只能从生产部门邮箱列表选择：{', '.join(invalid)}"]
+    return []
 
 
 def _normalize_review_rules(value: Any) -> list[dict[str, Any]]:
@@ -597,7 +729,7 @@ def parse_workflows_by_llm(session: Session, source_text: str) -> list[dict[str,
         return []
 
 
-def _normalize_rule(rule: dict[str, Any], fallback_index: int) -> dict[str, Any]:
+def _normalize_rule(rule: dict[str, Any], fallback_index: int, *, email_only_routing: bool = False) -> dict[str, Any]:
     name = str(rule.get("workflow_name") or rule.get("name") or "").strip()
     if not name:
         name = f"流程_{fallback_index}"
@@ -608,8 +740,12 @@ def _normalize_rule(rule: dict[str, Any], fallback_index: int) -> dict[str, Any]
     routing = rule.get("routing")
     if not isinstance(routing, dict):
         routing = {}
-    to_names = _normalize_list(routing.get("to_names") or routing.get("to"))
-    cc_names = _normalize_list(routing.get("cc_names") or routing.get("cc"))
+    if email_only_routing:
+        to_names = _normalize_email_list(routing.get("to_names") or routing.get("to"))
+        cc_names = _normalize_email_list(routing.get("cc_names") or routing.get("cc"))
+    else:
+        to_names = _normalize_list(routing.get("to_names") or routing.get("to"))
+        cc_names = _normalize_list(routing.get("cc_names") or routing.get("cc"))
     subject_template = str(rule.get("subject_template") or "").strip() or DEFAULT_TEMPLATE_SUBJECT
     body_template = str(rule.get("body_template") or "").strip() or DEFAULT_TEMPLATE_BODY
     subject_template, body_template = _ensure_task_template_variables(subject_template, body_template)
@@ -814,7 +950,6 @@ def _persist_workflow_rules(
             continue
         batch_codes.add(workflow_code)
         batch_names.add(workflow_name_key)
-        validation_errors.extend(_validate_rule(rule))
         definition = session.query(WorkflowDefinition).filter_by(workflow_code=rule["workflow_code"]).one_or_none()
         if definition is None:
             if workflow_name_key and workflow_name_key in existing_names:
@@ -844,17 +979,29 @@ def _persist_workflow_rules(
         if current_rules == rule:
             diffs.append({"workflow_code": rule["workflow_code"], "changed": False, "changes": []})
             if latest is not None and auto_publish:
-                session.query(WorkflowVersion).filter(
-                    WorkflowVersion.workflow_id == definition.id,
-                    WorkflowVersion.id != latest.id,
-                    WorkflowVersion.status == "Active",
-                ).update({"status": "Archived", "updated_at": now_utc()})
-                latest.status = "Active"
-                latest.approved_by = actor
-                latest.approved_at = now_utc()
-                latest.updated_at = now_utc()
+                rule_errors = _validate_rule(rule)
+                rule_errors.extend(_validate_production_main_recipient_selection(session, rule))
+                if rule_errors:
+                    validation_errors.extend(rule_errors)
+                else:
+                    session.query(WorkflowVersion).filter(
+                        WorkflowVersion.workflow_id == definition.id,
+                        WorkflowVersion.id != latest.id,
+                        WorkflowVersion.status == "Active",
+                    ).update({"status": "Archived", "updated_at": now_utc()})
+                    latest.status = "Active"
+                    latest.approved_by = actor
+                    latest.approved_at = now_utc()
+                    latest.updated_at = now_utc()
             continue
 
+        rule = _sync_rule_routing_with_production_departments(session, rule)
+        rule_errors = _validate_rule(rule)
+        if auto_publish:
+            rule_errors.extend(_validate_production_main_recipient_selection(session, rule))
+        if auto_publish:
+            validation_errors.extend(rule_errors)
+        can_publish_rule = auto_publish and not rule_errors
         version_no = (latest.version_no + 1) if latest is not None else 1
         version = WorkflowVersion(
             workflow_id=definition.id,
@@ -862,15 +1009,15 @@ def _persist_workflow_rules(
             source_asset_ref=source_asset_ref,
             source_text=source_text,
             compiled_rules_json=dumps(rule),
-            status="Active" if auto_publish else "Draft",
+            status="Active" if can_publish_rule else "Draft",
             created_by=actor,
-            approved_by=actor if auto_publish else None,
-            approved_at=now_utc() if auto_publish else None,
+            approved_by=actor if can_publish_rule else None,
+            approved_at=now_utc() if can_publish_rule else None,
         )
         session.add(version)
         session.flush()
         created_versions.append(version)
-        if auto_publish:
+        if can_publish_rule:
             session.query(WorkflowVersion).filter(
                 WorkflowVersion.workflow_id == definition.id,
                 WorkflowVersion.id != version.id,
@@ -926,7 +1073,10 @@ def import_workflow_document(
     llm_used = bool(rule_candidates)
     if not rule_candidates:
         rule_candidates = parse_workflows_by_rules(source_text)
-    normalized = [_normalize_rule(item, index) for index, item in enumerate(rule_candidates, start=1)]
+    normalized = [
+        _normalize_rule(item, index, email_only_routing=True)
+        for index, item in enumerate(rule_candidates, start=1)
+    ]
     return _persist_workflow_rules(
         session,
         file_name=resolved_file_name,
@@ -1050,6 +1200,13 @@ def activate_workflow_version(session: Session, version_id: str, actor: str = "s
     version = session.get(WorkflowVersion, version_id)
     if version is None:
         raise ValueError("workflow version not found")
+    rules = loads(version.compiled_rules_json, {})
+    if not isinstance(rules, dict):
+        rules = {}
+    errors = _validate_rule(rules)
+    errors.extend(_validate_production_main_recipient_selection(session, rules))
+    if errors:
+        raise ValueError("；".join(errors))
     session.query(WorkflowVersion).filter(
         WorkflowVersion.workflow_id == version.workflow_id,
         WorkflowVersion.id != version.id,
@@ -1129,7 +1286,10 @@ def save_workflow_version_rules(
     normalized["workflow_code"] = definition.workflow_code
     if not str(normalized.get("workflow_name") or "").strip():
         normalized["workflow_name"] = definition.workflow_name
+    session.flush()
+    normalized = _sync_rule_routing_with_production_departments(session, normalized, create_missing=False)
     errors = _validate_rule(normalized)
+    errors.extend(_validate_production_main_recipient_selection(session, normalized))
     if errors:
         raise ValueError("；".join(errors))
 
@@ -1499,6 +1659,7 @@ def resolve_contact_emails(
     mapping = loads(_get_config(session, "workflow_contact_map_json", "{}"), {})
     if not isinstance(mapping, dict):
         mapping = {}
+    department_lookup = _production_department_lookup(session)
     emails: list[str] = []
     unresolved: list[str] = []
     for name in names:
@@ -1513,6 +1674,14 @@ def resolve_contact_emails(
             if salesperson_email not in emails:
                 emails.append(salesperson_email)
             continue
+        department = department_lookup.get(_normalize_unique_text(key))
+        if department is not None:
+            department_emails = [item for item in as_list(department.mail_to_json) if _is_email_address(item)]
+            if department_emails:
+                for item in department_emails:
+                    if item not in emails:
+                        emails.append(item)
+                continue
         mapped = mapping.get(key)
         if isinstance(mapped, str) and mapped.strip():
             if mapped not in emails:

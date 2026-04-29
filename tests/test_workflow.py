@@ -21,6 +21,9 @@ from backend.app.models import (
     ExceptionCase,
     ExtractionEvidence,
     MailMessage,
+    MailWorkflowMatch,
+    MaintenanceAction,
+    MaintenanceSession,
     ModelProviderConfig,
     OrderRequirement,
     OutboundMailJob,
@@ -42,6 +45,7 @@ from backend.app.services.jobs import run_pending_jobs
 from backend.app.services.jsonutil import dumps, loads, as_list
 from backend.app.services.mail_adapter import (
     parse_email_bytes,
+    save_and_parse_attachment,
     send_outbound_jobs_smtp,
     send_pending_auto_workflow_mails_smtp,
     send_pending_receipt_acks_smtp,
@@ -55,6 +59,19 @@ from backend.app.services.initial_review import initial_review_config, remember_
 from backend.app.services.model_provider import build_openai_chat_payload, call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, execute_cleanup, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
+from backend.app.services.self_maintenance import (
+    apply_maintenance_action,
+    archive_maintenance_session,
+    build_self_maintenance_context,
+    create_code_patch_plan,
+    create_maintenance_handoff_package,
+    create_maintenance_diagnosis,
+    maintenance_session_timeline,
+    read_maintenance_handoff_package,
+    report_maintenance_implementation,
+    review_maintenance_implementation,
+    run_maintenance_validation,
+)
 from backend.app.services.workflow import (
     apply_exception_requirement_patch,
     approve_task,
@@ -71,6 +88,7 @@ from backend.app.services.workflow import (
     weekly_report_recipients,
 )
 from backend.app.services.workflow_rules import (
+    activate_workflow_version,
     deactivate_workflow_version,
     delete_workflow_version,
     chat_generate_workflow_rule,
@@ -83,6 +101,8 @@ from backend.app.services.workflow_rules import (
     workflow_version_diff,
 )
 from backend.app.models import now_utc
+from backend.app.main import self_maintenance_action_detail
+from scripts.maintenance_runner import CommandResult, create_handoff_package, validate_code_plan_action
 
 
 @pytest.fixture(autouse=True)
@@ -168,7 +188,7 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert readiness["ready"] is False
     assert "Dify API Key" in readiness["missing"]
     assert "bot邮箱密码" in readiness["missing"]
-    assert "生产部门邮箱" in readiness["missing"]
+    assert "生产部门主送邮箱" in readiness["missing"]
 
     with pytest.raises(Exception) as exc:
         update_mail_config(MailRuntimeConfigUpdate(bot_enabled=True), session)
@@ -176,7 +196,7 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert exc.value.status_code == 400
     assert "Dify API Key" in exc.value.detail
     assert "bot邮箱密码" in exc.value.detail
-    assert "生产部门邮箱" in exc.value.detail
+    assert "生产部门主送邮箱" in exc.value.detail
     assert session.get(SystemConfig, "bot_enabled").value == "false"
 
     configure_department(session)
@@ -189,6 +209,74 @@ def test_system_enable_requires_model_bot_and_department_config():
 
     assert result["startup_readiness"]["ready"] is True
     assert session.get(SystemConfig, "bot_enabled").value == "True"
+
+
+def test_system_enable_rejects_invalid_department_main_email():
+    from backend.app.main import runtime_startup_readiness, update_mail_config
+    from backend.app.schemas import MailRuntimeConfigUpdate
+
+    session = make_session()
+    department = session.query(ProductionDepartment).filter_by(department_code="default").one()
+    department.mail_to_json = dumps(["销售直属领导"])
+    model = session.query(ModelProviderConfig).one()
+    set_config(session, "model_api_key", "runtime-secret", is_secret=True)
+    model.credential_ref = "config:model_api_key"
+    session.commit()
+
+    readiness = runtime_startup_readiness(session, {"bot_email_password": "mail-secret"})
+    assert readiness["ready"] is False
+    assert any("生产部门主送邮箱格式不合法" in item for item in readiness["missing"])
+
+    with pytest.raises(Exception) as exc:
+        update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
+
+    assert exc.value.status_code == 400
+    assert "生产部门主送邮箱格式不合法" in exc.value.detail
+    assert "销售直属领导" in exc.value.detail
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
+
+
+def test_department_upsert_rejects_invalid_main_email():
+    from backend.app.main import upsert_default_department
+    from backend.app.schemas import DepartmentUpsert
+
+    session = make_session()
+
+    with pytest.raises(Exception) as exc:
+        upsert_default_department(DepartmentUpsert(mail_to=["sales-direct-leader"], mail_cc=[]), session)
+
+    assert exc.value.status_code == 400
+    assert "主送邮箱格式不合法" in exc.value.detail
+
+
+def test_delete_department_hides_it_and_disables_system_when_last_recipient():
+    from backend.app.main import delete_department, list_departments, update_mail_config
+    from backend.app.schemas import MailRuntimeConfigUpdate
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    configure_department(session)
+    model = session.query(ModelProviderConfig).one()
+    set_config(session, "model_api_key", "runtime-secret", is_secret=True)
+    model.credential_ref = "config:model_api_key"
+    session.commit()
+    update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
+
+    department = session.query(ProductionDepartment).filter_by(department_code="default").one()
+    result = delete_department(department.id, Request(), session)
+
+    assert result["ok"] is True
+    assert result["bot_disabled"] is True
+    assert session.get(ProductionDepartment, department.id).status == "Deleted"
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
+    assert all(row["id"] != department.id for row in list_departments(page=1, page_size=10, session=session)["items"])
+    audit = session.query(AuditEvent).filter_by(event_type="ProductionDepartmentDeleted").one()
+    assert audit.actor == "admin"
 
 
 def test_dashboard_includes_period_analytics_for_workbench_charts():
@@ -593,13 +681,12 @@ def test_workflow_conversation_policy_overrides_global_max_rounds():
     session = make_session()
     configure_department(session)
     set_config(session, "conversation_max_rounds", "3")
-    set_config(session, "workflow_contact_map_json", dumps({"张燕": "production@jimuyida.com"}), is_secret=False)
     import_structured_workflow_rules(
         session,
         rules=[
             {
                 "workflow_name": "轮次限制流程",
-                "routing": {"to_names": ["张燕"], "cc_names": []},
+                "routing": {"to_names": ["production@jimuyida.com"], "cc_names": []},
                 "match": {"any_keywords": ["轮次限制流程", "轮次限制"], "order_type": "normal_sales"},
                 "subject_template": "[轮次限制][{{task_no}}]",
                 "body_template": "流程类型：轮次限制流程",
@@ -763,6 +850,90 @@ def test_email_store_and_processing_queue_creates_task():
     assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 1
 
 
+def test_parse_email_bytes_repairs_legacy_gbk_attachment_filename():
+    file_name = "采购订单-JM-CGDD-20260522（上海测试公司）04.28.docx"
+    raw = (
+        b"From: sales@jimuyida.com\r\n"
+        b"To: bot.market@jimuyida.com\r\n"
+        b"Subject: =?utf-8?b?55Sf5Lqn6K6i5Y2V?=\r\n"
+        b"Message-ID: <legacy-gbk-filename@jimuyida.com>\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="b1"\r\n'
+        b"\r\n"
+        b"--b1\r\n"
+        b'Content-Type: text/plain; charset="utf-8"\r\n'
+        b"\r\n"
+        b"body\r\n"
+        b"--b1\r\n"
+        b"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n"
+        + b'Content-Disposition: attachment; filename="' + file_name.encode("gb18030") + b'"\r\n'
+        + b"\r\n"
+        + b"fake-docx\r\n"
+        + b"--b1--\r\n"
+    )
+
+    incoming = parse_email_bytes(raw)
+
+    assert incoming.attachments[0].file_name == file_name
+
+
+def test_task_issue_attachment_filename_has_chinese_compatible_headers(monkeypatch):
+    session = make_session()
+    configure_department(session)
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    task = create_valid_task(session, "SO-FILENAME-001")
+    file_name = "采购订单-JM-CGDD-20260522（上海测试公司）04.28.docx"
+    save_and_parse_attachment(
+        session,
+        task.requirement.source_mail_id,
+        file_name,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        make_docx_bytes("附件正文"),
+    )
+    job = OutboundMailJob(
+        mail_type="TaskIssue",
+        to_json=dumps(["production@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="生产任务单",
+        body="任务单",
+        idempotency_key="filename-compatible-task-issue",
+        related_task_id=task.id,
+        status="Pending",
+    )
+    session.add(job)
+    session.commit()
+
+    class FakeSMTP:
+        sent_messages = []
+
+        def __init__(self, host, port):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def login(self, username, password):
+            assert password == "runtime-secret"
+
+        def send_message(self, msg, from_addr, to_addrs):
+            self.sent_messages.append(msg)
+
+    monkeypatch.setattr("backend.app.services.mail_adapter.smtplib.SMTP_SSL", FakeSMTP)
+
+    result = send_outbound_jobs_smtp(session, [job.id])
+    session.commit()
+    raw_message = FakeSMTP.sent_messages[0].as_string()
+
+    assert result == {"sent": 1, "failed": 0, "total": 1}
+    assert "filename*0*=" not in raw_message
+    assert "filename*=" in raw_message
+    assert "%E9%87%87%E8%B4%AD%E8%AE%A2%E5%8D%95" in raw_message
+
+
 def test_config_backed_model_provider_key_and_payload():
     session = make_session()
     model = session.query(ModelProviderConfig).one()
@@ -832,6 +1003,353 @@ def test_model_provider_streaming_collects_sse_chunks(monkeypatch):
     )
 
     assert extract_chat_content(output) == "流程导入"
+
+
+def test_self_maintenance_context_summarizes_queue_and_failures():
+    session = make_session()
+    session.add(ProcessingJob(job_type="process_inbound_mail", payload_json=dumps({"mail_id": "missing"}), status="Failed", error_message="mail not found"))
+    session.add(OutboundMailJob(mail_type="SalesReceiptAck", to_json=dumps(["sales@jimuyida.com"]), cc_json=dumps([]), subject="回执", body="已收到", status="Pending", idempotency_key="self-maint-pending"))
+    record_exception_case(session, exception_type="RoutingMissing", severity="Medium", detail={"message": "生产路由缺失"})
+    session.commit()
+
+    context = build_self_maintenance_context(session)
+
+    assert context["queues"]["processing_counts"]["Failed"] == 1
+    assert context["queues"]["outbound_counts"]["Pending"] == 1
+    assert context["exceptions"]["open_count"] == 1
+    assert context["runtime"]["model_ready"] is False
+
+
+def test_self_maintenance_diagnosis_persists_session_and_actions_without_llm():
+    session = make_session()
+    session.add(ProcessingJob(job_type="process_inbound_mail", payload_json=dumps({"mail_id": "missing"}), status="Failed", error_message="mail not found"))
+    session.commit()
+
+    row = create_maintenance_diagnosis(session, user_message="为什么入库失败？", actor="admin", use_llm=False)
+    session.commit()
+
+    assert row.risk_level == "High"
+    assert "诊断结论" in row.diagnosis_md
+    assert session.query(MaintenanceSession).count() == 1
+    actions = session.query(MaintenanceAction).filter_by(session_id=row.id).all()
+    assert actions
+    assert any(loads(action.input_json, {}).get("title") == "复核失败入库任务" for action in actions)
+
+
+def test_self_maintenance_archive_session_updates_status_and_timeline():
+    session = make_session()
+    row = create_maintenance_diagnosis(session, user_message="归档已处理维护会话", actor="admin", use_llm=False)
+
+    archived = archive_maintenance_session(session, row.id, note="已处理完成", actor="admin")
+    session.commit()
+
+    assert archived.status == "Archived"
+    audit = session.query(AuditEvent).filter_by(event_type="SelfMaintenanceSessionArchived", related_object_id=row.id).one()
+    assert loads(audit.detail, {})["note"] == "已处理完成"
+    timeline = maintenance_session_timeline(session, row.id)["timeline"]
+    assert any(item["event_type"] == "SelfMaintenanceSessionArchived" for item in timeline)
+
+
+def test_self_maintenance_config_patch_requires_explicit_apply():
+    session = make_session()
+    set_config(session, "outbound_failed_alert_threshold", "20", is_secret=False)
+    session.commit()
+
+    row = create_maintenance_diagnosis(session, user_message="检查告警配置", actor="admin", use_llm=False)
+    session.commit()
+
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="config_patch").one()
+    payload = loads(action.input_json, {})
+    assert payload["changes"][0]["key"] == "outbound_failed_alert_threshold"
+    assert session.get(SystemConfig, "outbound_failed_alert_threshold").value == "20"
+
+    applied = apply_maintenance_action(session, action.id, actor="admin")
+    session.commit()
+
+    assert applied.status == "Completed"
+    assert applied.approved_by == "admin"
+    assert session.get(SystemConfig, "outbound_failed_alert_threshold").value == "1"
+    refreshed = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed.proposed_actions_json, [])
+    assert any(item.get("action_id") == action.id and item.get("action_status") == "Completed" for item in proposed_actions)
+
+
+def test_self_maintenance_code_patch_plan_is_non_executing_action():
+    session = make_session()
+
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    session.commit()
+
+    assert row.status == "Planned"
+    assert "修复草案" in row.diagnosis_md
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    payload = loads(action.input_json, {})
+    assert action.status == "Proposed"
+    assert "backend/app/static/app.js" in payload["suggested_files"]
+    assert "python3 -m pytest" in payload["validation_commands"]
+    assert session.query(MaintenanceAction).filter(MaintenanceAction.action_type == "config_patch").count() == 0
+
+
+def test_self_maintenance_action_detail_includes_session_and_timeline():
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="查看单个维护动作详情", actor="admin", use_llm=False)
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceCodePlanCreated",
+            actor="admin",
+            related_object_type="MaintenanceSession",
+            related_object_id=row.id,
+            detail=dumps({"risk_level": row.risk_level}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    detail = self_maintenance_action_detail(action.id, session)
+
+    assert detail["id"] == action.id
+    assert detail["session"]["id"] == row.id
+    assert detail["runner_commands"]
+    assert any(item["event_type"] == "SelfMaintenanceCodePlanCreated" for item in detail["timeline"])
+
+
+def test_self_maintenance_handoff_package_updates_action_and_session(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+
+    handoff = create_maintenance_handoff_package(session, action.id, actor="admin", output_dir=tmp_path / "handoff")
+    session.commit()
+
+    assert handoff.status == "HandoffReady"
+    result = loads(handoff.result_json, {})
+    assert result["handoff"]["created_by"] == "admin"
+    assert "python3 scripts/maintenance_runner.py validate" in "\n".join(result["handoff"]["runner_commands"])
+    assert (tmp_path / "handoff" / f"maintenance-action-{action.id}.md").exists()
+    assert (tmp_path / "handoff" / f"maintenance-action-{action.id}.json").exists()
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "HandoffReady"
+    assert proposed_actions[0]["handoff"]["markdown_path"].endswith(f"maintenance-action-{action.id}.md")
+
+
+def test_self_maintenance_reads_handoff_package_content(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    create_maintenance_handoff_package(session, action.id, actor="admin", output_dir=tmp_path / "handoff")
+    session.commit()
+
+    detail = read_maintenance_handoff_package(session, action.id, output_dir=tmp_path / "handoff")
+
+    assert detail["action_id"] == action.id
+    assert detail["markdown"]["exists"] is True
+    assert f"Maintenance Code Plan {action.id}" in detail["markdown"]["content"]
+    assert detail["json"]["exists"] is True
+    assert detail["json"]["content"]["action"]["id"] == action.id
+    assert "runner_commands" in detail["json"]["content"]
+
+
+def test_self_maintenance_validation_runs_allowed_command_and_updates_session(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    calls = []
+
+    def fake_runner(command, cwd, timeout_seconds):
+        calls.append((command, cwd, timeout_seconds))
+        return {"command": command, "exit_code": 0, "stdout_tail": "ok", "stderr_tail": ""}
+
+    validated = run_maintenance_validation(
+        session,
+        action.id,
+        selected_commands=["node --check backend/app/static/app.js"],
+        timeout_seconds=9,
+        output_dir=tmp_path / "reports",
+        cwd=tmp_path,
+        actor="admin",
+        command_runner=fake_runner,
+    )
+    session.commit()
+
+    assert validated.status == "Validated"
+    assert calls == [("node --check backend/app/static/app.js", tmp_path, 9)]
+    result = loads(validated.result_json, {})
+    assert result["validation"]["validated_by"] == "admin"
+    assert result["validation"]["commands"][0]["exit_code"] == 0
+    assert result["commands"][0]["exit_code"] == 0
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "Validated"
+    assert proposed_actions[0]["validation_result"]["commands"][0]["command"] == "node --check backend/app/static/app.js"
+
+
+def test_self_maintenance_timeline_orders_session_action_and_results(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    create_maintenance_handoff_package(session, action.id, actor="admin", output_dir=tmp_path / "handoff")
+    report_maintenance_implementation(session, action.id, status="PatchReady", summary="补丁已完成，等待人工复核", actor="maintenance-runner")
+    review_maintenance_implementation(session, action.id, decision="ReviewAccepted", note="人工复核通过", actor="admin")
+    session.commit()
+
+    payload = maintenance_session_timeline(session, row.id)
+    events = [item["event_type"] for item in payload["timeline"]]
+
+    assert events[0] == "MaintenanceSessionCreated"
+    assert "MaintenanceActionProposed" in events
+    assert "MaintenanceHandoffCreated" in events
+    assert "MaintenanceImplementationReported" in events
+    assert "MaintenanceImplementationReviewed" in events
+    assert payload["timeline"] == sorted(payload["timeline"], key=lambda item: item["created_at"])
+    assert payload["session"]["id"] == row.id
+    assert payload["actions"][0]["id"] == action.id
+
+
+def test_maintenance_runner_validates_code_plan_with_allowed_command(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    calls = []
+
+    def fake_runner(command, cwd, timeout_seconds):
+        calls.append((command, cwd, timeout_seconds))
+        return CommandResult(command=command, exit_code=0, stdout_tail="ok", stderr_tail="")
+
+    validated = validate_code_plan_action(
+        session,
+        action_id=action.id,
+        cwd=tmp_path,
+        output_dir=tmp_path / "reports",
+        timeout_seconds=12,
+        selected_commands=["node --check backend/app/static/app.js"],
+        command_runner=fake_runner,
+    )
+    session.commit()
+
+    assert validated.status == "Validated"
+    assert calls == [("node --check backend/app/static/app.js", tmp_path, 12)]
+    result = loads(validated.result_json, {})
+    assert result["commands"][0]["exit_code"] == 0
+    assert (tmp_path / "reports" / f"maintenance-action-{action.id}.md").exists()
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "Validated"
+    assert proposed_actions[0]["validation_result"]["commands"][0]["exit_code"] == 0
+    assert session.query(AuditEvent).filter_by(event_type="MaintenanceRunnerValidationCompleted").count() == 1
+
+
+def test_maintenance_runner_creates_handoff_package(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+
+    handoff = create_handoff_package(session, action_id=action.id, output_dir=tmp_path / "handoff")
+    session.commit()
+
+    assert handoff.status == "HandoffReady"
+    result = loads(handoff.result_json, {})
+    markdown_path = tmp_path / "handoff" / f"maintenance-action-{action.id}.md"
+    json_path = tmp_path / "handoff" / f"maintenance-action-{action.id}.json"
+    assert result["handoff"]["markdown_path"] == str(markdown_path)
+    assert result["handoff"]["json_path"] == str(json_path)
+    assert markdown_path.exists()
+    assert json_path.exists()
+    handoff_payload = loads(json_path.read_text(encoding="utf-8"), {})
+    assert handoff_payload["action"]["id"] == action.id
+    assert "safety_boundaries" in handoff_payload
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "HandoffReady"
+    assert session.query(AuditEvent).filter_by(event_type="MaintenanceRunnerHandoffCreated").count() == 1
+
+
+def test_maintenance_implementation_report_updates_action_and_session():
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+
+    reported = report_maintenance_implementation(
+        session,
+        action.id,
+        status="PatchReady",
+        summary="补丁已完成，等待人工复核",
+        changed_files=["backend/app/static/app.js"],
+        tests=["node --check backend/app/static/app.js"],
+        residual_risks=["尚未运行浏览器端回归"],
+        actor="maintenance-runner",
+    )
+    session.commit()
+
+    assert reported.status == "PatchReady"
+    result = loads(reported.result_json, {})
+    assert result["implementation"]["summary"] == "补丁已完成，等待人工复核"
+    assert result["implementation"]["changed_files"] == ["backend/app/static/app.js"]
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "PatchReady"
+    assert proposed_actions[0]["implementation"]["tests"] == ["node --check backend/app/static/app.js"]
+
+
+def test_maintenance_review_accepts_patch_ready_action():
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+    report_maintenance_implementation(
+        session,
+        action.id,
+        status="PatchReady",
+        summary="补丁已完成，等待人工复核",
+        actor="maintenance-runner",
+    )
+
+    reviewed = review_maintenance_implementation(
+        session,
+        action.id,
+        decision="ReviewAccepted",
+        note="人工复核通过",
+        actor="admin",
+    )
+    session.commit()
+
+    assert reviewed.status == "ReviewAccepted"
+    result = loads(reviewed.result_json, {})
+    assert result["review"]["decision"] == "ReviewAccepted"
+    assert result["review"]["note"] == "人工复核通过"
+    refreshed_session = session.get(MaintenanceSession, row.id)
+    proposed_actions = loads(refreshed_session.proposed_actions_json, [])
+    assert proposed_actions[0]["action_status"] == "ReviewAccepted"
+    assert proposed_actions[0]["review"]["reviewed_by"] == "admin"
+
+
+def test_maintenance_review_rejects_unreviewable_status():
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+
+    with pytest.raises(ValueError, match="not reviewable"):
+        review_maintenance_implementation(session, action.id, decision="ReviewAccepted", actor="admin")
+
+    assert session.get(MaintenanceAction, action.id).status == "Proposed"
+
+
+def test_maintenance_runner_rejects_unapproved_commands(tmp_path):
+    session = make_session()
+    row = create_code_patch_plan(session, user_message="为管理台自维护页面增加更清晰的错误提示", actor="admin", use_llm=False)
+    action = session.query(MaintenanceAction).filter_by(session_id=row.id, action_type="code_patch_plan").one()
+
+    with pytest.raises(ValueError, match="not allowed"):
+        validate_code_plan_action(
+            session,
+            action_id=action.id,
+            cwd=tmp_path,
+            output_dir=tmp_path / "reports",
+            selected_commands=["rm -rf data"],
+            command_runner=lambda command, cwd, timeout_seconds: CommandResult(command, 0, "", ""),
+        )
+
+    assert session.get(MaintenanceAction, action.id).status == "Proposed"
 
 
 def test_llm_fallback_can_classify_and_extract_natural_sales_order(monkeypatch):
@@ -1578,6 +2096,96 @@ def test_clear_tasks_requires_admin_password_and_removes_task_list():
     assert session.get(OutboundMailJob, outbound_id).related_version_id is None
     assert session.get(ExceptionCase, case_id).related_task_id is None
     audit = session.query(AuditEvent).filter_by(event_type="TaskListCleared").one()
+    assert audit.actor == "admin"
+
+
+def test_clear_business_data_removes_entered_flows_tasks_and_review_rules():
+    from backend.app.main import clear_business_data
+    from backend.app.schemas import AdminPasswordRequest
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    configure_department(session)
+    set_config(
+        session,
+        "initial_review_rules_json",
+        dumps(
+            [
+                {
+                    "id": "custom-review-rule",
+                    "name": "自定义规则",
+                    "field": "source_text",
+                    "operator": "contains",
+                    "value": "测试",
+                    "message": "必须包含测试",
+                    "enabled": True,
+                }
+            ]
+        ),
+        is_secret=False,
+    )
+    set_config(session, "initial_review_workflow_rule_deleted_ids_json", dumps(["workflow:old"]), is_secret=False)
+    import_result = import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "clear_business_flow",
+                "workflow_name": "清空数据流程",
+                "match": {"any_keywords": ["清空数据"], "all_keywords": [], "warehouse": "", "order_type": "", "subject_patterns": []},
+                "routing": {"to_names": ["production@jimuyida.com"], "cc_names": []},
+                "subject_template": "任务 {{task_no}}",
+                "body_template": "流程类型：{{workflow_name}}",
+                "required_fields": ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"],
+                "review_rules": [],
+            }
+        ],
+        auto_publish=True,
+        source_asset_ref="clear-business",
+        file_name="clear-business.json",
+    )
+    version_id = import_result["created_versions"][0]["id"]
+    task = create_valid_task(session, order_no="SO-CLEAR-BUSINESS")
+    source_mail = session.get(MailMessage, task.requirement.source_mail_id)
+    source_mail.related_task_id = task.id
+    session.add(
+        MailWorkflowMatch(
+            mail_id=source_mail.id,
+            workflow_version_id=version_id,
+            workflow_code="clear_business_flow",
+            confidence=100,
+            match_detail_json=dumps({"workflow_name": "清空数据流程"}),
+        )
+    )
+    session.commit()
+
+    result = clear_business_data(AdminPasswordRequest(admin_password="admin"), Request(), session)
+    session.expire_all()
+
+    assert result["ok"] is True
+    assert result["task_count"] == 1
+    assert result["workflow_count"] == 1
+    assert result["initial_review_rule_count"] == 1
+    assert session.query(ProductionTask).count() == 0
+    assert session.query(OrderRequirement).count() == 0
+    assert session.query(WorkflowDefinition).count() == 0
+    assert session.query(WorkflowVersion).count() == 0
+    assert session.query(WorkflowImportJob).count() == 0
+    assert session.query(MailWorkflowMatch).count() == 0
+    assert loads(session.get(SystemConfig, "initial_review_rules_json").value, []) == []
+    assert loads(session.get(SystemConfig, "initial_review_workflow_rule_deleted_ids_json").value, []) == []
+    display_config = initial_review_config(session, include_workflow_rules=True)
+    assert [rule["id"] for rule in display_config["rules"]] == [
+        "builtin-required-core-fields",
+        "builtin-parser-risk-flags",
+        "builtin-duplicate-submission",
+    ]
+    assert any(row.get("is_builtin") for row in list_workflow_rules(session, only_active=False))
+    audit = session.query(AuditEvent).filter_by(event_type="BusinessDataCleared").one()
     assert audit.actor == "admin"
 
 
@@ -2578,7 +3186,7 @@ def test_cleanup_preview_execute_and_weekly_csv():
     assert "任务统计" in csv_text
 
 
-def test_workflow_import_creates_published_versions():
+def test_workflow_import_doc_without_email_recipients_creates_draft_versions():
     session = make_session()
     result = import_workflow_document(
         session,
@@ -2590,10 +3198,12 @@ def test_workflow_import_creates_published_versions():
     )
     session.commit()
 
-    assert result["validation_errors"] == []
+    assert result["validation_errors"]
+    assert any("缺少收件人" in item for item in result["validation_errors"])
     assert len(result["created_versions"]) >= 5
     assert session.query(WorkflowImportJob).count() == 1
-    assert session.query(WorkflowVersion).filter_by(status="Active").count() >= 5
+    assert session.query(WorkflowVersion).filter_by(status="Active").count() == 0
+    assert session.query(WorkflowVersion).filter_by(status="Draft").count() >= 5
 
 
 def test_workflow_import_accepts_uploaded_text_content():
@@ -2625,7 +3235,133 @@ def test_workflow_import_accepts_uploaded_text_content():
     assert result["source_asset_ref"] == "uploaded:workflow-rules.txt"
     version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
     assert version is not None
-    assert loads(version.compiled_rules_json, {})["workflow_name"] == "上传流程"
+    rules = loads(version.compiled_rules_json, {})
+    assert rules["workflow_name"] == "上传流程"
+    assert rules["routing"]["to_names"] == []
+    assert rules["routing"]["cc_names"] == []
+    assert version.status == "Draft"
+
+
+def test_workflow_import_only_keeps_valid_recipient_emails_from_document():
+    session = make_session()
+    raw_text = """
+流程一: 邮箱提取流程
+邮件收件人：张燕 <zhangyan@jimuyida.com>、销售直属领导
+邮件抄送人：丁总、cc1@jimuyida.com，cc2@jimuyida.com
+邮件主题：[邮箱提取][{{task_no}}]
+邮件内容模板：
+流程类型：邮箱提取流程
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    assert result["validation_errors"] == []
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    rules = loads(version.compiled_rules_json, {})
+    assert rules["routing"]["to_names"] == ["zhangyan@jimuyida.com"]
+    assert rules["routing"]["cc_names"] == ["cc1@jimuyida.com", "cc2@jimuyida.com"]
+    assert session.query(ProductionDepartment).filter_by(department_name="销售直属领导").one_or_none() is None
+
+
+def test_workflow_with_empty_recipient_cannot_be_enabled():
+    session = make_session()
+    raw_text = """
+流程一: 空收件人流程
+邮件收件人：张燕、销售直属领导
+邮件抄送人：丁总、金总
+邮件主题：[空收件人][{{task_no}}]
+邮件内容模板：
+流程类型：空收件人流程
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+
+    assert any("缺少收件人" in item for item in result["validation_errors"])
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    assert version.status == "Draft"
+    rules = loads(version.compiled_rules_json, {})
+    assert rules["routing"]["to_names"] == []
+    assert rules["routing"]["cc_names"] == []
+
+    with pytest.raises(ValueError) as exc:
+        activate_workflow_version(session, version.id, actor="tester")
+    assert "缺少收件人" in str(exc.value)
+
+
+def test_workflow_import_splits_multiple_cc_recipients_by_comma_dunhao_and_space():
+    session = make_session()
+    raw_text = """
+流程一: 多抄送流程
+邮件收件人：to-production@jimuyida.com
+邮件抄送人：cc1@jimuyida.com cc2@jimuyida.com、cc3@jimuyida.com
+邮件主题：[多抄送][{{task_no}}]
+邮件内容模板：
+流程类型：多抄送流程
+""".strip()
+
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=False,
+        actor="tester",
+    )
+    session.commit()
+
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    rules = loads(version.compiled_rules_json, {})
+    assert rules["routing"]["cc_names"] == ["cc1@jimuyida.com", "cc2@jimuyida.com", "cc3@jimuyida.com"]
+
+
+def test_workflow_edit_requires_main_recipient_from_production_department_emails():
+    session = make_session()
+    raw_text = """
+流程一: 主送校验流程
+邮件收件人：to-production@jimuyida.com
+邮件主题：[主送校验][{{task_no}}]
+邮件内容模板：
+流程类型：主送校验流程
+""".strip()
+    result = import_workflow_document(
+        session,
+        file_path=None,
+        raw_text=raw_text,
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    version = session.get(WorkflowVersion, result["created_versions"][0]["id"])
+    deactivate_workflow_version(session, version.id)
+    session.commit()
+
+    rules = loads(version.compiled_rules_json, {})
+    rules["routing"]["to_names"] = ["张燕"]
+    with pytest.raises(ValueError, match="主送人只能从生产部门邮箱列表选择"):
+        save_workflow_version_rules(session, version.id, compiled_rules=rules, actor="tester", activate=True)
+
+    rules["routing"]["to_names"] = ["to-production@jimuyida.com"]
+    saved = save_workflow_version_rules(session, version.id, compiled_rules=rules, actor="tester", activate=True)
+    session.commit()
+
+    assert saved.status == "Active"
 
 
 def test_workflow_import_same_doc_is_idempotent_on_versions():
@@ -2652,7 +3388,8 @@ def test_workflow_import_same_doc_is_idempotent_on_versions():
     after_versions = session.query(WorkflowVersion).count()
 
     assert len(first["created_versions"]) >= 5
-    assert second["validation_errors"] == []
+    assert second["validation_errors"]
+    assert any("缺少收件人" in item for item in second["validation_errors"])
     assert len(second["created_versions"]) == 0
     assert before_versions == after_versions
 
@@ -2675,6 +3412,7 @@ def test_workflow_list_includes_builtin_default_order_flow():
 
 def test_workflow_version_diff_and_rollback_activate_selected_version():
     session = make_session()
+    configure_department(session)
     definition = WorkflowDefinition(
         workflow_code="diff_flow",
         workflow_name="版本差异流程",
@@ -2763,8 +3501,8 @@ def test_workflow_import_falls_back_when_llm_timeout(monkeypatch):
     session = make_session()
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：production@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -2794,7 +3532,7 @@ def test_workflow_import_falls_back_when_llm_timeout(monkeypatch):
     assert version is not None
     rules = loads(version.compiled_rules_json, {})
     assert rules["workflow_name"] == "常规销售流程"
-    assert rules["routing"]["to_names"] == ["张燕"]
+    assert rules["routing"]["to_names"] == ["production@jimuyida.com"]
 
 
 def test_workflow_import_backfills_task_template_variables_when_missing():
@@ -3127,6 +3865,15 @@ def test_save_workflow_version_rules_can_activate_after_manual_edit():
         }
     ]
     rules["routing"] = {"to_names": ["洪丹"], "cc_names": ["销售直属领导", "商务负责人"]}
+    session.add(
+        ProductionDepartment(
+            department_code="hongdan",
+            department_name="洪丹",
+            mail_to_json=dumps(["hongdan@jimuyida.com"]),
+            mail_cc_json=dumps([]),
+            status="Active",
+        )
+    )
 
     saved = save_workflow_version_rules(
         session,
@@ -3141,7 +3888,7 @@ def test_save_workflow_version_rules_can_activate_after_manual_edit():
     saved_rules = loads(saved.compiled_rules_json, {})
     assert len(saved_rules.get("review_rules", [])) == 1
     assert saved_rules["review_rules"][0]["name"] == "特批编码校验"
-    assert saved_rules["routing"]["to_names"] == ["洪丹"]
+    assert saved_rules["routing"]["to_names"] == ["hongdan@jimuyida.com"]
     assert saved_rules["routing"]["cc_names"] == ["销售直属领导", "商务负责人"]
 
 
@@ -3149,8 +3896,8 @@ def test_edit_active_workflow_requires_deactivate_first():
     session = make_session()
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3187,8 +3934,8 @@ def test_workflow_version_can_be_deactivated_then_updated_in_place_and_deleted()
     session = make_session()
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3232,8 +3979,8 @@ def test_delete_active_workflow_requires_deactivate_first():
     session = make_session()
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3329,21 +4076,10 @@ def test_import_workflow_document_rejects_duplicate_names_in_same_batch():
 
 def test_workflow_specific_review_rules_block_and_allow_after_fix():
     session = make_session()
-    set_config(
-        session,
-        "workflow_contact_map_json",
-        dumps(
-            {
-                "张燕": "zhangyan@jimuyida.com",
-                "销售直属领导": "sales.lead@jimuyida.com",
-            }
-        ),
-        is_secret=False,
-    )
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3371,8 +4107,8 @@ def test_workflow_specific_review_rules_block_and_allow_after_fix():
             "value": "特批编码",
             "message": "邮件缺少特批编码信息",
             "enabled": True,
-        }
-    ]
+            }
+        ]
     deactivate_workflow_version(session, version_id)
     save_workflow_version_rules(session, version_id, compiled_rules=custom_rules, actor="tester", activate=True)
     session.commit()
@@ -3400,6 +4136,12 @@ def test_workflow_specific_review_rules_block_and_allow_after_fix():
     assert blocked_case is not None
     blocked_detail = loads(blocked_case.detail, {})
     assert any("特批编码校验" in str(item.get("rule_name", "")) for item in blocked_detail.get("review_failures", []))
+    blocked_notice = session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").one()
+    assert f"流程编号：{custom_rules['workflow_code']}" in blocked_notice.body
+    assert f"流程版本ID：{version_id}" in blocked_notice.body
+    assert "未满足该流程下的规则" in blocked_notice.body
+    assert "特批编码校验：邮件缺少特批编码信息" in blocked_notice.body
+    assert all(item.get("workflow_code") == custom_rules["workflow_code"] for item in blocked_detail.get("review_failures", []))
 
     passed = create_inbound_mail(
         session,
@@ -3428,16 +4170,16 @@ def test_workflow_match_prefers_llm_selected_flow_when_multiple_active(monkeypat
     session = make_session()
     raw_text = """
 流程一: 样机借用 下单
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[样机借用][{{task_no}}]
 邮件内容模板：
 流程类型：样机借用
 附件：样机借用审批截图
 
 流程二: 常规销售 下单
-邮件收件人：洪丹
-邮件抄送人：销售直属领导
+邮件收件人：hongdan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规销售][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3496,30 +4238,18 @@ def test_workflow_match_prefers_llm_selected_flow_when_multiple_active(monkeypat
 
 def test_supplement_reply_uses_full_context_for_workflow_required_fields():
     session = make_session()
-    set_config(
-        session,
-        "workflow_contact_map_json",
-        dumps(
-            {
-                "张燕": "zhangyan@jimuyida.com",
-                "洪丹": "hongdan@jimuyida.com",
-                "销售直属领导": "sales.lead@jimuyida.com",
-            }
-        ),
-        is_secret=False,
-    )
     raw_text = """
 流程一: 样机借用 下单
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[样机借用][{{task_no}}]
 邮件内容模板：
 流程类型：样机借用
 附件：样机借用审批截图
 
 流程二: 常规销售 下单
-邮件收件人：洪丹
-邮件抄送人：销售直属领导
+邮件收件人：hongdan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规销售][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3589,21 +4319,10 @@ def test_workflow_review_rules_are_not_mixed_with_global_initial_review_rules():
         ),
         is_secret=False,
     )
-    set_config(
-        session,
-        "workflow_contact_map_json",
-        dumps(
-            {
-                "张燕": "zhangyan@jimuyida.com",
-                "销售直属领导": "sales.lead@jimuyida.com",
-            }
-        ),
-        is_secret=False,
-    )
     raw_text = """
 流程一: 常规销售流程
-邮件收件人：张燕
-邮件抄送人：销售直属领导
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：sales.lead@jimuyida.com
 邮件主题：[常规][{{task_no}}]
 邮件内容模板：
 流程类型：常规销售
@@ -3652,12 +4371,6 @@ def test_workflow_review_rules_are_not_mixed_with_global_initial_review_rules():
 
 def test_initial_review_config_syncs_workflow_review_rules_as_custom_rules():
     session = make_session()
-    set_config(
-        session,
-        "workflow_contact_map_json",
-        dumps({"张燕": "zhangyan@jimuyida.com"}),
-        is_secret=False,
-    )
     import_structured_workflow_rules(
         session,
         rules=[
@@ -3665,7 +4378,7 @@ def test_initial_review_config_syncs_workflow_review_rules_as_custom_rules():
                 "workflow_code": "custom_review_flow",
                 "workflow_name": "带规则流程",
                 "match": {"any_keywords": ["带规则流程"]},
-                "routing": {"to_names": ["张燕"]},
+                "routing": {"to_names": ["zhangyan@jimuyida.com"]},
                 "subject_template": "[带规则][{{task_no}}]",
                 "body_template": "流程类型：{{workflow_name}}",
                 "required_fields": [],
@@ -3709,7 +4422,7 @@ def test_deleted_workflow_review_rule_is_not_restored_by_sync():
                 "workflow_code": "deletable_review_flow",
                 "workflow_name": "可删除规则流程",
                 "match": {"any_keywords": ["可删除规则流程"]},
-                "routing": {"to_names": ["张燕"]},
+                "routing": {"to_names": ["zhangyan@jimuyida.com"]},
                 "subject_template": "[可删除][{{task_no}}]",
                 "body_template": "流程类型：{{workflow_name}}",
                 "required_fields": [],
@@ -3868,13 +4581,30 @@ WORKFLOW_CASES = [
 ]
 
 
+def workflow_import_text_with_email_routing() -> str:
+    sections: list[str] = []
+    for index, case in enumerate(WORKFLOW_CASES, start=1):
+        sections.append(
+            "\n".join(
+                [
+                    f"流程{index}: {case['name']}",
+                    f"邮件收件人：{case['expected_to']}",
+                    "邮件抄送人：sales.lead@jimuyida.com",
+                    "邮件主题：[生产任务单][{{task_no}}][{{customer_name}}][{{product_summary}}][V{{version_no}}]",
+                    "邮件内容模板：",
+                    *case["lines"],
+                ]
+            )
+        )
+    return "\n\n".join(sections)
+
+
 def prepare_imported_workflow_session():
     session = make_session()
-    set_config(session, "workflow_contact_map_json", dumps(WORKFLOW_CONTACT_MAP), is_secret=False)
     import_workflow_document(
         session,
-        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
-        raw_text=None,
+        file_path=None,
+        raw_text=workflow_import_text_with_email_routing(),
         prefer_llm=False,
         auto_publish=True,
         actor="tester",
@@ -3928,38 +4658,21 @@ def test_imported_business_workflow_cases_fail_initial_review_when_required_fiel
     assert case_row is not None
     detail = loads(case_row.detail, {})
     assert any(missing_label in item.get("message", "") for item in detail.get("review_failures", []))
+    notice = session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").order_by(OutboundMailJob.created_at.desc()).first()
+    assert notice is not None
+    assert "当前使用流程" in notice.body
+    assert "流程编号：" in notice.body
+    assert "流程版本ID：" in notice.body
+    assert "未满足该流程下的规则" in notice.body
+    assert missing_label in notice.body
 
 
-def test_imported_workflow_routes_task_after_contact_mapping():
+def test_imported_workflow_routes_task_after_explicit_email_routing():
     session = make_session()
-    set_config(
-        session,
-        "workflow_contact_map_json",
-        dumps(
-            {
-                "张燕": "zhangyan@jimuyida.com",
-                "丁总": "dingyong@jimuyida.com",
-                "金总": "jinzong@jimuyida.com",
-                "罗总": "luozong@jimuyida.com",
-                "张杏": "zhangxing@jimuyida.com",
-                "洪丹": "hongdan@jimuyida.com",
-                "曾鲜艳": "zengxianyan@jimuyida.com",
-                "余烁": "yushuo@jimuyida.com",
-                "单涛": "dantao@jimuyida.com",
-                "袁辉": "yuanhui@jimuyida.com",
-                "包亚敏": "baoyamin@jimuyida.com",
-                "张洁仪": "zhangjieyi@jimuyida.com",
-                "邢惠玲": "xinghuiling@jimuyida.com",
-                "宋勤红": "songqinhong@jimuyida.com",
-                "销售直属领导": "sales.lead@jimuyida.com",
-            }
-        ),
-        is_secret=False,
-    )
     import_workflow_document(
         session,
-        file_path="/Users/kaimao/github/jm-sp-bot/docs/商务部邮件下单流程梳理.docx",
-        raw_text=None,
+        file_path=None,
+        raw_text=workflow_import_text_with_email_routing(),
         prefer_llm=False,
         auto_publish=True,
         actor="tester",
@@ -3997,7 +4710,7 @@ def test_imported_workflow_routes_task_after_contact_mapping():
     assert "物流发货方式" not in as_list(binding.missing_fields_json)
 
 
-def test_imported_workflow_without_contact_mapping_fails_review():
+def test_imported_workflow_without_primary_contact_mapping_routes_to_internal_exception():
     session = make_session()
     import_workflow_document(
         session,
@@ -4033,7 +4746,56 @@ def test_imported_workflow_without_contact_mapping_fails_review():
     session.commit()
 
     assert task is None
-    case = session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").order_by(ExceptionCase.created_at.desc()).first()
+    case = session.query(ExceptionCase).filter_by(exception_type="RoutingMissing").order_by(ExceptionCase.created_at.desc()).first()
     assert case is not None
     detail = loads(case.detail, {})
-    assert any("流程收件人未映射邮箱" in item.get("message", "") for item in detail.get("review_failures", []))
+    assert "生产部门邮箱未配置" in detail["message"]
+    assert detail.get("unresolved_contacts") == []
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0
+
+
+def test_non_email_workflow_cc_contact_is_discarded_and_does_not_fail_initial_review():
+    session = make_session()
+    import_workflow_document(
+        session,
+        file_path=None,
+        raw_text="""
+流程一: 抄送动态角色流程
+邮件收件人：zhangyan@jimuyida.com
+邮件抄送人：销售直属领导
+邮件主题：[抄送测试][{{task_no}}]
+邮件内容模板：
+流程类型：抄送动态角色流程
+附件：采购订单
+""".strip(),
+        prefer_llm=False,
+        auto_publish=True,
+        actor="tester",
+    )
+    session.commit()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 抄送动态角色流程",
+        body_text="\n".join(
+            [
+                "客户名称：测试客户",
+                "产品：G100",
+                "数量：20台",
+                "期望交期：2026-07-01",
+                "订单号：SO-WF-CC-001",
+                "附件：采购订单",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert as_list(task.target_mail_to_json) == ["zhangyan@jimuyida.com"]
+    assert as_list(task.target_mail_cc_json) == []
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one()
+    assert as_list(binding.unresolved_contacts_json) == []
+    assert session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0

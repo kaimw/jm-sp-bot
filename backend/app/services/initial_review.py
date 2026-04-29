@@ -88,6 +88,10 @@ class ReviewFailure:
     field_label: str
     rule_name: str
     message: str
+    workflow_code: str = ""
+    workflow_name: str = ""
+    workflow_version_id: str = ""
+    is_workflow_rule: bool = False
 
 
 @dataclass(frozen=True)
@@ -429,6 +433,10 @@ def serialize_review_failures(failures: list[ReviewFailure]) -> list[dict]:
             "field_label": failure.field_label,
             "rule_name": failure.rule_name,
             "message": failure.message,
+            "workflow_code": failure.workflow_code,
+            "workflow_name": failure.workflow_name,
+            "workflow_version_id": failure.workflow_version_id,
+            "is_workflow_rule": failure.is_workflow_rule,
         }
         for failure in failures
     ]

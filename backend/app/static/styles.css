@@ -1500,6 +1500,10 @@ textarea:focus {
   width: min(880px, 100%);
 }
 
+.self-maintenance-detail-panel {
+  width: min(1040px, 100%);
+}
+
 .mail-detail-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

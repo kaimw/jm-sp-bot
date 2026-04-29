@@ -144,6 +144,51 @@ class ModelChatTestRequest(BaseModel):
     system_prompt: str | None = None
 
 
+class SelfMaintenanceDiagnoseRequest(BaseModel):
+    message: str
+    use_llm: bool = True
+
+
+class SelfMaintenanceActionApplyRequest(BaseModel):
+    admin_password: str
+
+
+class SelfMaintenanceCodePlanRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+    use_llm: bool = True
+
+
+class SelfMaintenanceSessionArchiveRequest(BaseModel):
+    admin_password: str
+    note: str = ""
+
+
+class SelfMaintenanceImplementationReportRequest(BaseModel):
+    admin_password: str
+    status: str = Field(default="PatchReady", pattern="^(PatchReady|PatchFailed)$")
+    summary: str
+    changed_files: list[str] = []
+    tests: list[str] = []
+    residual_risks: list[str] = []
+
+
+class SelfMaintenanceValidationRequest(BaseModel):
+    admin_password: str
+    commands: list[str] = []
+    timeout_seconds: int = Field(default=300, ge=1, le=900)
+
+
+class SelfMaintenanceHandoffRequest(BaseModel):
+    admin_password: str
+
+
+class SelfMaintenanceReviewRequest(BaseModel):
+    admin_password: str
+    decision: str = Field(pattern="^(ReviewAccepted|ReviewRejected|NeedsRevision)$")
+    note: str = ""
+
+
 class WorkflowImportRequest(BaseModel):
     file_path: str | None = None
     file_name: str | None = None

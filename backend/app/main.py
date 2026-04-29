@@ -7,6 +7,7 @@ import contextlib
 import csv
 import hmac
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,8 @@ from backend.app.models import (
     MailMessage,
     MailWorkflowMatch,
     MailTemplate,
+    MaintenanceAction,
+    MaintenanceSession,
     ModelProviderConfig,
     OrderRequirement,
     OutboundMailJob,
@@ -60,6 +63,14 @@ from backend.app.schemas import (
     ProductionQuestionRequest,
     TaskClearRequest,
     SalesReplyRequest,
+    SelfMaintenanceActionApplyRequest,
+    SelfMaintenanceCodePlanRequest,
+    SelfMaintenanceDiagnoseRequest,
+    SelfMaintenanceHandoffRequest,
+    SelfMaintenanceImplementationReportRequest,
+    SelfMaintenanceReviewRequest,
+    SelfMaintenanceSessionArchiveRequest,
+    SelfMaintenanceValidationRequest,
     TaskManualCloseRequest,
     TemplateUpdate,
     WorkflowContactMapUpdate,
@@ -75,6 +86,7 @@ from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_s
 from backend.app.services.bootstrap import seed_defaults, set_config
 from backend.app.services.e2e_mail import run_tencent_mail_e2e
 from backend.app.services.initial_review import (
+    DEFAULT_REQUIRED_FIELDS,
     FIELD_LABELS,
     OPERATOR_OPTIONS,
     dedupe_initial_review_rules,
@@ -90,6 +102,21 @@ from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
+from backend.app.services.self_maintenance import (
+    apply_maintenance_action,
+    archive_maintenance_session,
+    build_self_maintenance_context,
+    create_code_patch_plan,
+    create_maintenance_handoff_package,
+    create_maintenance_diagnosis,
+    maintenance_session_timeline,
+    read_maintenance_handoff_package,
+    report_maintenance_implementation,
+    review_maintenance_implementation,
+    run_maintenance_validation,
+    serialize_maintenance_action,
+    serialize_maintenance_session,
+)
 from backend.app.services.workflow_rules import (
     activate_workflow_version,
     chat_generate_workflow_rule,
@@ -129,6 +156,7 @@ app = FastAPI(title="商务生产任务单智能体 MVP")
 PUBLIC_API_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/auth/me"}
 logger = logging.getLogger(__name__)
 mail_worker_task: asyncio.Task | None = None
+EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 
 
 @app.middleware("http")
@@ -278,6 +306,169 @@ def bootstrap(session: Session = Depends(get_session)) -> dict:
     return {"ok": True}
 
 
+def normalize_email_values(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        for item in re.split(r"[,，;；\s]+", str(value or "")):
+            email = item.strip()
+            if email:
+                normalized.append(email)
+    return normalized
+
+
+def invalid_email_addresses(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    return [email for email in normalize_email_values(values) if not EMAIL_ADDRESS_PATTERN.fullmatch(email)]
+
+
+def clear_task_records(session: Session) -> dict:
+    tasks_to_clear = session.query(ProductionTask).all()
+    task_ids = [task.id for task in tasks_to_clear]
+    requirement_ids = [task.requirement_id for task in tasks_to_clear]
+    version_ids = [
+        row.id
+        for row in session.query(ProductionTaskVersion.id).filter(ProductionTaskVersion.task_id.in_(task_ids)).all()
+    ] if task_ids else []
+
+    mail_updates = 0
+    outbound_updates = 0
+    exception_updates = 0
+    question_deletes = 0
+    version_deletes = 0
+    binding_deletes = 0
+    evidence_deletes = 0
+    requirement_deletes = 0
+    task_deletes = 0
+
+    if task_ids:
+        mail_updates = (
+            session.query(MailMessage)
+            .filter(MailMessage.related_task_id.in_(task_ids))
+            .update({MailMessage.related_task_id: None}, synchronize_session=False)
+        )
+        exception_updates = (
+            session.query(ExceptionCase)
+            .filter(ExceptionCase.related_task_id.in_(task_ids))
+            .update({ExceptionCase.related_task_id: None}, synchronize_session=False)
+        )
+        outbound_query = session.query(OutboundMailJob).filter(OutboundMailJob.related_task_id.in_(task_ids))
+        if version_ids:
+            outbound_query = session.query(OutboundMailJob).filter(
+                or_(OutboundMailJob.related_task_id.in_(task_ids), OutboundMailJob.related_version_id.in_(version_ids))
+            )
+        outbound_updates = outbound_query.update(
+            {OutboundMailJob.related_task_id: None, OutboundMailJob.related_version_id: None},
+            synchronize_session=False,
+        )
+        question_deletes = (
+            session.query(QuestionAndReply)
+            .filter(QuestionAndReply.task_id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        version_deletes = (
+            session.query(ProductionTaskVersion)
+            .filter(ProductionTaskVersion.task_id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        task_deletes = (
+            session.query(ProductionTask)
+            .filter(ProductionTask.id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+
+    if requirement_ids:
+        binding_deletes = (
+            session.query(RequirementWorkflowBinding)
+            .filter(RequirementWorkflowBinding.requirement_id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+        evidence_deletes = (
+            session.query(ExtractionEvidence)
+            .filter(ExtractionEvidence.requirement_id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+        requirement_deletes = (
+            session.query(OrderRequirement)
+            .filter(OrderRequirement.id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
+
+    return {
+        "task_count": task_deletes,
+        "requirement_count": requirement_deletes,
+        "version_count": version_deletes,
+        "question_count": question_deletes,
+        "binding_count": binding_deletes,
+        "evidence_count": evidence_deletes,
+        "mail_links_cleared": mail_updates,
+        "outbound_links_cleared": outbound_updates,
+        "exception_links_cleared": exception_updates,
+    }
+
+
+def clear_workflow_records(session: Session) -> dict:
+    match_deletes = session.query(MailWorkflowMatch).delete(synchronize_session=False)
+    import_job_deletes = session.query(WorkflowImportJob).delete(synchronize_session=False)
+    version_deletes = session.query(WorkflowVersion).delete(synchronize_session=False)
+    definition_deletes = session.query(WorkflowDefinition).delete(synchronize_session=False)
+    return {
+        "workflow_definition_count": definition_deletes,
+        "workflow_version_count": version_deletes,
+        "workflow_import_job_count": import_job_deletes,
+        "mail_workflow_match_count": match_deletes,
+    }
+
+
+def clear_remaining_requirement_records(session: Session) -> dict:
+    requirement_ids = [row.id for row in session.query(OrderRequirement.id).all()]
+    if not requirement_ids:
+        return {
+            "orphan_requirement_count": 0,
+            "orphan_binding_count": 0,
+            "orphan_evidence_count": 0,
+        }
+    binding_deletes = (
+        session.query(RequirementWorkflowBinding)
+        .filter(RequirementWorkflowBinding.requirement_id.in_(requirement_ids))
+        .delete(synchronize_session=False)
+    )
+    evidence_deletes = (
+        session.query(ExtractionEvidence)
+        .filter(ExtractionEvidence.requirement_id.in_(requirement_ids))
+        .delete(synchronize_session=False)
+    )
+    requirement_deletes = (
+        session.query(OrderRequirement)
+        .filter(OrderRequirement.id.in_(requirement_ids))
+        .delete(synchronize_session=False)
+    )
+    return {
+        "orphan_requirement_count": requirement_deletes,
+        "orphan_binding_count": binding_deletes,
+        "orphan_evidence_count": evidence_deletes,
+    }
+
+
+def reset_initial_review_records(session: Session) -> dict:
+    rules_row = session.get(SystemConfig, "initial_review_rules_json")
+    deleted_ids_row = session.get(SystemConfig, "initial_review_workflow_rule_deleted_ids_json")
+    required_fields_row = session.get(SystemConfig, "initial_review_required_fields_json")
+    rules = loads(rules_row.value if rules_row is not None else "[]", [])
+    deleted_ids = loads(deleted_ids_row.value if deleted_ids_row is not None else "[]", [])
+    required_fields = loads(required_fields_row.value if required_fields_row is not None else "[]", [])
+    rule_count = len(rules) if isinstance(rules, list) else 0
+    deleted_id_count = len(deleted_ids) if isinstance(deleted_ids, list) else 0
+    required_field_count = len(required_fields) if isinstance(required_fields, list) else 0
+    set_config(session, "initial_review_enabled", "true", is_secret=False)
+    set_config(session, "initial_review_required_fields_json", dumps(DEFAULT_REQUIRED_FIELDS), is_secret=False)
+    set_config(session, "initial_review_rules_json", "[]", is_secret=False)
+    set_config(session, "initial_review_workflow_rule_deleted_ids_json", "[]", is_secret=False)
+    return {
+        "initial_review_rule_count": rule_count,
+        "initial_review_deleted_rule_marker_count": deleted_id_count,
+        "initial_review_required_field_count": required_field_count,
+    }
+
+
 def runtime_startup_readiness(session: Session, overrides: dict | None = None) -> dict:
     overrides = overrides or {}
     missing: list[str] = []
@@ -298,8 +489,16 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
         missing.append("bot邮箱密码")
 
     departments = session.query(ProductionDepartment).filter_by(status="Active").all()
-    if not any(as_list(dept.mail_to_json) for dept in departments):
-        missing.append("生产部门邮箱")
+    production_main_recipients: list[str] = []
+    invalid_production_main_recipients: list[str] = []
+    for dept in departments:
+        recipients = normalize_email_values(as_list(dept.mail_to_json))
+        production_main_recipients.extend(recipients)
+        invalid_production_main_recipients.extend(invalid_email_addresses(recipients))
+    if not production_main_recipients:
+        missing.append("生产部门主送邮箱")
+    elif invalid_production_main_recipients:
+        missing.append(f"生产部门主送邮箱格式不合法：{', '.join(invalid_production_main_recipients)}")
 
     return {"ready": not missing, "missing": missing}
 
@@ -421,6 +620,40 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
         set_config(session, key, str(value), is_secret=key in secret_keys)
     session.commit()
     return config(session)
+
+
+@app.post("/api/system/business-data/clear")
+def clear_business_data(payload: AdminPasswordRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    require_admin_password(payload.admin_password)
+    task_detail = clear_task_records(session)
+    orphan_requirement_detail = clear_remaining_requirement_records(session)
+    workflow_detail = clear_workflow_records(session)
+    initial_review_detail = reset_initial_review_records(session)
+    actor = getattr(request.state, "username", "system")
+    detail = {
+        **task_detail,
+        **orphan_requirement_detail,
+        **workflow_detail,
+        **initial_review_detail,
+    }
+    session.add(
+        AuditEvent(
+            event_type="BusinessDataCleared",
+            actor=actor,
+            related_object_type="System",
+            related_object_id="business-data",
+            detail=dumps(detail),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {
+        "ok": True,
+        "cleared": detail,
+        "task_count": task_detail["task_count"],
+        "workflow_count": workflow_detail["workflow_definition_count"],
+        "initial_review_rule_count": initial_review_detail["initial_review_rule_count"],
+    }
 
 
 @app.get("/api/initial-review/rules")
@@ -966,90 +1199,8 @@ def tasks(
 @app.post("/api/tasks/clear")
 def clear_tasks(payload: TaskClearRequest, request: Request, session: Session = Depends(get_session)) -> dict:
     require_admin_password(payload.admin_password)
-
-    tasks_to_clear = session.query(ProductionTask).all()
-    task_ids = [task.id for task in tasks_to_clear]
-    requirement_ids = [task.requirement_id for task in tasks_to_clear]
-    version_ids = [
-        row.id
-        for row in session.query(ProductionTaskVersion.id).filter(ProductionTaskVersion.task_id.in_(task_ids)).all()
-    ] if task_ids else []
-
-    mail_updates = 0
-    outbound_updates = 0
-    exception_updates = 0
-    question_deletes = 0
-    version_deletes = 0
-    binding_deletes = 0
-    evidence_deletes = 0
-    requirement_deletes = 0
-    task_deletes = 0
-
-    if task_ids:
-        mail_updates = (
-            session.query(MailMessage)
-            .filter(MailMessage.related_task_id.in_(task_ids))
-            .update({MailMessage.related_task_id: None}, synchronize_session=False)
-        )
-        exception_updates = (
-            session.query(ExceptionCase)
-            .filter(ExceptionCase.related_task_id.in_(task_ids))
-            .update({ExceptionCase.related_task_id: None}, synchronize_session=False)
-        )
-        outbound_query = session.query(OutboundMailJob).filter(OutboundMailJob.related_task_id.in_(task_ids))
-        if version_ids:
-            outbound_query = session.query(OutboundMailJob).filter(
-                or_(OutboundMailJob.related_task_id.in_(task_ids), OutboundMailJob.related_version_id.in_(version_ids))
-            )
-        outbound_updates = outbound_query.update(
-            {OutboundMailJob.related_task_id: None, OutboundMailJob.related_version_id: None},
-            synchronize_session=False,
-        )
-        question_deletes = (
-            session.query(QuestionAndReply)
-            .filter(QuestionAndReply.task_id.in_(task_ids))
-            .delete(synchronize_session=False)
-        )
-        version_deletes = (
-            session.query(ProductionTaskVersion)
-            .filter(ProductionTaskVersion.task_id.in_(task_ids))
-            .delete(synchronize_session=False)
-        )
-        task_deletes = (
-            session.query(ProductionTask)
-            .filter(ProductionTask.id.in_(task_ids))
-            .delete(synchronize_session=False)
-        )
-
-    if requirement_ids:
-        binding_deletes = (
-            session.query(RequirementWorkflowBinding)
-            .filter(RequirementWorkflowBinding.requirement_id.in_(requirement_ids))
-            .delete(synchronize_session=False)
-        )
-        evidence_deletes = (
-            session.query(ExtractionEvidence)
-            .filter(ExtractionEvidence.requirement_id.in_(requirement_ids))
-            .delete(synchronize_session=False)
-        )
-        requirement_deletes = (
-            session.query(OrderRequirement)
-            .filter(OrderRequirement.id.in_(requirement_ids))
-            .delete(synchronize_session=False)
-        )
-
+    detail = clear_task_records(session)
     actor = getattr(request.state, "username", "system")
-    detail = {
-        "task_count": task_deletes,
-        "requirement_count": requirement_deletes,
-        "version_count": version_deletes,
-        "question_count": question_deletes,
-        "binding_count": binding_deletes,
-        "evidence_count": evidence_deletes,
-        "mail_links_cleared": mail_updates,
-        "outbound_links_cleared": outbound_updates,
-        "exception_links_cleared": exception_updates,
-    }
     session.add(
         AuditEvent(
             event_type="TaskListCleared",
@@ -1061,7 +1212,7 @@ def clear_tasks(payload: TaskClearRequest, request: Request, session: Session = 
         )
     )
     session.commit()
-    return {"cleared": task_deletes, **detail}
+    return {"cleared": detail["task_count"], **detail}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -2117,6 +2268,345 @@ def chat_model_provider(payload: ModelChatTestRequest, session: Session = Depend
     return {"ok": True, "reply": extract_chat_content(output), "raw": output}
 
 
+@app.get("/api/self-maintenance/context")
+def self_maintenance_context(session: Session = Depends(get_session)) -> dict:
+    return build_self_maintenance_context(session)
+
+
+@app.post("/api/self-maintenance/diagnose")
+def self_maintenance_diagnose(
+    payload: SelfMaintenanceDiagnoseRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        row = create_maintenance_diagnosis(
+            session,
+            user_message=payload.message,
+            actor=getattr(request.state, "username", "system"),
+            use_llm=payload.use_llm,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceDiagnosed",
+            actor=getattr(request.state, "username", "system"),
+            related_object_type="MaintenanceSession",
+            related_object_id=row.id,
+            detail=dumps({"risk_level": row.risk_level}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_session(row, include_context=True)
+
+
+@app.post("/api/self-maintenance/code-plan")
+def self_maintenance_code_plan(
+    payload: SelfMaintenanceCodePlanRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        row = create_code_patch_plan(
+            session,
+            user_message=payload.message,
+            actor=getattr(request.state, "username", "system"),
+            source_session_id=payload.session_id,
+            use_llm=payload.use_llm,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceCodePlanCreated",
+            actor=getattr(request.state, "username", "system"),
+            related_object_type="MaintenanceSession",
+            related_object_id=row.id,
+            detail=dumps({"risk_level": row.risk_level}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return self_maintenance_session_detail(row.id, session)
+
+
+@app.get("/api/self-maintenance/sessions")
+def list_self_maintenance_sessions(
+    include_archived: bool = False,
+    status: str | None = None,
+    risk_level: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(MaintenanceSession)
+    if not include_archived:
+        query = query.filter(MaintenanceSession.status != "Archived")
+    if status and status.strip():
+        query = query.filter(MaintenanceSession.status == status.strip())
+    if risk_level and risk_level.strip():
+        query = query.filter(MaintenanceSession.risk_level == risk_level.strip())
+    return page_response(
+        query.order_by(MaintenanceSession.created_at.desc()),
+        serialize_maintenance_session,
+        page,
+        page_size,
+        {
+            "status_options": distinct_values(session, MaintenanceSession.status),
+            "risk_level_options": distinct_values(session, MaintenanceSession.risk_level),
+        },
+    )
+
+
+@app.get("/api/self-maintenance/sessions/{session_id}")
+def self_maintenance_session_detail(session_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(MaintenanceSession, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="maintenance session not found")
+    actions = (
+        session.query(MaintenanceAction)
+        .filter_by(session_id=session_id)
+        .order_by(MaintenanceAction.created_at)
+        .all()
+    )
+    return {
+        **serialize_maintenance_session(row, include_context=True),
+        "actions": [serialize_maintenance_action(action) for action in actions],
+        "timeline": maintenance_session_timeline(session, session_id)["timeline"],
+    }
+
+
+@app.get("/api/self-maintenance/sessions/{session_id}/timeline")
+def self_maintenance_session_timeline(session_id: str, session: Session = Depends(get_session)) -> dict:
+    try:
+        return maintenance_session_timeline(session, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/self-maintenance/sessions/{session_id}/archive")
+def self_maintenance_session_archive(
+    session_id: str,
+    payload: SelfMaintenanceSessionArchiveRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        row = archive_maintenance_session(session, session_id, note=payload.note, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return serialize_maintenance_session(row, include_context=True)
+
+
+@app.get("/api/self-maintenance/actions")
+def list_self_maintenance_actions(
+    action_type: str | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(MaintenanceAction)
+    if action_type and action_type.strip():
+        query = query.filter(MaintenanceAction.action_type == action_type.strip())
+    if status and status.strip():
+        query = query.filter(MaintenanceAction.status == status.strip())
+    return page_response(
+        query.order_by(MaintenanceAction.created_at.desc()),
+        serialize_maintenance_action,
+        page,
+        page_size,
+        {
+            "action_type_options": distinct_values(session, MaintenanceAction.action_type),
+            "status_options": distinct_values(session, MaintenanceAction.status),
+        },
+    )
+
+
+@app.get("/api/self-maintenance/actions/{action_id}")
+def self_maintenance_action_detail(action_id: str, session: Session = Depends(get_session)) -> dict:
+    action = session.get(MaintenanceAction, action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="maintenance action not found")
+    maintenance_session = session.get(MaintenanceSession, action.session_id)
+    payload = serialize_maintenance_action(action)
+    payload["session"] = serialize_maintenance_session(maintenance_session) if maintenance_session else None
+    payload["timeline"] = maintenance_session_timeline(session, action.session_id)["timeline"] if maintenance_session else []
+    return payload
+
+
+@app.post("/api/self-maintenance/actions/{action_id}/apply")
+def self_maintenance_action_apply(
+    action_id: str,
+    payload: SelfMaintenanceActionApplyRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        action = apply_maintenance_action(session, action_id, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceActionApplied",
+            actor=actor,
+            related_object_type="MaintenanceAction",
+            related_object_id=action.id,
+            detail=dumps({"action_type": action.action_type, "result": loads(action.result_json, {})}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_action(action)
+
+
+@app.post("/api/self-maintenance/actions/{action_id}/implementation")
+def self_maintenance_action_implementation(
+    action_id: str,
+    payload: SelfMaintenanceImplementationReportRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        action = report_maintenance_implementation(
+            session,
+            action_id,
+            status=payload.status,
+            summary=payload.summary,
+            changed_files=payload.changed_files,
+            tests=payload.tests,
+            residual_risks=payload.residual_risks,
+            actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceImplementationReported",
+            actor=actor,
+            related_object_type="MaintenanceAction",
+            related_object_id=action.id,
+            detail=dumps({"status": action.status, "result": loads(action.result_json, {}).get("implementation", {})}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_action(action)
+
+
+@app.post("/api/self-maintenance/actions/{action_id}/handoff")
+def self_maintenance_action_handoff(
+    action_id: str,
+    payload: SelfMaintenanceHandoffRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        action = create_maintenance_handoff_package(session, action_id, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceHandoffCreated",
+            actor=actor,
+            related_object_type="MaintenanceAction",
+            related_object_id=action.id,
+            detail=dumps({"status": action.status, "handoff": loads(action.result_json, {}).get("handoff", {})}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_action(action)
+
+
+@app.post("/api/self-maintenance/actions/{action_id}/validate")
+def self_maintenance_action_validate(
+    action_id: str,
+    payload: SelfMaintenanceValidationRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        action = run_maintenance_validation(
+            session,
+            action_id,
+            selected_commands=payload.commands or None,
+            timeout_seconds=payload.timeout_seconds,
+            actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceValidationCompleted",
+            actor=actor,
+            related_object_type="MaintenanceAction",
+            related_object_id=action.id,
+            detail=dumps({"status": action.status, "validation": loads(action.result_json, {}).get("validation", {})}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_action(action)
+
+
+@app.get("/api/self-maintenance/actions/{action_id}/handoff")
+def self_maintenance_action_handoff_detail(
+    action_id: str,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        return read_maintenance_handoff_package(session, action_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/self-maintenance/actions/{action_id}/review")
+def self_maintenance_action_review(
+    action_id: str,
+    payload: SelfMaintenanceReviewRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_admin_password(payload.admin_password)
+    actor = getattr(request.state, "username", "system")
+    try:
+        action = review_maintenance_implementation(
+            session,
+            action_id,
+            decision=payload.decision,
+            note=payload.note,
+            actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.add(
+        AuditEvent(
+            event_type="SelfMaintenanceImplementationReviewed",
+            actor=actor,
+            related_object_type="MaintenanceAction",
+            related_object_id=action.id,
+            detail=dumps({"status": action.status, "review": loads(action.result_json, {}).get("review", {})}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_maintenance_action(action)
+
+
 @app.get("/api/departments")
 def list_departments(
     q: str | None = None,
@@ -2139,27 +2629,94 @@ def list_departments(
         )
     if status and status.strip():
         query = query.filter(ProductionDepartment.status == status.strip())
+    else:
+        query = query.filter(ProductionDepartment.status != "Deleted")
     return page_response(
         query.order_by(ProductionDepartment.department_code),
         serialize_department,
         page,
         page_size,
-        {"status_options": distinct_values(session, ProductionDepartment.status)},
+        {
+            "status_options": [
+                value
+                for value in distinct_values(session, ProductionDepartment.status)
+                if value != "Deleted"
+            ]
+        },
     )
+
+
+def save_production_department(payload: DepartmentUpsert, session: Session) -> dict:
+    department_code = str(payload.department_code or "").strip()
+    department_name = str(payload.department_name or "").strip()
+    if not department_code:
+        raise HTTPException(status_code=400, detail="部门编码必填")
+    if not department_name:
+        raise HTTPException(status_code=400, detail="部门名称必填")
+    mail_to = normalize_email_values(payload.mail_to)
+    mail_cc = normalize_email_values(payload.mail_cc)
+    invalid_to = invalid_email_addresses(mail_to)
+    invalid_cc = invalid_email_addresses(mail_cc)
+    if invalid_to:
+        raise HTTPException(status_code=400, detail=f"主送邮箱格式不合法：{', '.join(invalid_to)}")
+    if invalid_cc:
+        raise HTTPException(status_code=400, detail=f"抄送邮箱格式不合法：{', '.join(invalid_cc)}")
+    dept = session.query(ProductionDepartment).filter_by(department_code=department_code).one_or_none()
+    if dept is None:
+        dept = ProductionDepartment(department_code=department_code)
+        session.add(dept)
+    dept.department_name = department_name
+    dept.mail_to_json = dumps(mail_to)
+    dept.mail_cc_json = dumps(mail_cc)
+    dept.status = "Active"
+    session.commit()
+    return {"ok": True, "department_id": dept.id}
+
+
+@app.post("/api/departments")
+def create_or_update_department(payload: DepartmentUpsert, session: Session = Depends(get_session)) -> dict:
+    return save_production_department(payload, session)
+
+
+@app.delete("/api/departments/{department_id}")
+def delete_department(department_id: str, request: Request, session: Session = Depends(get_session)) -> dict:
+    dept = session.get(ProductionDepartment, department_id)
+    if dept is None or dept.status == "Deleted":
+        raise HTTPException(status_code=404, detail="production department not found")
+    dept.status = "Deleted"
+    dept.updated_at = now_utc()
+    session.flush()
+    bot_was_enabled = system_config_bool(session, "bot_enabled", False)
+    readiness = runtime_startup_readiness(session)
+    bot_disabled = False
+    if bot_was_enabled and not readiness["ready"]:
+        set_config(session, "bot_enabled", "false", is_secret=False)
+        bot_disabled = True
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="ProductionDepartmentDeleted",
+            actor=actor,
+            related_object_type="ProductionDepartment",
+            related_object_id=dept.id,
+            detail=dumps(
+                {
+                    "department_code": dept.department_code,
+                    "department_name": dept.department_name,
+                    "bot_disabled": bot_disabled,
+                    "startup_missing": readiness["missing"],
+                }
+            ),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"ok": True, "department": serialize_department(dept), "bot_disabled": bot_disabled}
 
 
 @app.put("/api/departments/default")
 def upsert_default_department(payload: DepartmentUpsert, session: Session = Depends(get_session)) -> dict:
-    dept = session.query(ProductionDepartment).filter_by(department_code=payload.department_code).one_or_none()
-    if dept is None:
-        dept = ProductionDepartment(department_code=payload.department_code)
-        session.add(dept)
-    dept.department_name = payload.department_name
-    dept.mail_to_json = dumps([str(email) for email in payload.mail_to])
-    dept.mail_cc_json = dumps([str(email) for email in payload.mail_cc])
-    dept.status = "Active"
-    session.commit()
-    return {"ok": True, "department_id": dept.id}
+    return save_production_department(payload, session)
 
 
 @app.get("/api/templates/production-task")

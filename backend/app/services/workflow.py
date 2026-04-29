@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_
@@ -195,7 +196,10 @@ def recipient_hash(to_addresses: list[str], cc_addresses: list[str]) -> str:
 
 
 def primary_department(session: Session) -> ProductionDepartment:
-    department = session.query(ProductionDepartment).filter_by(status="Active").first()
+    departments = session.query(ProductionDepartment).filter_by(status="Active").order_by(ProductionDepartment.department_code).all()
+    department = next((item for item in departments if as_list(item.mail_to_json)), None)
+    if department is None and departments:
+        department = departments[0]
     if department is None:
         department = ProductionDepartment(department_code="default", department_name="默认生产部门")
         session.add(department)
@@ -495,7 +499,7 @@ def find_evidence_line(text: str, value: str) -> str:
 
 
 def route_is_configured(session: Session) -> bool:
-    return bool(as_list(primary_department(session).mail_to_json))
+    return any(as_list(department.mail_to_json) for department in session.query(ProductionDepartment).filter_by(status="Active").all())
 
 
 WORKFLOW_EXTRA_FIELD_LABELS = {
@@ -546,6 +550,8 @@ def upsert_requirement_workflow_binding(
         cc_names,
         salesperson_email=requirement.salesperson_email,
     )
+    if unresolved_to:
+        to_emails = []
     required_fields = [str(item) for item in rule.get("required_fields", []) if str(item).strip()]
     extracted_fields = extract_workflow_fields(source_text, required_fields)
     missing_labels: list[str] = []
@@ -597,17 +603,6 @@ def upsert_requirement_workflow_binding(
                 risk_flags.append(flag)
 
     unresolved_contacts = sorted(set(unresolved_to + unresolved_cc))
-    for name in unresolved_contacts:
-        message = f"流程收件人未映射邮箱：{name}"
-        failures.append(
-            ReviewFailure(
-                field="source_text",
-                field_label="流程路由",
-                rule_name="流程路由校验",
-                message=message,
-            )
-        )
-        risk_flags.append(message)
 
     binding = workflow_binding_for_requirement(session, requirement.id)
     if binding is None:
@@ -640,6 +635,16 @@ def upsert_requirement_workflow_binding(
     binding.unresolved_contacts_json = dumps(unresolved_contacts)
     binding.updated_at = now_utc()
     session.flush()
+    failures = [
+        replace(
+            failure,
+            workflow_code=binding.workflow_code,
+            workflow_name=binding.workflow_name,
+            workflow_version_id=binding.workflow_version_id or "",
+            is_workflow_rule=True,
+        )
+        for failure in failures
+    ]
     return binding, failures, missing_labels, risk_flags
 
 
@@ -648,7 +653,7 @@ def routing_for_requirement(
     requirement: OrderRequirement,
 ) -> tuple[list[str], list[str], RequirementWorkflowBinding | None]:
     binding = workflow_binding_for_requirement(session, requirement.id)
-    if binding is not None and as_list(binding.route_to_json):
+    if binding is not None:
         return as_list(binding.route_to_json), as_list(binding.route_cc_json), binding
     department = primary_department(session)
     return as_list(department.mail_to_json), as_list(department.mail_cc_json), binding
@@ -866,6 +871,9 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
                 "message": f"订单初审已通过，但{routing_message}，系统无法自动创建生产任务。",
                 "action_hint": routing_hint,
                 "workflow_code": binding.workflow_code if binding is not None else None,
+                "workflow_name": binding.workflow_name if binding is not None else None,
+                "workflow_version_id": binding.workflow_version_id if binding is not None else None,
+                "unresolved_contacts": as_list(binding.unresolved_contacts_json) if binding is not None else [],
             },
             source_mail_id=mail.id,
         )
@@ -1068,6 +1076,9 @@ def handle_requirement_supplement_reply(session: Session, mail: MailMessage) -> 
                 "message": f"订单初审已通过，但{routing_message}，系统无法自动创建生产任务。",
                 "action_hint": routing_hint,
                 "workflow_code": binding.workflow_code if binding is not None else None,
+                "workflow_name": binding.workflow_name if binding is not None else None,
+                "workflow_version_id": binding.workflow_version_id if binding is not None else None,
+                "unresolved_contacts": as_list(binding.unresolved_contacts_json) if binding is not None else [],
             },
             source_mail_id=mail.id,
         )
@@ -1109,7 +1120,10 @@ def enqueue_initial_review_rejection(
     existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
     if existing is not None:
         return existing
-    reason_lines = []
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    reason_lines: list[str] = []
+    workflow_rule_lines: list[str] = []
+    other_reason_lines: list[str] = []
     duplicate_submission = False
     for failure in failures:
         message = getattr(failure, "message", str(failure)).strip()
@@ -1118,8 +1132,29 @@ def enqueue_initial_review_rejection(
             duplicate_submission = True
         if message and message not in reason_lines:
             reason_lines.append(message)
+        display_message = f"{rule_name}：{message}" if rule_name and rule_name not in message else message
+        is_workflow_failure = bool(getattr(failure, "is_workflow_rule", False))
+        failure_workflow_version_id = str(getattr(failure, "workflow_version_id", "") or "")
+        if binding is not None and not is_workflow_failure and failure_workflow_version_id:
+            is_workflow_failure = failure_workflow_version_id == binding.workflow_version_id
+        if display_message:
+            target_lines = workflow_rule_lines if is_workflow_failure else other_reason_lines
+            if display_message not in target_lines:
+                target_lines.append(display_message)
     if not reason_lines:
         reason_lines = ["订单信息未通过系统初审，请补充完整后回复本邮件。"]
+    if binding is None:
+        workflow_context_lines = [
+            "当前使用流程：系统通用初审（未匹配专属流程）",
+            "流程编号：SYSTEM_INITIAL_REVIEW",
+            "流程版本ID：N/A",
+        ]
+    else:
+        workflow_context_lines = [
+            f"当前使用流程：{binding.workflow_name or binding.workflow_code or '未命名流程'}",
+            f"流程编号：{binding.workflow_code or '未配置'}",
+            f"流程版本ID：{binding.workflow_version_id or '未记录'}",
+        ]
     mail_type = "RequirementSupplementRequest"
     subject = f"[订单信息待补充][{requirement.internal_order_no}] 请补充生产任务单信息"
     if duplicate_submission:
@@ -1136,6 +1171,8 @@ def enqueue_initial_review_rejection(
                 "系统检测到同一需求在24小时内已提交并受理，本次不会重复创建任务。",
                 *([f"已受理任务号：{duplicate_task_no}"] if duplicate_task_no else []),
                 "",
+                *workflow_context_lines,
+                "",
                 "如需调整内容，请回复“订单变更 + 任务号”；如需撤回，请回复“撤回需求 + 任务号”（生产确认排单前有效）。",
                 "",
                 get_config(session, "bot_signature", "积木易搭AI机器人"),
@@ -1147,7 +1184,11 @@ def enqueue_initial_review_rejection(
                 "销售同事好，",
                 "",
                 "收到订单需求后，系统初审未通过，请按以下原因补充或修正后回复本邮件：",
-                *[f"- {reason}" for reason in reason_lines],
+                *workflow_context_lines,
+                "",
+                "未满足该流程下的规则：",
+                *[f"- {reason}" for reason in (workflow_rule_lines or ["无流程专属规则未通过；本次由系统通用初审规则拦截。"])],
+                *(["", "其他初审原因：", *[f"- {reason}" for reason in other_reason_lines]] if other_reason_lines else []),
                 "",
                 f"当前识别客户：{requirement.customer_name or '未识别'}",
                 f"当前识别产品：{requirement.product_summary or '未识别'}",

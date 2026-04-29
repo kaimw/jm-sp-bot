@@ -4,10 +4,10 @@ import email
 import imaplib
 import smtplib
 from dataclasses import dataclass, field
-from email.header import decode_header
+from email.header import Header, decode_header
 from email.message import EmailMessage
 from email.policy import default
-from email.utils import formataddr, getaddresses
+from email.utils import encode_rfc2231, formataddr, getaddresses
 from html import unescape
 import re
 
@@ -30,6 +30,8 @@ from backend.app.services.workflow import (
     get_config,
     record_exception_case,
 )
+
+OUTBOUND_EMAIL_POLICY = default.clone(max_line_length=998)
 
 
 @dataclass
@@ -57,10 +59,93 @@ def decode_mime(value: str | None) -> str:
     parts: list[str] = []
     for content, charset in decode_header(value):
         if isinstance(content, bytes):
-            parts.append(content.decode(charset or "utf-8", errors="replace"))
+            parts.append(decode_header_bytes(content, charset))
         else:
-            parts.append(content)
+            parts.append(repair_mojibake_text(content))
     return "".join(parts)
+
+
+def decode_header_bytes(content: bytes, charset: str | None) -> str:
+    candidates = []
+    if charset:
+        candidates.append(str(charset).strip().lower())
+    candidates.extend(["utf-8", "gb18030", "gbk", "big5", "latin-1"])
+    seen: set[str] = set()
+    fallback = content.decode("utf-8", errors="replace")
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            decoded = content.decode(candidate)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        if "\ufffd" not in decoded:
+            return decoded
+        fallback = decoded
+    return fallback
+
+
+def has_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def repair_mojibake_text(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if any(0xDC80 <= ord(char) <= 0xDCFF for char in text):
+        raw = text.encode("ascii", errors="surrogateescape")
+        for target_encoding in ("utf-8", "gb18030", "gbk", "big5"):
+            try:
+                repaired = raw.decode(target_encoding)
+            except UnicodeDecodeError:
+                continue
+            if repaired and "\ufffd" not in repaired:
+                return repaired
+    latin1_like = sum(1 for char in text if 0x80 <= ord(char) <= 0xFF)
+    if latin1_like >= 2 or any(marker in text for marker in ("Ã", "Â", "�")):
+        for source_encoding in ("latin-1", "cp1252"):
+            try:
+                raw = text.encode(source_encoding)
+            except UnicodeEncodeError:
+                continue
+            for target_encoding in ("utf-8", "gb18030", "gbk", "big5"):
+                try:
+                    repaired = raw.decode(target_encoding)
+                except UnicodeDecodeError:
+                    continue
+                if repaired != text and ("\ufffd" not in repaired) and (has_cjk(repaired) or target_encoding == "utf-8"):
+                    return repaired
+    return text
+
+
+def decode_attachment_filename(part) -> str:
+    filename = decode_mime(part.get_filename())
+    if filename and "\ufffd" not in filename:
+        return filename
+    for header_name, param_name in (("Content-Disposition", "filename"), ("Content-Type", "name")):
+        raw_header_value = next((value for name, value in part.raw_items() if name.lower() == header_name.lower()), "")
+        matched = re.search(rf"{param_name}\*?\s*=\s*(?:\"([^\"]*)\"|([^;\s]+))", raw_header_value, flags=re.IGNORECASE)
+        if not matched:
+            continue
+        raw_value = matched.group(1) if matched.group(1) is not None else matched.group(2)
+        repaired = decode_mime(raw_value)
+        if repaired and "\ufffd" not in repaired:
+            return repaired
+    for header_name, param_name in (("Content-Disposition", "filename"), ("Content-Type", "name")):
+        value = part.get_param(param_name, header=header_name, unquote=True)
+        fallback = decode_mime(value)
+        if fallback:
+            return fallback
+    return filename or ""
+
+
+def apply_attachment_filename_compatibility(part, file_name: str, content_type: str) -> None:
+    encoded_word = Header(file_name, "utf-8", maxlinelen=1000).encode()
+    rfc2231 = encode_rfc2231(file_name, "utf-8")
+    part.replace_header("Content-Type", f'{content_type}; name="{encoded_word}"')
+    part.replace_header("Content-Disposition", f'attachment; filename="{encoded_word}"; filename*={rfc2231}')
 
 
 def strip_html(html: str) -> str:
@@ -96,7 +181,7 @@ def parse_email_bytes(raw: bytes) -> IncomingEmail:
         if part.is_multipart():
             continue
         if content_disposition == "attachment":
-            file_name = decode_mime(part.get_filename()) or "attachment.bin"
+            file_name = decode_attachment_filename(part) or "attachment.bin"
             attachments.append(
                 IncomingAttachment(
                     file_name=file_name,
@@ -450,7 +535,7 @@ def send_outbound_jobs_with_account(
             reserve_mail_send(username, interval_seconds=interval_seconds)
             send_attempts += 1
             try:
-                msg = EmailMessage()
+                msg = EmailMessage(policy=OUTBOUND_EMAIL_POLICY)
                 msg["From"] = formataddr((display_name, username))
                 msg["To"] = ", ".join(as_list(job.to_json))
                 if as_list(job.cc_json):
@@ -497,7 +582,7 @@ def send_direct_smtp(
     recipients = to_addresses + (cc_addresses or [])
     if not recipients:
         raise RuntimeError("smtp recipients are not configured")
-    msg = EmailMessage()
+    msg = EmailMessage(policy=OUTBOUND_EMAIL_POLICY)
     msg["From"] = formataddr((display_name, username))
     msg["To"] = ", ".join(to_addresses)
     if cc_addresses:
@@ -533,5 +618,6 @@ def attach_original_order_files(session: Session, msg: EmailMessage, job: Outbou
         try:
             maintype, subtype = (asset.content_type or "application/octet-stream").split("/", 1)
             msg.add_attachment(read_storage(asset.storage_ref), maintype=maintype, subtype=subtype, filename=asset.file_name)
+            apply_attachment_filename_compatibility(msg.get_payload()[-1], asset.file_name, f"{maintype}/{subtype}")
         except Exception as exc:
             record_attachment_parse_exception(session, asset, f"attach outbound failed: {exc}")
