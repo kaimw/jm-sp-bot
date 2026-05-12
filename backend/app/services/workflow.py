@@ -43,6 +43,10 @@ from backend.app.services.workflow_rules import (
     upsert_mail_workflow_match,
     workflow_binding_for_requirement,
 )
+from backend.app.services.products import (
+    extract_products_with_llm,
+    review_order_products,
+)
 
 
 TASK_NO_PATTERN = re.compile(r"PT-\d{8}-\d{4}", re.IGNORECASE)
@@ -812,13 +816,43 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
             required_fields_override=[],
             rules_override=[],
         )
-    all_failures = [*review.failures, *workflow_failures]
+    
+    # ---------------------------------------------------------
+    # Product Management Review Integration
+    # ---------------------------------------------------------
+    product_review_failures = []
+    product_risk_flags = []
+    if requirement.product_summary:
+        extracted_items = extract_products_with_llm(session, requirement.product_summary)
+        if extracted_items:
+            reviewed_items = review_order_products(session, extracted_items)
+            for item in reviewed_items:
+                res = item.get("review", {})
+                if res.get("status") in ("Exception", "Warning"):
+                    flags = res.get("risk_flags", [])
+                    product_risk_flags.extend(flags)
+                    for f in flags:
+                        product_review_failures.append(
+                            ReviewFailure(
+                                field="product_summary",
+                                field_label="产品明细审核",
+                                rule_name="商品中台合规校验",
+                                message=f"产品 {item.get('sku_code', 'Unknown')} 审核失败: {f}",
+                            )
+                        )
+            
+            # Save the structured items back to requirement or a new field if needed.
+            # Since we didn't add a field to OrderRequirement for this, we will just 
+            # log it in the audit or risk flags for now.
+    # ---------------------------------------------------------
+
+    all_failures = [*review.failures, *workflow_failures, *product_review_failures]
     merged_missing_fields: list[str] = []
     for label in [*review.missing_fields, *workflow_missing_fields]:
         if label and label not in merged_missing_fields:
             merged_missing_fields.append(label)
     merged_risk_flags: list[str] = []
-    for flag in [*review.risk_flags, *workflow_risk_flags]:
+    for flag in [*review.risk_flags, *workflow_risk_flags, *product_risk_flags]:
         if flag and flag not in merged_risk_flags:
             merged_risk_flags.append(flag)
     requirement.missing_fields_json = dumps(merged_missing_fields)

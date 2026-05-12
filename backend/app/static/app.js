@@ -24,6 +24,10 @@ const tableStates = {
   reviewRules: { q: "", status: "", page: 1, page_size: 10 },
   selfMaintenanceSessions: { status: "", risk_level: "", page: 1, page_size: 5 },
   selfMaintenanceActions: { action_type: "", status: "", page: 1, page_size: 8 },
+  productsSpu: { q: "", page: 1, page_size: 10 },
+  productsSku: { spu_id: "", page: 1, page_size: 10 },
+  productsPricing: { sku_id: "", page: 1, page_size: 10 },
+  productsPromotions: { page: 1, page_size: 10 },
 };
 
 async function api(path, options = {}) {
@@ -2095,6 +2099,10 @@ async function refreshAll() {
     refreshMails(),
     refreshOps(),
     loadTemplate(),
+    refreshProductsSpu(),
+    refreshProductsSku(),
+    refreshProductsPricing(),
+    refreshProductsPromotions(),
   ]);
 }
 
@@ -3394,6 +3402,373 @@ function formatE2EResult(result) {
   ];
   return lines.join("\n");
 }
+
+// ==========================================
+// Product Management Logic
+// ==========================================
+
+async function refreshProductsSpu() {
+  const data = await api(`/api/products/spu?${queryFromState(tableStates.productsSpu)}`);
+  const rows = data.items || [];
+  $("#products-spu-list").innerHTML = rows.map(row => `
+    <div class="row">
+      <div><strong>${h(row.spu_id)}</strong><br /><small>${h(row.name)}</small></div>
+      <div><small>${h(row.brand || "-")}</small><br /><small>${h(row.category || "-")}</small></div>
+      <div><small>${h(formatTime(row.created_at))}</small></div>
+    </div>
+  `).join("") || `<div class="row"><div>暂无 SPU 数据</div></div>`;
+  renderListPagination("#products-spu-pagination", "productsSpu", data);
+}
+
+async function refreshProductsSku() {
+  const data = await api(`/api/products/sku?${queryFromState(tableStates.productsSku)}`);
+  const rows = data.items || [];
+  $("#products-sku-list").innerHTML = rows.map(row => `
+    <div class="row">
+      <div><strong>${h(row.sku_id)}</strong><br /><small>${h(JSON.stringify(row.attributes))}</small></div>
+      <div><a href="#" class="link" data-action="goto-spu" data-spu="${h(row.spu_id)}">${h(row.spu_id)}</a></div>
+      <div><small>${h(row.status)}</small><br /><a href="#" class="link" data-action="quick-new-pricing" data-sku-uuid="${h(row.id)}" data-sku-id="${h(row.sku_id)}">配置价格</a></div>
+      <div><small>${h(formatTime(row.created_at))}</small></div>
+    </div>
+  `).join("") || `<div class="row"><div>暂无 SKU 数据</div></div>`;
+  renderListPagination("#products-sku-pagination", "productsSku", data);
+}
+
+async function refreshProductsPricing() {
+  const data = await api(`/api/pricing?${queryFromState(tableStates.productsPricing)}`);
+  const rows = data.items || [];
+  $("#products-pricing-list").innerHTML = rows.map(row => `
+    <div class="row">
+      <div><strong>${h(row.channel)}</strong> / <a href="#" class="link" data-action="goto-sku" data-sku="${h(row.sku_id)}">${h(row.sku_id)}</a><br /><small>${h(row.currency)}</small></div>
+      <div>
+        <small>A: ${h(row.tier_a_price || "-")} | B: ${h(row.tier_b_price || "-")} | C: ${h(row.tier_c_price || "-")}</small>
+        ${row.promo_start_time ? `<br/><small class="text-secondary">${h(formatTime(row.promo_start_time))} 至 ${h(formatTime(row.promo_end_time))}</small>` : ""}
+      </div>
+      <div><strong>${h(row.map_price)}</strong></div>
+      <div><small>${h(formatTime(row.updated_at))}</small></div>
+    </div>
+  `).join("") || `<div class="row"><div>暂无定价数据</div></div>`;
+  renderListPagination("#products-pricing-pagination", "productsPricing", data);
+}
+
+async function refreshProductsPromotions() {
+  const data = await api(`/api/promotions?${queryFromState(tableStates.productsPromotions)}`);
+  const rows = data.items || [];
+  $("#products-promotions-list").innerHTML = rows.map(row => `
+    <div class="row">
+      <div><strong>${h(row.name)}</strong><br /><small>${h(row.channel || "通用")}</small></div>
+      <div><small>${h(row.discount_type === 'percentage' ? '比例' : '固定减免')}</small><br /><strong>${h(row.discount_value)}</strong></div>
+      <div><small>${h(row.start_time ? formatTime(row.start_time) : "不限")} - ${h(row.end_time ? formatTime(row.end_time) : "不限")}</small></div>
+      <div>
+        <small>${row.is_active ? "生效中" : "已停用"}</small><br/>
+        <div class="row-actions">
+          <a href="#" class="link" data-action="edit-promotion" data-id="${row.id}">编辑</a>
+          <a href="#" class="link" data-action="toggle-promotion" data-id="${row.id}" data-active="${row.is_active}">
+            ${row.is_active ? "失效" : "生效"}
+          </a>
+          <a href="#" class="link text-danger" data-action="delete-promotion" data-id="${row.id}">删除</a>
+        </div>
+      </div>
+    </div>
+  `).join("") || `<div class="row"><div>暂无促销数据</div></div>`;
+  
+  // Store rule data in a global map to avoid escaping issues in HTML attributes
+  window._promotionRules = window._promotionRules || {};
+  rows.forEach(r => { window._promotionRules[r.id] = r; });
+
+  renderListPagination("#products-promotions-pagination", "productsPromotions", data);
+}
+
+// Product Tab Logic
+$("#products-tabs")?.addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  const tabName = e.target.dataset.tab;
+  document.querySelectorAll("#products-tabs button").forEach(b => b.classList.toggle("active", b === e.target));
+  document.querySelectorAll("[id^='products-'][id$='-tab']").forEach(el => el.hidden = true);
+  document.querySelectorAll("[id^='products-'][id$='-tab']").forEach(el => el.classList.remove("is-active"));
+  const activeTab = $(`#products-${tabName}-tab`);
+  if (activeTab) {
+    activeTab.hidden = false;
+    activeTab.classList.add("is-active");
+  }
+});
+
+// Product Modals
+function openModal(id) {
+  const modal = $(id);
+  if (modal) modal.hidden = false;
+}
+function closeModal(id) {
+  const modal = $(id);
+  if (modal) modal.hidden = true;
+}
+
+document.addEventListener("click", async (e) => {
+  const target = e.target;
+  if (target.dataset.action === "new-spu") openModal("#product-spu-modal");
+  if (target.dataset.action === "new-sku") openModal("#product-sku-modal");
+  if (target.dataset.action === "new-pricing") openModal("#product-pricing-modal");
+  if (target.dataset.action === "new-promotion") {
+    e.preventDefault();
+    editingPromotionId = null;
+    $("#product-promotion-title").innerText = "新增促销规则";
+    $("#product-promotion-form").reset();
+    openModal("#product-promotion-modal");
+  }
+  if (target.dataset.action === "import-excel") {
+    $("#product-import-preview-container").hidden = true;
+    openModal("#product-import-modal");
+  }
+
+  if (target.dataset.action === "goto-spu") {
+    e.preventDefault();
+    const spuId = target.dataset.spu;
+    tableStates.productsSpu.q = spuId;
+    tableStates.productsSpu.page = 1;
+    $("#products-spu-filter-form [name=q]").value = spuId;
+    document.querySelectorAll("#products-tabs button").forEach(b => {
+      if (b.dataset.tab === "spu") b.click();
+    });
+  }
+
+  if (target.dataset.action === "goto-sku") {
+    e.preventDefault();
+    const skuId = target.dataset.sku;
+    tableStates.productsPricing.sku_id = skuId;
+    tableStates.productsPricing.page = 1;
+    $("#products-pricing-filter-form [name=sku_id]").value = skuId;
+    document.querySelectorAll("#products-tabs button").forEach(b => {
+      if (b.dataset.tab === "pricing") b.click();
+    });
+  }
+
+  if (target.dataset.action === "quick-new-pricing") {
+    e.preventDefault();
+    const skuUuid = target.dataset.skuUuid;
+    openModal("#product-pricing-modal");
+    $("#product-pricing-form [name=sku_uuid]").value = skuUuid;
+  }
+
+  if (target.dataset.action === "edit-promotion") {
+    e.preventDefault();
+    const id = target.dataset.id;
+    const rule = window._promotionRules[id];
+    if (!rule) return;
+    editingPromotionId = rule.id;
+    openModal("#product-promotion-modal");
+    $("#product-promotion-title").innerText = "编辑促销规则";
+    const form = $("#product-promotion-form");
+    form.elements.name.value = rule.name || "";
+    form.elements.channel.value = rule.channel || "";
+    form.elements.discount_type.value = rule.discount_type || "percentage";
+    form.elements.discount_value.value = rule.discount_value || "";
+    form.elements.start_time.value = rule.start_time ? rule.start_time.slice(0, 16) : "";
+    form.elements.end_time.value = rule.end_time ? rule.end_time.slice(0, 16) : "";
+    form.elements.priority.value = rule.priority || 0;
+  }
+
+  if (target.dataset.action === "delete-promotion") {
+    e.preventDefault();
+    const id = target.dataset.id;
+    if (!confirm("确定要删除该促销规则吗？")) return;
+    await guardedAction(["商品中心", "删除促销规则"], async () => {
+      await api(`/api/promotions/${id}`, { method: "DELETE" });
+      toast("删除成功");
+      refreshProductsPromotions();
+    });
+  }
+
+  if (target.dataset.action === "toggle-promotion") {
+    e.preventDefault();
+    const id = target.dataset.id;
+    const isActive = target.dataset.active === "true";
+    await guardedAction(["商品中心", "切换状态"], async () => {
+      await api(`/api/promotions/${id}/toggle?is_active=${!isActive}`, { method: "POST" });
+      toast("操作成功");
+      refreshProductsPromotions();
+    });
+  }
+});
+
+$("#product-spu-close")?.addEventListener("click", () => closeModal("#product-spu-modal"));
+$("#product-sku-close")?.addEventListener("click", () => closeModal("#product-sku-modal"));
+$("#product-pricing-close")?.addEventListener("click", () => closeModal("#product-pricing-modal"));
+$("#product-promotion-close")?.addEventListener("click", () => closeModal("#product-promotion-modal"));
+$("#product-import-close")?.addEventListener("click", () => closeModal("#product-import-modal"));
+
+let currentImportPreviewData = null;
+let editingPromotionId = null;
+
+$("#product-import-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const formData = new FormData(e.target);
+  await guardedAction(["商品中心", "导入预览"], async () => {
+    const data = await api("/api/products/import/preview", {
+      method: "POST",
+      body: formData,
+    }, true);
+    
+    currentImportPreviewData = data;
+    
+    const spuCount = data.spu.new.length + data.spu.conflict.length;
+    const skuCount = data.sku.new.length + data.sku.conflict.length;
+    const pricingCount = data.pricing.new.length + data.pricing.conflict.length;
+    
+    $("#product-import-summary").innerText = `解析完毕：发现 SPU ${spuCount} 条（冲突 ${data.spu.conflict.length}），SKU ${skuCount} 条（冲突 ${data.sku.conflict.length}），价格配置 ${pricingCount} 条（冲突 ${data.pricing.conflict.length}）。冲突的数据如果在确认导入后将被覆盖。`;
+    
+    let conflictHtml = "<strong>冲突项预览（前10条）：</strong><ul>";
+    const conflicts = [...data.spu.conflict.map(c => `SPU: ${c.spu_id}`), ...data.sku.conflict.map(c => `SKU: ${c.sku_id}`), ...data.pricing.conflict.map(c => `Pricing: ${c.sku_id} @ ${c.channel}`)];
+    if (conflicts.length === 0) {
+      conflictHtml += "<li>无冲突数据</li>";
+    } else {
+      conflicts.slice(0, 10).forEach(c => conflictHtml += `<li>${c}</li>`);
+      if (conflicts.length > 10) conflictHtml += `<li>...等 ${conflicts.length} 项</li>`;
+    }
+    conflictHtml += "</ul>";
+    $("#product-import-conflict-list").innerHTML = conflictHtml;
+    
+    $("#product-import-preview-container").hidden = false;
+  });
+});
+
+$("#product-import-confirm-btn")?.addEventListener("click", async () => {
+  if (!currentImportPreviewData) return;
+  await guardedAction(["商品中心", "确认导入"], async () => {
+    const result = await api("/api/products/import/confirm", {
+      method: "POST",
+      body: JSON.stringify(currentImportPreviewData),
+    });
+    toast(`导入成功！SPU: ${result.counts.spu}, SKU: ${result.counts.sku}, 价格: ${result.counts.pricing}`);
+    closeModal("#product-import-modal");
+    $("#product-import-form").reset();
+    currentImportPreviewData = null;
+    $("#product-import-preview-container").hidden = true;
+    refreshProductsSpu();
+    refreshProductsSku();
+    refreshProductsPricing();
+  });
+});
+
+$("#product-spu-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const formData = new FormData(e.target);
+  await guardedAction(["商品中心", "新增 SPU"], async () => {
+    await api("/api/products/spu", {
+      method: "POST",
+      body: JSON.stringify(Object.fromEntries(formData)),
+    });
+    toast("SPU 创建成功");
+    closeModal("#product-spu-modal");
+    e.target.reset();
+    refreshProductsSpu();
+  });
+});
+
+$("#product-sku-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const formData = new FormData(e.target);
+  const payload = Object.fromEntries(formData);
+  try {
+    payload.attributes = payload.attributes ? JSON.parse(payload.attributes) : {};
+  } catch (err) {
+    toast("属性 JSON 格式错误");
+    return;
+  }
+  await guardedAction(["商品中心", "新增 SKU"], async () => {
+    await api("/api/products/sku", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    toast("SKU 创建成功");
+    closeModal("#product-sku-modal");
+    e.target.reset();
+    refreshProductsSku();
+  });
+});
+
+$("#product-pricing-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const formData = new FormData(e.target);
+  const payload = Object.fromEntries(formData);
+  // Ensure integers where needed
+  ["map_price", "tier_a_price", "tier_b_price", "tier_c_price"].forEach(k => {
+    if (payload[k] !== undefined && payload[k] !== "") {
+      payload[k] = parseInt(payload[k], 10);
+    } else {
+      payload[k] = null;
+    }
+  });
+  ["promo_start_time", "promo_end_time"].forEach(k => {
+    if (!payload[k]) payload[k] = null;
+  });
+  await guardedAction(["商品中心", "配置价格"], async () => {
+    await api("/api/pricing", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    toast("渠道价格配置成功");
+    closeModal("#product-pricing-modal");
+    e.target.reset();
+    refreshProductsPricing();
+  });
+});
+
+$("#product-promotion-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const formData = new FormData(e.target);
+  const payload = Object.fromEntries(formData);
+  payload.discount_value = parseInt(payload.discount_value, 10);
+  if (isNaN(payload.discount_value)) {
+    alert("请输入有效的折扣数值");
+    return;
+  }
+  payload.priority = parseInt(payload.priority || "0", 10);
+  if (isNaN(payload.priority)) payload.priority = 0;
+  
+  if (!payload.channel) payload.channel = null;
+  ["start_time", "end_time"].forEach(k => {
+    if (!payload[k]) payload[k] = null;
+  });
+  
+  const label = editingPromotionId ? "编辑促销规则" : "新增促销规则";
+  const url = editingPromotionId ? `/api/promotions/${editingPromotionId}` : "/api/promotions";
+  const method = editingPromotionId ? "PATCH" : "POST";
+
+  await guardedAction(["商品中心", label], async () => {
+    await api(url, {
+      method: method,
+      body: JSON.stringify(payload),
+    });
+    toast(`${label}成功`);
+    closeModal("#product-promotion-modal");
+    e.target.reset();
+    editingPromotionId = null;
+    $("#product-promotion-title").innerText = "新增促销规则";
+    refreshProductsPromotions();
+  });
+});
+
+// Bind search forms
+$("#products-spu-filter-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  tableStates.productsSpu.q = e.target.q.value;
+  tableStates.productsSpu.page = 1;
+  refreshProductsSpu();
+});
+
+$("#products-sku-filter-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  tableStates.productsSku.spu_id = e.target.spu_id.value;
+  tableStates.productsSku.page = 1;
+  refreshProductsSku();
+});
+
+$("#products-pricing-filter-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  tableStates.productsPricing.sku_id = e.target.sku_id.value;
+  tableStates.productsPricing.page = 1;
+  refreshProductsPricing();
+});
 
 resetWorkflowChat();
 setActivePage();

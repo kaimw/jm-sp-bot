@@ -46,7 +46,7 @@ def reserve_mail_login(protocol: str, username: str, *, interval_seconds: int | 
         _last_login_attempts[key] = now
 
 
-def reserve_mail_send(username: str, *, interval_seconds: int | None = None) -> None:
+def reserve_mail_send(username: str, *, interval_seconds: int | None = None, blocking: bool = False) -> None:
     interval = clamp_mail_interval_seconds(interval_seconds)
     key = username.lower()
     now = time.monotonic()
@@ -55,12 +55,25 @@ def reserve_mail_send(username: str, *, interval_seconds: int | None = None) -> 
         if previous is not None:
             remaining = interval - (now - previous)
             if remaining > 0:
-                wait_seconds = max(1, math.ceil(remaining))
-                raise RuntimeError(
-                    f"{username} 的 SMTP 发信触发频率保护，请 {wait_seconds} 秒后重试；单账号发信间隔不能低于 "
-                    f"{MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒。"
-                )
-        _last_send_attempts[key] = now
+                if blocking:
+                    # 阻塞模式：等待冷却后继续，规避腾讯企业邮箱发信频率风控
+                    _last_send_attempts[key] = now + remaining
+                    # 释放锁后再 sleep，避免持锁阻塞
+                else:
+                    wait_seconds = max(1, math.ceil(remaining))
+                    raise RuntimeError(
+                        f"{username} 的 SMTP 发信触发频率保护，请 {wait_seconds} 秒后重试；单账号发信间隔不能低于 "
+                        f"{MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒。"
+                    )
+            else:
+                _last_send_attempts[key] = now
+                return
+        else:
+            _last_send_attempts[key] = now
+            return
+
+    # 只有 blocking=True 且需要等待时才走到这里
+    time.sleep(remaining)
 
 
 def reset_mail_login_throttle() -> None:

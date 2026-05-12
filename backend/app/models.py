@@ -339,6 +339,12 @@ class OutboundMailJob(Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
+    # 重试相关：指数退避自动重试
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # 优先级（越小越高）：10=收件回执 20=业务推进 30=任务单 40=通知 60=周报
+    priority: Mapped[int] = mapped_column(Integer, default=40, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
@@ -400,3 +406,92 @@ class BackupJob(Base):
     storage_ref: Mapped[str] = mapped_column(Text, nullable=False)
     manifest_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+# ==========================================
+# Product Management Module Models
+# ==========================================
+
+class ProductSPU(Base):
+    __tablename__ = "product_spus"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    spu_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name_en: Mapped[str | None] = mapped_column(String(255))
+    brand: Mapped[str | None] = mapped_column(String(128))
+    category: Mapped[str | None] = mapped_column(String(128))
+    product_line: Mapped[str | None] = mapped_column(String(128))
+    product_type: Mapped[str | None] = mapped_column(String(128))
+    positioning: Mapped[str | None] = mapped_column(String(128))
+    launch_time: Mapped[str | None] = mapped_column(String(64))
+    lifecycle: Mapped[str | None] = mapped_column(String(64))
+    extended_info_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    skus: Mapped[list["ProductSKU"]] = relationship(back_populates="spu")
+
+
+class ProductSKU(Base):
+    __tablename__ = "product_skus"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    spu_uuid: Mapped[str] = mapped_column(String(36), ForeignKey("product_spus.id"), nullable=False)
+    sku_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128))
+    version: Mapped[str | None] = mapped_column(String(128))
+    barcode: Mapped[str | None] = mapped_column(String(128))
+    cost_price: Mapped[int | None] = mapped_column(Integer)
+    msrp: Mapped[int | None] = mapped_column(Integer)
+    attributes_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    supply_info_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    media_info_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    spu: Mapped[ProductSPU] = relationship(back_populates="skus")
+    channel_pricings: Mapped[list["ChannelPricing"]] = relationship(back_populates="sku")
+
+
+class ChannelPricing(Base):
+    __tablename__ = "channel_pricings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    sku_uuid: Mapped[str] = mapped_column(String(36), ForeignKey("product_skus.id"), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel_sku_id: Mapped[str | None] = mapped_column(String(128))
+    listing_id: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str | None] = mapped_column(String(64))
+    tier_a_price: Mapped[int | None] = mapped_column(Integer) # Stored as cents
+    tier_b_price: Mapped[int | None] = mapped_column(Integer)
+    tier_c_price: Mapped[int | None] = mapped_column(Integer)
+    map_price: Mapped[int | None] = mapped_column(Integer) # Minimum Advertised Price
+    max_price: Mapped[int | None] = mapped_column(Integer) # Maximum Price
+    promo_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    promo_end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    currency: Mapped[str] = mapped_column(String(16), default="USD", nullable=False)
+    stock_quantity: Mapped[int | None] = mapped_column(Integer)
+    manager: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    sku: Mapped[ProductSKU] = relationship(back_populates="channel_pricings")
+
+
+class PromotionRule(Base):
+    __tablename__ = "promotion_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel: Mapped[str | None] = mapped_column(String(64))
+    start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    discount_type: Mapped[str] = mapped_column(String(32), nullable=False) # e.g. PERCENTAGE, FIXED_AMOUNT
+    discount_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)

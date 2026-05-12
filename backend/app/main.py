@@ -80,6 +80,11 @@ from backend.app.schemas import (
     WorkflowSimulationRequest,
     WorkflowVersionUpdateRequest,
     WeeklyReportRecipientsUpdate,
+    ProductSPUCreate,
+    ProductSKUCreate,
+    ChannelPricingUpdate,
+    PromotionRuleCreate,
+    PromotionRuleUpdate,
 )
 from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_INTERVAL_SECONDS
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token
@@ -148,6 +153,19 @@ from backend.app.services.workflow import (
     weekly_report_mail_body,
     weekly_report_recipients,
     weekly_report_subject,
+)
+from backend.app.services.products import (
+    create_spu,
+    create_sku,
+    set_channel_pricing,
+    create_promotion_rule,
+    get_spus,
+    get_skus,
+    get_channel_pricing,
+    get_promotions,
+    update_promotion_rule,
+    delete_promotion_rule,
+    toggle_promotion_rule,
 )
 
 
@@ -3219,3 +3237,240 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+# ==========================================
+# Product Management APIs
+# ==========================================
+
+@app.get("/api/products/spu")
+def list_products_spu_api(
+    q: str = Query("", description="搜索 SPU 代码或名称"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session)
+) -> dict:
+    skip = (page - 1) * page_size
+    items, total = get_spus(session, skip=skip, limit=page_size, query=q)
+    return {
+        "items": [
+            {
+                "id": spu.id,
+                "spu_id": spu.spu_id,
+                "name": spu.name,
+                "brand": spu.brand,
+                "category": spu.category,
+                "created_at": spu.created_at.isoformat(),
+            } for spu in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size)
+    }
+
+@app.post("/api/products/spu")
+def create_product_spu_api(payload: ProductSPUCreate, session: Session = Depends(get_session)) -> dict:
+    spu = create_spu(session, spu_id=payload.spu_id, name=payload.name, brand=payload.brand, category=payload.category)
+    session.commit()
+    return {"id": spu.id, "spu_id": spu.spu_id}
+
+
+import tempfile
+import os
+from fastapi import UploadFile, File
+from backend.app.services.excel_import import preview_excel_import, confirm_excel_import
+
+@app.post("/api/products/import/preview")
+def api_preview_product_import(file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        contents = file.file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+    
+    try:
+        preview = preview_excel_import(tmp_path, session)
+    finally:
+        os.remove(tmp_path)
+    
+    return preview
+
+@app.post("/api/products/import/confirm")
+def api_confirm_product_import(data: dict, session: Session = Depends(get_session)) -> dict:
+    counts = confirm_excel_import(data, session)
+    session.commit()
+    return {"message": "导入成功", "counts": counts}
+
+
+@app.get("/api/products/sku")
+def list_products_sku_api(
+    spu_id: str = Query(None, description="所属 SPU ID (Code)"),
+    spu_uuid: str = Query(None, description="所属 SPU UUID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session)
+) -> dict:
+    skip = (page - 1) * page_size
+    items, total = get_skus(session, skip=skip, limit=page_size, spu_id=spu_id, spu_uuid=spu_uuid)
+    return {
+        "items": [
+            {
+                "id": sku.id,
+                "spu_id": sku.spu.spu_id,
+                "sku_id": sku.sku_id,
+                "status": sku.status,
+                "attributes": loads(sku.attributes_json, {}),
+                "created_at": sku.created_at.isoformat(),
+            } for sku in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size)
+    }
+
+@app.post("/api/products/sku")
+def create_product_sku_api(payload: ProductSKUCreate, session: Session = Depends(get_session)) -> dict:
+    sku = create_sku(session, spu_uuid=payload.spu_uuid, sku_id=payload.sku_id, attributes=payload.attributes)
+    session.commit()
+    return {"id": sku.id, "sku_id": sku.sku_id}
+
+
+@app.get("/api/pricing")
+def list_channel_pricing_api(
+    sku_id: str = Query(None, description="按 SKU ID (Code) 筛选"),
+    sku_uuid: str = Query(None, description="按 SKU UUID 筛选"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session)
+) -> dict:
+    skip = (page - 1) * page_size
+    items, total = get_channel_pricing(session, skip=skip, limit=page_size, sku_id=sku_id, sku_uuid=sku_uuid)
+    return {
+        "items": [
+            {
+                "id": p.id,
+                "sku_id": p.sku.sku_id,
+                "channel": p.channel,
+                "tier_a_price": p.tier_a_price,
+                "tier_b_price": p.tier_b_price,
+                "tier_c_price": p.tier_c_price,
+                "map_price": p.map_price,
+                "promo_start_time": p.promo_start_time.isoformat() if p.promo_start_time else None,
+                "promo_end_time": p.promo_end_time.isoformat() if p.promo_end_time else None,
+                "currency": p.currency,
+                "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            } for p in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size)
+    }
+
+@app.post("/api/pricing")
+def set_channel_pricing_api(payload: ChannelPricingUpdate, session: Session = Depends(get_session)) -> dict:
+    pricing = set_channel_pricing(
+        session,
+        sku_uuid=payload.sku_uuid,
+        channel=payload.channel,
+        tier_a_price=payload.tier_a_price,
+        tier_b_price=payload.tier_b_price,
+        tier_c_price=payload.tier_c_price,
+        map_price=payload.map_price,
+        promo_start_time=payload.promo_start_time,
+        promo_end_time=payload.promo_end_time,
+        currency=payload.currency
+    )
+    session.commit()
+    return {"id": pricing.id, "sku_uuid": pricing.sku_uuid, "channel": pricing.channel}
+
+
+@app.get("/api/promotions")
+def list_promotions_api(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session)
+) -> dict:
+    skip = (page - 1) * page_size
+    items, total = get_promotions(session, skip=skip, limit=page_size)
+    return {
+        "items": [
+            {
+                "id": rule.id,
+                "name": rule.name,
+                "channel": rule.channel,
+                "is_active": rule.is_active,
+                "start_time": rule.start_time.isoformat() if rule.start_time else None,
+                "end_time": rule.end_time.isoformat() if rule.end_time else None,
+                "priority": rule.priority,
+                "discount_type": rule.discount_type,
+                "discount_value": rule.discount_value,
+                "created_at": rule.created_at.isoformat(),
+            } for rule in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size)
+    }
+
+@app.post("/api/promotions")
+def create_promotion_api(payload: PromotionRuleCreate, session: Session = Depends(get_session)) -> dict:
+    try:
+        rule = create_promotion_rule(
+            session,
+            name=payload.name,
+            discount_type=payload.discount_type,
+            discount_value=payload.discount_value,
+            channel=payload.channel,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            priority=payload.priority
+        )
+        res = {"id": rule.id, "name": rule.name}
+        session.commit()
+        return res
+    except Exception as e:
+        session.rollback()
+        logging.exception("Error in create_promotion_api")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/promotions/{rule_id}")
+def update_promotion_api(rule_id: str, payload: PromotionRuleUpdate, session: Session = Depends(get_session)) -> dict:
+    try:
+        rule = update_promotion_rule(session, rule_id, **payload.dict(exclude_unset=True))
+        if not rule:
+            raise HTTPException(status_code=404, detail="Promotion rule not found")
+        res = {"id": rule.id, "name": rule.name}
+        session.commit()
+        return res
+    except Exception as e:
+        session.rollback()
+        logging.exception("Error in update_promotion_api")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/promotions/{rule_id}")
+def delete_promotion_api(rule_id: str, session: Session = Depends(get_session)) -> dict:
+    try:
+        success = delete_promotion_rule(session, rule_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Promotion rule not found")
+        session.commit()
+        return {"success": True}
+    except Exception as e:
+        session.rollback()
+        logging.exception("Error in delete_promotion_api")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/promotions/{rule_id}/toggle")
+def toggle_promotion_api(rule_id: str, is_active: bool = Query(...), session: Session = Depends(get_session)) -> dict:
+    try:
+        rule = toggle_promotion_rule(session, rule_id, is_active)
+        if not rule:
+            raise HTTPException(status_code=404, detail="Promotion rule not found")
+        res = {"id": rule.id, "is_active": rule.is_active}
+        session.commit()
+        return res
+    except Exception as e:
+        session.rollback()
+        logging.exception("Error in toggle_promotion_api")
+        raise HTTPException(status_code=500, detail=str(e))

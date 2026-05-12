@@ -229,3 +229,52 @@ class WorkflowChatSaveRequest(BaseModel):
     compiled_rule: dict[str, Any]
     activate: bool = False
     edit_version_id: str | None = None
+
+
+# ==========================================
+# Product Management Schemas
+# ==========================================
+
+class ProductSPUCreate(BaseModel):
+    spu_id: str
+    name: str
+    brand: str | None = None
+    category: str | None = None
+
+
+class ProductSKUCreate(BaseModel):
+    spu_uuid: str
+    sku_id: str
+    attributes: dict[str, Any] = {}
+
+
+class ChannelPricingUpdate(BaseModel):
+    sku_uuid: str
+    channel: str = "default"
+    tier_a_price: int | None = None
+    tier_b_price: int | None = None
+    tier_c_price: int | None = None
+    map_price: int | None = None
+    promo_start_time: datetime | None = None
+    promo_end_time: datetime | None = None
+    currency: str = "USD"
+
+
+class PromotionRuleCreate(BaseModel):
+    name: str
+    channel: str | None = None
+    discount_type: str = Field(pattern="^(percentage|fixed_amount|PERCENTAGE|FIXED_AMOUNT)$")
+    discount_value: int
+    priority: int = 0
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+
+class PromotionRuleUpdate(BaseModel):
+    name: str | None = None
+    channel: str | None = None
+    discount_type: str | None = Field(None, pattern="^(percentage|fixed_amount|PERCENTAGE|FIXED_AMOUNT)$")
+    discount_value: int | None = None
+    priority: int | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    is_active: bool | None = None

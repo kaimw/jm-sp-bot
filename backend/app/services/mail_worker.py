@@ -10,7 +10,13 @@ from backend.app.config import MAIL_WORKER_MIN_INTERVAL_SECONDS, settings
 from backend.app.database import SessionLocal
 from backend.app.models import OutboundMailJob
 from backend.app.services.jobs import run_pending_jobs
-from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, send_pending_auto_workflow_mails_smtp, sync_imap_mailbox
+from backend.app.services.mail_adapter import (
+    AUTO_WORKFLOW_MAIL_TYPES,
+    OUTBOUND_PRIORITY_NOTIFY,
+    send_pending_auto_workflow_mails_smtp,
+    send_pending_smtp,
+    sync_imap_mailbox,
+)
 from backend.app.services.workflow import bot_enabled, get_config
 
 
@@ -54,7 +60,8 @@ def run_mail_auto_worker_once() -> dict:
                 "enabled": True,
                 "synced": {"imported": 0, "queued": 0},
                 "processed": {"completed": 0, "failed": 0, "total": 0},
-                "auto_workflow_mails": {"sent": 0, "failed": 0, "total": 0},
+                "high_priority_mails": {"sent": 0, "failed": 0, "total": 0},
+                "low_priority_mails": {"sent": 0, "failed": 0, "total": 0},
             }
             try:
                 result["processed"] = run_pending_jobs(session, limit=settings.mail_auto_worker_limit)
@@ -64,31 +71,43 @@ def run_mail_auto_worker_once() -> dict:
                 logger.exception("mail auto worker processing failed")
                 result["processed"] = {"completed": 0, "failed": 0, "total": 0, "error": str(exc)}
 
-            try:
-                pending_auto_count = pending_auto_workflow_mail_count(session)
-            except Exception as exc:
-                pending_auto_count = 0
-                logger.exception("mail auto worker pending count failed")
-                result["auto_workflow_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
-
-            if pending_auto_count > 0:
+            # ── 高优先级通道：priority ≤ 30（收件回执、业务推进、任务单）──
+            high_priority_count = _pending_high_priority_count(session)
+            if high_priority_count > 0:
                 try:
-                    result["auto_workflow_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
+                    result["high_priority_mails"] = _send_high_priority_mails(session, limit=settings.mail_auto_worker_limit)
                     session.commit()
                 except Exception as exc:
                     session.rollback()
-                    logger.exception("mail auto worker auto workflow send failed")
-                    result["auto_workflow_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
-                result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
-                return _finish_worker_run(result, started)
+                    logger.exception("mail auto worker high priority send failed")
+                    result["high_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
 
-            try:
-                result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
-                session.commit()
-            except Exception as exc:
-                session.rollback()
-                logger.exception("mail auto worker sync failed")
-                result["synced"] = {"imported": 0, "queued": 0, "error": str(exc)}
+            # ── 低优先级通道：priority > 30（通知、周报等）──
+            low_priority_count = pending_auto_workflow_mail_count(session)
+            if low_priority_count > 0:
+                try:
+                    result["low_priority_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    logger.exception("mail auto worker low priority send failed")
+                    result["low_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
+
+            # 两个通道都没有待发邮件，才执行 IMAP 同步
+            if high_priority_count == 0 and low_priority_count == 0:
+                try:
+                    result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    logger.exception("mail auto worker sync failed")
+                    result["synced"] = {"imported": 0, "queued": 0, "error": str(exc)}
+            else:
+                result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
+
+            # ── 健康检查：最老 Pending 邮件年龄告警 ──
+            _check_oldest_pending_age(session)
+
             return _finish_worker_run(result, started)
         except Exception as exc:
             _WORKER_STATUS["last_error"] = str(exc)
@@ -136,3 +155,69 @@ def configured_mail_worker_interval_seconds() -> int:
         except ValueError:
             value = settings.mail_auto_worker_interval_seconds
         return max(MAIL_WORKER_MIN_INTERVAL_SECONDS, value)
+
+
+# 高优先级通道：仅发 priority <= 30（收件回执、业务推进、任务单）
+_HIGH_PRIORITY_THRESHOLD = OUTBOUND_PRIORITY_NOTIFY  # 30 以下为高优先级
+
+# 最老 Pending 邮件超过此秒数时打告警
+_OLDEST_PENDING_ALERT_SECONDS = 600  # 10 分钟
+
+
+def _pending_high_priority_count(session: Session) -> int:
+    now = datetime.now(timezone.utc)
+    return (
+        session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.status == "Pending",
+            OutboundMailJob.priority < _HIGH_PRIORITY_THRESHOLD,
+            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+        )
+        .count()
+    )
+
+
+def _send_high_priority_mails(session: Session, *, limit: int = 5) -> dict:
+    """只发高优先级（priority < NOTIFY）的待发邮件。"""
+    now = datetime.now(timezone.utc)
+    jobs = (
+        session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.status == "Pending",
+            OutboundMailJob.priority < _HIGH_PRIORITY_THRESHOLD,
+            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+        )
+        .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
+        .limit(limit)
+        .all()
+    )
+    if not jobs:
+        return {"sent": 0, "failed": 0, "total": 0}
+    return send_pending_smtp(session, limit=limit)
+
+
+def _check_oldest_pending_age(session: Session) -> None:
+    """检查最老的 Pending 邮件年龄，超阈值时打 WARNING 日志，便于快速发现积压。"""
+    oldest = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Pending")
+        .order_by(OutboundMailJob.created_at)
+        .first()
+    )
+    if oldest is None:
+        return
+    now = datetime.now(timezone.utc)
+    created = oldest.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age_seconds = (now - created).total_seconds()
+    if age_seconds > _OLDEST_PENDING_ALERT_SECONDS:
+        logger.warning(
+            "[OutboundMailAlert] 最老 Pending 邮件已等待 %.0f 秒（阈值 %d 秒），"
+            "mail_type=%s id=%s subject=%s",
+            age_seconds,
+            _OLDEST_PENDING_ALERT_SECONDS,
+            oldest.mail_type,
+            oldest.id,
+            oldest.subject[:60],
+        )

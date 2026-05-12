@@ -20,7 +20,7 @@ class ExtractedRequirement:
 
 FIELD_PATTERNS = {
     "customer_name": r"(?:客户|客户名称)[:：]\s*(?P<value>.+)",
-    "product_summary": r"(?:产品|产品名称|产品规格|规格)[:：]\s*(?P<value>.+)",
+    "product_summary": r"(?:产品|产品名称|产品规格|产品/规格|规格|物料名称|品名)[:：]\s*(?P<value>[^\n]+?)(?=\s*(?:数量|交期)[:：]|$)",
     "quantity_text": r"(?:数量|生产数量)[:：]\s*(?P<value>.+)",
     "expected_delivery_date": r"(?:交期|期望交期|交付日期)[:：]\s*(?P<value>.+)",
     "external_order_no": r"(?:订单号|订单编号)[:：]\s*(?P<value>.+)",
@@ -136,9 +136,16 @@ def _extract_natural_order_values(text: str) -> dict[str, str | None]:
 def extract_requirement(subject: str, body: str, from_address: str) -> ExtractedRequirement:
     body = normalize_latest_reply(body)
     source_text = f"{subject}\n{body}"
+    # 第一优先：规则提取
     values = {field: _match(pattern, body) for field, pattern in FIELD_PATTERNS.items()}
-    natural_values = _extract_natural_order_values(source_text)
-    values = {field: values.get(field) or natural_values.get(field) for field in values}
+
+    # 仅当存在未命中字段时，再用自然语言提取兜底，且只补全仍为空的字段
+    missing_rule_fields = [field for field, val in values.items() if not val]
+    if missing_rule_fields:
+        natural_values = _extract_natural_order_values(body)  # 只在正文匹配，避免主题行被误识别
+        for field in missing_rule_fields:
+            if natural_values.get(field):
+                values[field] = natural_values[field]
     missing = [
         label
         for label, value in [

@@ -33,6 +33,7 @@
         <a href="#review-rules" data-page-link="review-rules">初审规则</a>
         <a href="#integration" data-page-link="integration">接入</a>
         <a href="#departments" data-page-link="departments">生产邮箱</a>
+        <a href="#products" data-page-link="products">商品管理</a>
         <a href="#reports" data-page-link="reports">周报</a>
         <a href="#mails" data-page-link="mails">邮件</a>
         <a href="#outbound" data-page-link="outbound">外发</a>
@@ -60,6 +61,93 @@
         <div id="dashboard" class="metrics"></div>
         <div id="dashboard-insights" class="dashboard-insights"></div>
         <div id="system-health" class="health-panel"></div>
+      </section>
+
+      <section class="page" data-page="products" data-title="商品管理" data-subtitle="管理产品 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
+        <div class="tabs" id="products-tabs">
+          <button type="button" class="active" data-tab="spu">产品 SPU</button>
+          <button type="button" data-tab="sku">存货 SKU</button>
+          <button type="button" data-tab="pricing">渠道价格</button>
+          <button type="button" data-tab="promotions">促销规则</button>
+        </div>
+
+        <div class="tab-content is-active" id="products-spu-tab">
+          <div class="table-filter-bar">
+            <form id="products-spu-filter-form" class="inline-form">
+              <input type="text" name="q" placeholder="搜索名称或代码..." />
+              <button type="submit" class="button ghost">搜索</button>
+            </form>
+            <div>
+              <button class="button ghost" data-action="import-excel">导入 Excel</button>
+              <button class="button" data-action="new-spu">新增 SPU</button>
+            </div>
+          </div>
+          <div class="data-table">
+            <div class="head row">
+              <div>SPU代码 / 名称</div>
+              <div>品牌 / 品类</div>
+              <div>创建时间</div>
+            </div>
+            <div id="products-spu-list" class="list"></div>
+          </div>
+          <div id="products-spu-pagination" class="pagination"></div>
+        </div>
+
+        <div class="tab-content" id="products-sku-tab" hidden>
+          <div class="table-filter-bar">
+            <form id="products-sku-filter-form" class="inline-form">
+              <input type="text" name="spu_id" placeholder="按 SPU ID 过滤..." />
+              <button type="submit" class="button ghost">过滤</button>
+            </form>
+            <button class="button" data-action="new-sku">新增 SKU</button>
+          </div>
+          <div class="data-table">
+            <div class="head row">
+              <div>SKU代码</div>
+              <div>所属 SPU</div>
+              <div>状态</div>
+              <div>创建时间</div>
+            </div>
+            <div id="products-sku-list" class="list"></div>
+          </div>
+          <div id="products-sku-pagination" class="pagination"></div>
+        </div>
+
+        <div class="tab-content" id="products-pricing-tab" hidden>
+          <div class="table-filter-bar">
+            <form id="products-pricing-filter-form" class="inline-form">
+              <input type="text" name="sku_id" placeholder="按 SKU ID 过滤..." />
+              <button type="submit" class="button ghost">过滤</button>
+            </form>
+            <button class="button" data-action="new-pricing">配置价格</button>
+          </div>
+          <div class="data-table">
+            <div class="head row">
+              <div>渠道 / 币种</div>
+              <div>阶梯价格 (分)</div>
+              <div>底价 (MAP)</div>
+              <div>更新时间</div>
+            </div>
+            <div id="products-pricing-list" class="list"></div>
+          </div>
+          <div id="products-pricing-pagination" class="pagination"></div>
+        </div>
+
+        <div class="tab-content" id="products-promotions-tab" hidden>
+          <div class="table-filter-bar">
+            <button class="button" data-action="new-promotion">新增促销</button>
+          </div>
+          <div class="data-table">
+            <div class="head row">
+              <div>规则名称 / 渠道</div>
+              <div>优惠内容</div>
+              <div>有效期</div>
+              <div>状态</div>
+            </div>
+            <div id="products-promotions-list" class="list"></div>
+          </div>
+          <div id="products-promotions-pagination" class="pagination"></div>
+        </div>
       </section>
 
       <section class="page" data-page="self-maintenance" data-title="自维护" data-subtitle="通过对话诊断系统问题，生成只读排障建议和操作草案。">
@@ -703,6 +791,100 @@
         </div>
         <div id="self-maintenance-detail-fields" class="mail-detail-fields"></div>
         <pre id="self-maintenance-detail-body" class="mail-detail-body"></pre>
+      </section>
+    </div>
+
+    <div id="product-spu-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-spu-title">
+        <div class="modal-head">
+          <div><small>商品中心</small><h2 id="product-spu-title">新增 SPU</h2></div>
+          <button id="product-spu-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="product-spu-form" class="form-grid compact-form">
+          <label>SPU代码 <input name="spu_code" required placeholder="如: SP-1001" /></label>
+          <label>商品名称 <input name="name" required placeholder="例如: 星巴克拿铁" /></label>
+          <label>品牌 <input name="brand" placeholder="选填" /></label>
+          <label>品类 <input name="category" placeholder="选填" /></label>
+          <button type="submit" class="button wide">保存</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="product-sku-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-sku-title">
+        <div class="modal-head">
+          <div><small>商品中心</small><h2 id="product-sku-title">新增 SKU</h2></div>
+          <button id="product-sku-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="product-sku-form" class="form-grid compact-form">
+          <label>所属 SPU UUID <input name="spu_uuid" required placeholder="输入 SPU 的 UUID" /></label>
+          <label>SKU ID <input name="sku_id" required placeholder="如: SKU-1001-A" /></label>
+          <label class="wide">属性 (JSON格式) <input name="attributes" placeholder='如: {"color": "red"}' /></label>
+          <button type="submit" class="button wide">保存</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="product-pricing-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-pricing-title">
+        <div class="modal-head">
+          <div><small>商品中心</small><h2 id="product-pricing-title">配置渠道价格</h2></div>
+          <button id="product-pricing-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="product-pricing-form" class="form-grid compact-form">
+          <label class="wide">SKU UUID <input name="sku_uuid" required placeholder="输入 SKU 的 UUID" /></label>
+          <label>渠道名称 <input name="channel" required placeholder="例如: default" value="default" /></label>
+          <label>底价(MAP) 分 <input name="map_price" type="number" placeholder="必填，用于审核" required /></label>
+          <label>A档价格(分) <input name="tier_a_price" type="number" placeholder="日常售价" /></label>
+          <label>B档价格(分) <input name="tier_b_price" type="number" placeholder="大促价" /></label>
+          <label>C档价格(分) <input name="tier_c_price" type="number" placeholder="日常折扣" /></label>
+          <label>促销开始 <input name="promo_start_time" type="datetime-local" /></label>
+          <label>促销结束 <input name="promo_end_time" type="datetime-local" /></label>
+          <label>币种 <input name="currency" required placeholder="USD/CNY等" value="CNY" /></label>
+          <button type="submit" class="button wide">保存</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="product-promotion-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-promotion-title">
+        <div class="modal-head">
+          <div><small>商品中心</small><h2 id="product-promotion-title">新增促销规则</h2></div>
+          <button id="product-promotion-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="product-promotion-form" class="form-grid compact-form">
+          <label class="wide">规则名称 <input name="name" required placeholder="必须与邮件中提取的活动名一致" /></label>
+          <label>渠道 <input name="channel" placeholder="选填，如 default" /></label>
+          <label>优惠类型 <select name="discount_type"><option value="percentage">比例折扣</option><option value="fixed_amount">固定减免</option></select></label>
+          <label>优惠数值 <input name="discount_value" type="number" required placeholder="如 10 表示 10% 或 减10分" /></label>
+          <label>生效时间 <input name="start_time" type="datetime-local" /></label>
+          <label>结束时间 <input name="end_time" type="datetime-local" /></label>
+          <label>优先级 <input name="priority" type="number" value="0" placeholder="数字越大优先级越高" /></label>
+          <button type="submit" class="button wide">保存</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="product-import-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-import-title" style="max-width: 800px;">
+        <div class="modal-head">
+          <div><small>商品中心</small><h2 id="product-import-title">导入 Excel</h2></div>
+          <button id="product-import-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="product-import-form" class="form-grid compact-form">
+          <label class="wide">选择 Excel 文件 
+            <input name="excel_file" type="file" accept=".xlsx" required />
+          </label>
+          <button type="submit" class="button wide">解析并预览</button>
+        </form>
+        <div id="product-import-preview-container" hidden>
+          <div style="margin-top: 1rem; border-top: 1px solid var(--border-color); padding-top: 1rem;">
+            <h3>解析预览</h3>
+            <p id="product-import-summary" style="margin-bottom: 1rem; font-size: 0.9em; color: var(--text-color-light);"></p>
+            <div id="product-import-conflict-list" style="max-height: 200px; overflow-y: auto; background: var(--bg-hover); padding: 0.5rem; margin-bottom: 1rem; font-size: 0.85em;"></div>
+            <button id="product-import-confirm-btn" type="button" class="button wide danger">确认覆盖导入</button>
+          </div>
+        </div>
       </section>
     </div>
 

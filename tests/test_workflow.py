@@ -1756,21 +1756,38 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     result = send_pending_smtp(session, limit=10)
     session.commit()
 
-    assert result == {"sent": 1, "failed": 0, "total": 1}
+    # 新行为：3 封全部被处理，不再受 send_attempts>=1 限制
+    # - ok: Sent
+    # - missing_recipient: 收件人缺失 → 直接 Failed（不可恢复错误）
+    # - send_failure: SMTP 异常 → 保持 Pending（指数退避重试，next_retry_at 被设置）
+    assert result["sent"] == 1
+    assert result["failed"] == 2   # missing_recipient(Failed) + send_failure(scheduled retry)
+    assert result["total"] == 3
     assert ok.status == "Sent"
-    assert missing_recipient.status == "Pending"
+    assert missing_recipient.status == "Failed"
     assert send_failure.status == "Pending"
+    assert send_failure.attempt_count == 1
+    assert send_failure.next_retry_at is not None
     assert FakeSMTP.sent_messages == [("OK", "bot.market@jimuyida.com", ["ok@jimuyida.com"])]
-    assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendFailed").count() == 0
+    # missing_recipient 直接失败进异常队列(1条)；send_failure 还在重试中，不进异常队列
+    assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendFailed").count() == 1
 
-    reset_mail_login_throttle()
-    result = send_pending_smtp(session, limit=10)
+    # 手动清除 next_retry_at 以模拟超过冷却期
+    send_failure.next_retry_at = None
+    # 模拟多次失败达到最大重试上限
+    from backend.app.services.mail_adapter import OUTBOUND_MAX_AUTO_RETRIES
+    send_failure.attempt_count = OUTBOUND_MAX_AUTO_RETRIES
     session.commit()
 
-    assert result == {"sent": 0, "failed": 2, "total": 2}
-    assert missing_recipient.status == "Failed"
+    reset_mail_login_throttle()
+    result2 = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    # 达到最大重试次数，send_failure 转为 Failed，产生第2条 ExceptionCase
+    assert result2["sent"] == 0
     assert send_failure.status == "Failed"
-    assert FakeSMTP.sent_messages == [("OK", "bot.market@jimuyida.com", ["ok@jimuyida.com"])]
+    assert send_failure.attempt_count == OUTBOUND_MAX_AUTO_RETRIES + 1
+    # missing_recipient(1条) + send_failure超限(1条) = 共2条
     assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendFailed").count() == 2
 
     retried = retry_outbound_mail(session, missing_recipient.id)
@@ -2920,16 +2937,17 @@ def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeyp
     result = send_pending_auto_workflow_mails_smtp(session, limit=10)
     session.commit()
 
-    assert result == {"sent": 1, "failed": 0, "total": 1}
+    # 新的多封发送行为：AUTO_WORKFLOW 类型的 8 封全部发出（limit=10 > 8封总量）
+    assert result == {"sent": 8, "failed": 0, "total": 8}
     assert ack.status == "Sent"
-    assert review.status == "Pending"
-    assert question_forward.status == "Pending"
-    assert question_receipt.status == "Pending"
-    assert task_issue.status == "Pending"
-    assert weekly_report.status == "Pending"
-    assert production_confirmed.status == "Pending"
-    assert confirmation_receipt.status == "Pending"
-    assert FakeSMTP.sent_subjects == ["Re: 生产订单需求"]
+    assert review.status == "Sent"
+    assert question_forward.status == "Sent"
+    assert question_receipt.status == "Sent"
+    assert task_issue.status == "Sent"
+    assert weekly_report.status == "Sent"
+    assert production_confirmed.status == "Sent"
+    assert confirmation_receipt.status == "Sent"
+    assert len(FakeSMTP.sent_subjects) == 8
 
 
 def test_pending_auto_workflow_sender_includes_production_rejected(monkeypatch):
