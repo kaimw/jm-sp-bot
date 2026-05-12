@@ -3431,7 +3431,7 @@ def create_promotion_api(payload: PromotionRuleCreate, session: Session = Depend
         return res
     except Exception as e:
         session.rollback()
-        logging.exception("Error in create_promotion_api")
+        logger.exception("Error in create_promotion_api")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/promotions/{rule_id}")
@@ -3445,7 +3445,7 @@ def update_promotion_api(rule_id: str, payload: PromotionRuleUpdate, session: Se
         return res
     except Exception as e:
         session.rollback()
-        logging.exception("Error in update_promotion_api")
+        logger.exception("Error in update_promotion_api")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/promotions/{rule_id}")
@@ -3458,7 +3458,7 @@ def delete_promotion_api(rule_id: str, session: Session = Depends(get_session)) 
         return {"success": True}
     except Exception as e:
         session.rollback()
-        logging.exception("Error in delete_promotion_api")
+        logger.exception("Error in delete_promotion_api")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/promotions/{rule_id}/toggle")
@@ -3472,5 +3472,5 @@ def toggle_promotion_api(rule_id: str, is_active: bool = Query(...), session: Se
         return res
     except Exception as e:
         session.rollback()
-        logging.exception("Error in toggle_promotion_api")
+        logger.exception("Error in toggle_promotion_api")
         raise HTTPException(status_code=500, detail=str(e))
