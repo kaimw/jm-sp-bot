@@ -1730,6 +1730,41 @@ def cancel_pending_outbound(payload: OutboundBulkCancelRequest, request: Request
     }
 
 
+@app.post("/api/outbound-mails/clear-queue")
+def clear_outbound_queue(
+    payload: AdminPasswordRequest, 
+    request: Request, 
+    session: Session = Depends(get_session)
+) -> dict:
+    require_admin_password(payload.admin_password)
+    
+    now = now_utc()
+    actor = getattr(request.state, "username", "system")
+    
+    # We cancel both Pending and Failed jobs as they are part of the active queue
+    count = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status.in_(["Pending", "Failed"]))
+        .update({OutboundMailJob.status: "Cancelled"}, synchronize_session=False)
+    )
+    
+    if count > 0:
+        session.add(
+            AuditEvent(
+                event_type="OutboundQueueCleared",
+                actor=actor,
+                related_object_type="OutboundMailJob",
+                related_object_id="bulk-clear",
+                detail=dumps({"cancelled_count": count, "previous_statuses": ["Pending", "Failed"]}),
+                created_at=now,
+            )
+        )
+        session.commit()
+    
+    return {"cleared": count}
+
+
+
 @app.post("/api/outbound-mails/{job_id}/retry")
 def retry_outbound(job_id: str, session: Session = Depends(get_session)) -> dict:
     try:
@@ -1985,7 +2020,7 @@ async def mailbox_auto_run_once() -> dict:
 
 
 @app.get("/api/skills/list")
-def list_skills() -> list[dict[str, str]]:
+def list_skills() -> list:
     return registry.list_skills()
 
 
@@ -2018,6 +2053,20 @@ async def generate_skill(request: Request, session: Session = Depends(get_sessio
         logger.exception("Skill generation failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/api/skills/{name}")
+def delete_skill(name: str) -> dict:
+    success = SkillFactory.delete_skill(name)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to delete skill {name}")
+    return {"success": True}
+
+
+@app.post("/api/skills/{name}/toggle")
+def toggle_skill(name: str, active: bool = Query(...)) -> dict:
+    success = SkillFactory.toggle_skill(name, active)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to toggle skill {name}")
+    return {"success": True}
 
 @app.get("/api/jobs")
 def list_jobs(

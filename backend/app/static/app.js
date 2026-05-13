@@ -805,15 +805,49 @@ async function refreshSkills() {
   await guardedAction(["技能实验室", "加载列表"], async () => {
     const skills = await api("/api/skills/list");
     listNode.innerHTML = skills.map(skill => `
-      <div class="row skill-row">
-        <div>
+      <div class="row skill-row ${skill.active ? "" : "disabled-row"}">
+        <div class="skill-info">
           <strong>${h(skill.name)}</strong>
+          ${skill.active ? "" : '<span class="status-tag warning">已停用</span>'}
           <p><small>${h(skill.description || "无描述")}</small></p>
+        </div>
+        <div class="actions">
+          <button class="icon-button" data-action="toggle-skill" data-id="${h(skill.name)}" data-active="${skill.active}" title="${skill.active ? "停用" : "启用"}">
+            ${skill.active ? "🚫" : "✅"}
+          </button>
+          <button class="icon-button danger" data-action="delete-skill" data-id="${h(skill.name)}" title="删除">
+            🗑️
+          </button>
         </div>
       </div>
     `).join("") || '<div class="row">暂无可用技能</div>';
   });
 }
+
+$("#skill-list")?.addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  
+  const skillName = target.dataset.id;
+  const action = target.dataset.action;
+
+  if (action === "toggle-skill") {
+    const currentActive = target.dataset.active === "true";
+    await guardedAction(["技能实验室", currentActive ? "停用技能" : "启用技能"], async () => {
+      await api(`/api/skills/${skillName}/toggle?active=${!currentActive}`, { method: "POST" });
+      toast(currentActive ? "技能已停用" : "技能已启用");
+      refreshSkills();
+    });
+  } else if (action === "delete-skill") {
+    if (!confirm(`确定要删除技能 ${skillName} 吗？此操作不可撤销。`)) return;
+    await guardedAction(["技能实验室", "删除技能"], async () => {
+      await api(`/api/skills/${skillName}`, { method: "DELETE" });
+      toast("技能已删除");
+      refreshSkills();
+    });
+  }
+});
+
 
 $("#skill-generate-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -2578,6 +2612,23 @@ $("#cancel-pending-outbound")?.addEventListener("click", async () => {
     await refreshAll();
   });
 });
+
+$("#clear-outbound-queue")?.addEventListener("click", async () => {
+  if (!confirm("确定要清空全部待发送外发队列吗？\n所有 Pending 和 Failed 任务将被标记为 Cancelled。此操作需要管理员密码。")) return;
+  
+  const adminPassword = prompt("请输入管理员密码以执行清空操作：");
+  if (!adminPassword) return;
+
+  await guardedAction(["外发", "清空队列"], async () => {
+    const result = await api("/api/outbound-mails/clear-queue", {
+      method: "POST",
+      body: JSON.stringify({ admin_password: adminPassword }),
+    });
+    toast(`已清空 ${result.cleared} 个外发任务`);
+    refreshOutbound();
+  });
+});
+
 
 $("#notify-outbound-alerts")?.addEventListener("click", async () => {
   await guardedAction(["外发", "发送告警通知"], async () => {

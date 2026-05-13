@@ -39,7 +39,7 @@
         <a href="#outbound" data-page-link="outbound">外发</a>
         <a href="#exceptions" data-page-link="exceptions">异常</a>
         <a href="#ops" data-page-link="ops">运维</a>
-        <a href="#skill-lab" data-page-link="skill-lab">Skill Lab</a>
+        <a href="#skill-lab" data-page-link="skill-lab">技能实验室</a>
       </nav>
     </aside>
 
@@ -149,7 +149,7 @@
           <div id="products-promotions-pagination" class="pagination"></div>
         </div>
       </section>
-      <section class="page" data-page="skill-lab" data-title="Skill Lab" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
+      <section class="page" data-page="skill-lab" data-title="技能实验室" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
         <div class="section-head">
           <h2 id="skill-lab">技能实验室 (Skill Lab)</h2>
           <p>生成的技能将立即热加载到后端引擎，无需重启服务。</p>
@@ -458,6 +458,7 @@
           <input name="recipient" aria-label="收件人" placeholder="收件人" />
           <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
           <button id="cancel-pending-outbound" type="button" class="icon-button filter-action danger-action" title="批量取消当前筛选条件下的 Pending 外发" aria-label="批量取消 Pending 外发">⊘</button>
+          <button id="clear-outbound-queue" type="button" class="icon-button filter-action danger-action" title="彻底清空全部待发送外发队列 (需要管理员密码)" aria-label="清空外发队列">🗑️</button>
           <a class="icon-button filter-action" href="/api/outbound-mails/diagnostics/export.csv" target="_blank" title="导出失败诊断 CSV" aria-label="导出失败诊断 CSV">⇩</a>
           <button id="notify-outbound-alerts" type="button" class="icon-button filter-action" title="发送外发告警通知" aria-label="发送外发告警通知">✉</button>
           <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
