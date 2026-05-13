@@ -36,12 +36,18 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_mail_auto_worker_once() -> dict:
+import asyncio
+from backend.app.services.skills.executor import SkillExecutor
+from backend.app.services.skills.mail_skills import * # Ensure skills are registered
+
+async def run_mail_auto_worker_once() -> dict:
     started = monotonic()
     _WORKER_STATUS["run_count"] = int(_WORKER_STATUS.get("run_count") or 0) + 1
     _WORKER_STATUS["last_started_at"] = _iso_now()
     _WORKER_STATUS["last_error"] = None
+    
     with SessionLocal() as session:
+        executor = SkillExecutor(session)
         try:
             if not bot_enabled(session):
                 return _finish_worker_run(
@@ -53,6 +59,7 @@ def run_mail_auto_worker_once() -> dict:
                     },
                     started,
                 )
+            
             if not get_config(session, "bot_email_password", ""):
                 return _finish_worker_run({"enabled": True, "skipped": "bot_email_password is not configured"}, started)
 
@@ -63,6 +70,8 @@ def run_mail_auto_worker_once() -> dict:
                 "high_priority_mails": {"sent": 0, "failed": 0, "total": 0},
                 "low_priority_mails": {"sent": 0, "failed": 0, "total": 0},
             }
+
+            # 1. 处理任务队列 (Jobs)
             try:
                 result["processed"] = run_pending_jobs(session, limit=settings.mail_auto_worker_limit)
                 session.commit()
@@ -71,46 +80,44 @@ def run_mail_auto_worker_once() -> dict:
                 logger.exception("mail auto worker processing failed")
                 result["processed"] = {"completed": 0, "failed": 0, "total": 0, "error": str(exc)}
 
-            # ── 高优先级通道：priority ≤ 30（收件回执、业务推进、任务单）──
+            # 2. 高优先级通道技能
             high_priority_count = _pending_high_priority_count(session)
             if high_priority_count > 0:
-                try:
-                    result["high_priority_mails"] = _send_high_priority_mails(session, limit=settings.mail_auto_worker_limit)
-                    session.commit()
-                except Exception as exc:
-                    session.rollback()
-                    logger.exception("mail auto worker high priority send failed")
-                    result["high_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
+                skill_res = await executor.run("send_high_priority_mails", limit=settings.mail_auto_worker_limit)
+                if skill_res.success:
+                    result["high_priority_mails"] = skill_res.data
+                else:
+                    result["high_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": skill_res.message}
+                session.commit()
 
-            # ── 低优先级通道：priority > 30（通知、周报等）──
+            # 3. 低优先级通道技能
             low_priority_count = pending_auto_workflow_mail_count(session)
             if low_priority_count > 0:
-                try:
-                    result["low_priority_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
-                    session.commit()
-                except Exception as exc:
-                    session.rollback()
-                    logger.exception("mail auto worker low priority send failed")
-                    result["low_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": str(exc)}
+                skill_res = await executor.run("send_auto_workflow_mails", limit=settings.mail_auto_worker_limit)
+                if skill_res.success:
+                    result["low_priority_mails"] = skill_res.data
+                else:
+                    result["low_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": skill_res.message}
+                session.commit()
 
-            # 两个通道都没有待发邮件，才执行 IMAP 同步
+            # 4. 收件同步技能 (只有在没有待发邮件时才同步，避免 SMTP 风控)
             if high_priority_count == 0 and low_priority_count == 0:
-                try:
-                    result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
-                    session.commit()
-                except Exception as exc:
-                    session.rollback()
-                    logger.exception("mail auto worker sync failed")
-                    result["synced"] = {"imported": 0, "queued": 0, "error": str(exc)}
+                skill_res = await executor.run("receive_mails", limit=settings.mail_auto_worker_limit)
+                if skill_res.success:
+                    result["synced"] = skill_res.data
+                else:
+                    result["synced"] = {"imported": 0, "queued": 0, "error": skill_res.message}
+                session.commit()
             else:
                 result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
 
-            # ── 健康检查：最老 Pending 邮件年龄告警 ──
+            # 5. 健康检查
             _check_oldest_pending_age(session)
 
             return _finish_worker_run(result, started)
         except Exception as exc:
             _WORKER_STATUS["last_error"] = str(exc)
+            logger.exception("Mail worker critical failure")
             raise
 
 

@@ -39,7 +39,7 @@
         <a href="#outbound" data-page-link="outbound">外发</a>
         <a href="#exceptions" data-page-link="exceptions">异常</a>
         <a href="#ops" data-page-link="ops">运维</a>
-        <a href="#self-maintenance" data-page-link="self-maintenance">自维护</a>
+        <a href="#skill-lab" data-page-link="skill-lab">Skill Lab</a>
       </nav>
     </aside>
 
@@ -149,66 +149,35 @@
           <div id="products-promotions-pagination" class="pagination"></div>
         </div>
       </section>
-
-      <section class="page" data-page="self-maintenance" data-title="自维护" data-subtitle="通过对话诊断系统问题，生成只读排障建议和操作草案。">
+      <section class="page" data-page="skill-lab" data-title="Skill Lab" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
         <div class="section-head">
-          <h2>系统诊断</h2>
-          <p>当前 MVP 只生成诊断和建议，不会自动修改配置、发送邮件或部署代码。</p>
+          <h2 id="skill-lab">技能实验室 (Skill Lab)</h2>
+          <p>生成的技能将立即热加载到后端引擎，无需重启服务。</p>
         </div>
-        <div id="self-maintenance-summary" class="metrics"></div>
-        <form id="self-maintenance-form" class="chat-input">
-          <textarea name="message" rows="4" placeholder="例如：为什么今天外发邮件积压？最近模型兜底失败的原因是什么？"></textarea>
-          <label class="switch-line">
-            <input name="use_llm" type="checkbox" checked />
-            <span>使用当前模型诊断</span>
-          </label>
-          <button type="submit" class="button">生成诊断</button>
-        </form>
-        <form id="self-maintenance-code-plan-form" class="chat-input">
-          <textarea name="message" rows="3" placeholder="例如：为入库失败增加自动重试和更清晰的错误提示。"></textarea>
-          <label class="switch-line">
-            <input name="use_llm" type="checkbox" checked />
-            <span>使用当前模型规划</span>
-          </label>
-          <button type="submit" class="button ghost">生成代码修复草案</button>
-        </form>
-        <div class="section-head">
-          <h2>诊断结果</h2>
-          <p>结果会保存为维护会话，并记录审计事件；代码草案只用于人工实施。</p>
+        <div class="skill-lab-container">
+          <div class="skill-list-panel">
+            <h3>当前可用技能</h3>
+            <div id="skill-list" class="list compact-list">
+              <div class="loading">正在加载技能列表...</div>
+            </div>
+          </div>
+          <div class="skill-gen-panel">
+            <h3>进化新技能</h3>
+            <form id="skill-generate-form" class="chat-input">
+              <textarea name="requirement" rows="4" placeholder="例如：编写一个‘附件清理’技能，删除 30 天前下载的所有临时附件。"></textarea>
+              <div class="form-actions">
+                <button type="submit" class="button">生成并加载</button>
+              </div>
+            </form>
+            <div id="skill-gen-result" class="test-result" hidden>
+              <div class="result-header">
+                <strong id="gen-skill-name"></strong>
+                <span class="status-tag success">已加载</span>
+              </div>
+              <pre id="gen-skill-code" class="code-preview"></pre>
+            </div>
+          </div>
         </div>
-        <pre id="self-maintenance-result" class="test-result show">暂无诊断结果</pre>
-        <div id="self-maintenance-actions" class="list"></div>
-        <div class="section-head">
-          <h2>最近维护会话</h2>
-          <p>用于追踪诊断问题、风险等级和建议动作。</p>
-        </div>
-        <label class="switch-line">
-          <input id="self-maintenance-include-archived" type="checkbox" />
-          <span>显示已归档会话</span>
-        </label>
-        <form id="self-maintenance-session-filter-form" class="filters">
-          <label>状态 <select name="status"></select></label>
-          <label>风险 <select name="risk_level"></select></label>
-          <button type="submit" class="button ghost">筛选</button>
-        </form>
-        <div id="self-maintenance-sessions" class="list"></div>
-        <div id="self-maintenance-sessions-pagination" class="pagination" data-table-pagination="selfMaintenanceSessions"></div>
-        <div class="section-head">
-          <h2>维护时间线</h2>
-          <p>按时间串联诊断、草案、交接包、验证、实现回填和人工复核。</p>
-        </div>
-        <div id="self-maintenance-timeline" class="workflow-timeline"></div>
-        <div class="section-head">
-          <h2>最近维护动作</h2>
-          <p>显示配置应用、代码草案和外部 runner 验证结果。</p>
-        </div>
-        <form id="self-maintenance-action-filter-form" class="filters">
-          <label>动作类型 <select name="action_type"></select></label>
-          <label>状态 <select name="status"></select></label>
-          <button type="submit" class="button ghost">筛选</button>
-        </form>
-        <div id="self-maintenance-action-history" class="list"></div>
-        <div id="self-maintenance-actions-pagination" class="pagination" data-table-pagination="selfMaintenanceActions"></div>
       </section>
 
       <section class="page" data-page="reports" data-title="周报" data-subtitle="统计摘要、收件人和导出文件。">
@@ -780,19 +749,7 @@
       </section>
     </div>
 
-    <div id="self-maintenance-detail-modal" class="modal-backdrop" hidden>
-      <section class="modal-panel self-maintenance-detail-panel" role="dialog" aria-modal="true" aria-labelledby="self-maintenance-detail-title">
-        <div class="modal-head">
-          <div>
-            <small id="self-maintenance-detail-meta">维护会话</small>
-            <h2 id="self-maintenance-detail-title">自维护详情</h2>
-          </div>
-          <button id="self-maintenance-detail-close" type="button" class="icon-button" aria-label="关闭">×</button>
-        </div>
-        <div id="self-maintenance-detail-fields" class="mail-detail-fields"></div>
-        <pre id="self-maintenance-detail-body" class="mail-detail-body"></pre>
-      </section>
-    </div>
+
 
     <div id="product-spu-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-spu-title">

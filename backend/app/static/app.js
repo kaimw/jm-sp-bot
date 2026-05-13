@@ -7,7 +7,6 @@ let workflowChatState = { messages: [], compiledRule: null, validationErrors: []
 let runtimeConfigState = {};
 let startupReadinessState = { ready: false, missing: [] };
 let dashboardViewState = { period: "year" };
-let selfMaintenanceState = { context: null, lastSession: null, includeArchived: false, action_type: "", status: "" };
 let baiduMapLoadPromise = null;
 let baiduDemandMap = null;
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
@@ -22,8 +21,6 @@ const tableStates = {
   audit: { q: "", event_type: "", actor: "", related_object_type: "", page: 1, page_size: 10 },
   backups: { q: "", status: "", backup_type: "", page: 1, page_size: 10 },
   reviewRules: { q: "", status: "", page: 1, page_size: 10 },
-  selfMaintenanceSessions: { status: "", risk_level: "", page: 1, page_size: 5 },
-  selfMaintenanceActions: { action_type: "", status: "", page: 1, page_size: 8 },
   productsSpu: { q: "", page: 1, page_size: 10 },
   productsSku: { spu_id: "", page: 1, page_size: 10 },
   productsPricing: { sku_id: "", page: 1, page_size: 10 },
@@ -255,6 +252,10 @@ function setActivePage(pageName = currentPageName()) {
   });
   $("#page-title").textContent = target.dataset.title || "工作台";
   $("#page-subtitle").textContent = target.dataset.subtitle || "";
+
+  if (pageName === "skill-lab" || pageName === "self-maintenance") {
+    refreshSkills();
+  }
 }
 
 async function refreshDashboard() {
@@ -797,6 +798,55 @@ function renderOutboundDiagnostics(data) {
     }
   `;
 }
+async function refreshSkills() {
+  const listNode = $("#skill-list");
+  if (!listNode) return;
+  
+  await guardedAction(["技能实验室", "加载列表"], async () => {
+    const skills = await api("/api/skills/list");
+    listNode.innerHTML = skills.map(skill => `
+      <div class="row skill-row">
+        <div>
+          <strong>${h(skill.name)}</strong>
+          <p><small>${h(skill.description || "无描述")}</small></p>
+        </div>
+      </div>
+    `).join("") || '<div class="row">暂无可用技能</div>';
+  });
+}
+
+$("#skill-generate-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const requirement = form.requirement.value.trim();
+  if (!requirement) return;
+
+  const btn = form.querySelector("button");
+  const resultPanel = $("#skill-gen-result");
+  
+  btn.disabled = true;
+  btn.textContent = "正在进化中...";
+  resultPanel.hidden = true;
+
+  await guardedAction(["技能实验室", "进化新技能"], async () => {
+    const res = await api("/api/skills/generate", {
+      method: "POST",
+      body: JSON.stringify({ requirement })
+    });
+    
+    if (res.success) {
+      toast("进化成功！新技能已加载。");
+      form.requirement.value = "";
+      $("#gen-skill-name").textContent = res.skill_name;
+      $("#gen-skill-code").textContent = res.code_preview || "";
+      resultPanel.hidden = false;
+      refreshSkills();
+    }
+  });
+
+  btn.disabled = false;
+  btn.textContent = "生成并加载";
+});
 
 function fillForm(formSelector, values) {
   const form = $(formSelector);
@@ -1461,338 +1511,6 @@ async function refreshWeeklyReportRecipients() {
   $("#weekly-report-recipients-form [name=cc]").value = (data.cc || []).join(", ");
 }
 
-function renderSelfMaintenanceActions(actions) {
-  const node = $("#self-maintenance-actions");
-  if (!node) return;
-  node.innerHTML =
-    (actions || [])
-      .map((action) => {
-        const changes = (action.changes || [])
-          .map((change) => `${change.key}: ${change.before || "空"} -> ${change.after}（${change.reason || "配置修复"}）`)
-          .join("；");
-        const files = (action.suggested_files || []).join(", ");
-        const commands = (action.validation_commands || []).join("；");
-        const actionId = action.action_id || action.id || "";
-        const status = action.action_status || action.status || "Proposed";
-        const canApply = action.type === "config_patch" && actionId && status === "Proposed";
-        const codePlan = action.type === "code_patch_plan";
-        const runnerCommands = codePlan && actionId ? [
-          `python3 scripts/maintenance_runner.py handoff --action-id ${actionId}`,
-          `python3 scripts/maintenance_runner.py validate --action-id ${actionId}`,
-          `python3 scripts/maintenance_runner.py complete --action-id ${actionId} --summary "补丁已完成，等待人工复核"`,
-          `python3 scripts/maintenance_runner.py review --action-id ${actionId} --decision ReviewAccepted --note "人工复核通过"`,
-        ] : [];
-        return `
-        <div class="row">
-          <div><strong>${h(action.title || action.type || "建议动作")}</strong><br /><small>${h(action.type || "")}</small></div>
-          <div><small>风险</small><br />${h(action.risk || "Low")}</div>
-          <div><small>状态</small><br />${h(status)}</div>
-          <div>
-            <small>${h(action.detail || "")}${changes ? `；${h(changes)}` : ""}${files ? `；建议文件：${h(files)}` : ""}${commands ? `；验证：${h(commands)}` : ""}</small>
-            ${codePlan && action.plan_md ? `<pre class="test-result show">${h(action.plan_md)}</pre>` : ""}
-            ${runnerCommands.length ? `<pre class="test-result show">${h(runnerCommands.join("\n"))}</pre>` : ""}
-            ${canApply ? `<div class="actions row-actions"><button class="button ghost" type="button" data-action="apply-config-patch" data-id="${h(actionId)}">应用配置</button></div>` : ""}
-          </div>
-        </div>`;
-      })
-      .join("") || `<div class="row"><div>暂无建议动作</div></div>`;
-}
-
-function renderSelfMaintenanceContext(context) {
-  const node = $("#self-maintenance-summary");
-  if (!node || !context) return;
-  const processing = context.queues?.processing_counts || {};
-  const outbound = context.queues?.outbound_counts || {};
-  node.innerHTML = `
-    <div class="metric"><span>模型</span><strong>${context.runtime?.model_ready ? "就绪" : "未就绪"}</strong><small>${h(context.runtime?.active_model?.model_name || "未配置")}</small></div>
-    <div class="metric"><span>入库失败</span><strong>${h(processing.Failed || 0)}</strong><small>Pending ${h(processing.Pending || 0)} / Running ${h(processing.Running || 0)}</small></div>
-    <div class="metric"><span>外发积压</span><strong>${h(outbound.Pending || 0)}</strong><small>Failed ${h(outbound.Failed || 0)}，最早等待 ${h(formatDuration(context.queues?.oldest_pending_outbound_age_seconds || 0))}</small></div>
-    <div class="metric"><span>开放异常</span><strong>${h(context.exceptions?.open_count || 0)}</strong><small>24 小时新增 ${h(context.exceptions?.created_last_24h || 0)}</small></div>
-  `;
-}
-
-function summarizeMaintenanceActionResult(result) {
-  if (!result || typeof result !== "object") return "";
-  const parts = [];
-  if (result.report_path) parts.push(`报告：${result.report_path}`);
-  if (result.handoff) {
-    const paths = [result.handoff.markdown_path, result.handoff.json_path].filter(Boolean).join("，");
-    if (paths) parts.push(`交接包：${paths}`);
-  }
-  if (Array.isArray(result.commands) && result.commands.length) {
-    parts.push(`命令：${result.commands.map((item) => `${item.command}=${item.exit_code}`).join("；")}`);
-  }
-  if (Array.isArray(result.applied) && result.applied.length) {
-    parts.push(`配置：${result.applied.map((item) => `${item.key}: ${item.before || "空"} -> ${item.after}`).join("；")}`);
-  }
-  if (result.implementation) {
-    const item = result.implementation;
-    const files = Array.isArray(item.changed_files) && item.changed_files.length ? `；文件：${item.changed_files.join(", ")}` : "";
-    const risks = Array.isArray(item.residual_risks) && item.residual_risks.length ? `；风险：${item.residual_risks.join("；")}` : "";
-    parts.push(`实现：${item.status || ""} ${item.summary || ""}${files}${risks}`);
-  }
-  if (result.review) {
-    parts.push(`复核：${result.review.decision || ""} ${result.review.note || ""}`.trim());
-  }
-  return parts.join("；") || JSON.stringify(result).slice(0, 240);
-}
-
-function renderSelfMaintenanceHandoff(detail) {
-  const markdown = detail.markdown || {};
-  const json = detail.json || {};
-  const handoff = detail.handoff || {};
-  const paths = [
-    markdown.path ? `Markdown: ${markdown.path}${markdown.exists ? "" : "（文件不存在）"}` : "",
-    json.path ? `JSON: ${json.path}${json.exists ? "" : "（文件不存在）"}` : "",
-  ].filter(Boolean).join("\n");
-  const commands = Array.isArray(handoff.runner_commands) ? handoff.runner_commands.join("\n") : "";
-  const sections = [
-    `交接包 ${detail.action_id} / ${detail.status}`,
-    paths,
-    commands ? `\nRunner Commands\n${commands}` : "",
-    markdown.content ? `\nMarkdown\n${markdown.content}` : "",
-    json.raw ? `\nJSON\n${json.raw}` : "",
-  ].filter(Boolean);
-  $("#self-maintenance-result").textContent = sections.join("\n\n");
-}
-
-function maintenanceTimelineDetail(detail) {
-  if (!detail) return "";
-  if (typeof detail === "string") return detail;
-  if (detail.message) return `${detail.message}${detail.risk_level ? ` / 风险：${detail.risk_level}` : ""}`;
-  if (detail.summary) return detail.summary;
-  if (detail.note) return detail.note;
-  if (detail.detail) return detail.detail;
-  if (detail.markdown_path || detail.json_path) return [detail.markdown_path, detail.json_path].filter(Boolean).join("，");
-  if (Array.isArray(detail.changed_files) && detail.changed_files.length) return `文件：${detail.changed_files.join(", ")}`;
-  if (Array.isArray(detail.commands) && detail.commands.length) return `命令：${detail.commands.map((item) => `${item.command}=${item.exit_code}`).join("；")}`;
-  if (Array.isArray(detail.applied) && detail.applied.length) return detail.applied.map((item) => `${item.key}: ${item.before || "空"} -> ${item.after}`).join("；");
-  if (detail.status) return detail.status;
-  return JSON.stringify(detail).slice(0, 240);
-}
-
-function renderSelfMaintenanceTimeline(timeline) {
-  const node = $("#self-maintenance-timeline");
-  if (!node) return;
-  node.innerHTML =
-    (timeline || [])
-      .map(
-        (item) => `
-        <div class="timeline-item">
-          <div><small>${h(formatTime(item.created_at))}</small></div>
-          <div><strong>${h(item.title || item.event_type)}</strong><br /><small>${h(item.status || item.event_type)}${item.source ? ` · ${h(item.source)}` : ""}</small></div>
-          <div><small>${h(maintenanceTimelineDetail(item.detail))}</small></div>
-        </div>`
-      )
-      .join("") || `<div class="timeline-item"><div>暂无维护时间线</div></div>`;
-}
-
-function summarizeMaintenanceSessionAction(action) {
-  const input = action.input || {};
-  const title = input.title || action.action_type || "维护动作";
-  const detail = input.detail || input.summary || action.error_message || summarizeMaintenanceActionResult(action.result);
-  return `- ${title} [${action.status || "unknown"}] ${action.id || ""}${detail ? `\n  ${detail}` : ""}`;
-}
-
-function summarizeMaintenanceSessionProposal(item) {
-  const title = item.title || item.action_type || "建议动作";
-  const status = item.action_status || item.status || "Proposed";
-  const detail = item.detail || item.summary || item.reason || "";
-  return `- ${title} [${status}]${detail ? `\n  ${detail}` : ""}`;
-}
-
-function formatSelfMaintenanceSessionDetail(detail) {
-  const proposedActions = Array.isArray(detail.proposed_actions) ? detail.proposed_actions : [];
-  const actions = Array.isArray(detail.actions) ? detail.actions : [];
-  const timeline = Array.isArray(detail.timeline) ? detail.timeline : [];
-  const sections = [
-    "## 诊断",
-    detail.diagnosis_md || "暂无诊断内容",
-    "",
-    "## 建议动作",
-    proposedActions.map(summarizeMaintenanceSessionProposal).join("\n") || "暂无建议动作",
-    "",
-    "## 维护动作",
-    actions.map(summarizeMaintenanceSessionAction).join("\n") || "暂无维护动作",
-    "",
-    "## 时间线",
-    timeline.map((item) => `- ${formatTime(item.created_at)} ${item.title || item.event_type}: ${maintenanceTimelineDetail(item.detail)}`).join("\n") || "暂无时间线",
-    "",
-    "## 采集上下文",
-    JSON.stringify(detail.collected_context || {}, null, 2),
-  ];
-  return sections.join("\n");
-}
-
-async function openSelfMaintenanceSessionDetail(sessionId) {
-  const detail = await api(`/api/self-maintenance/sessions/${sessionId}`);
-  selfMaintenanceState.lastSession = detail;
-  $("#self-maintenance-detail-title").textContent = detail.user_message || "自维护详情";
-  $("#self-maintenance-detail-meta").textContent = `${detail.status || "维护会话"} · ${detail.created_at || ""}`;
-  $("#self-maintenance-detail-fields").innerHTML = `
-    <div><small>会话ID</small><strong>${h(detail.id || "未记录")}</strong></div>
-    <div><small>风险等级</small><strong>${h(detail.risk_level || "未记录")}</strong></div>
-    <div><small>状态</small><strong>${h(detail.status || "未记录")}</strong></div>
-    <div><small>创建人</small><strong>${h(detail.created_by || "system")}</strong></div>
-    <div><small>建议动作</small><strong>${h((detail.proposed_actions || []).length)}</strong></div>
-    <div><small>维护动作</small><strong>${h((detail.actions || []).length)}</strong></div>
-    <div><small>时间线事件</small><strong>${h((detail.timeline || []).length)}</strong></div>
-  `;
-  $("#self-maintenance-detail-body").textContent = formatSelfMaintenanceSessionDetail(detail);
-  renderSelfMaintenanceActions(detail.proposed_actions || []);
-  renderSelfMaintenanceTimeline(detail.timeline || []);
-  $("#self-maintenance-detail-modal").hidden = false;
-}
-
-function formatSelfMaintenanceActionDetail(detail) {
-  const sections = [
-    "## 动作输入",
-    JSON.stringify(detail.input || {}, null, 2),
-    "",
-    "## 动作结果",
-    JSON.stringify(detail.result || {}, null, 2),
-    "",
-    "## Runner 命令",
-    Array.isArray(detail.runner_commands) && detail.runner_commands.length ? detail.runner_commands.join("\n") : "暂无 runner 命令",
-    "",
-    "## 关联会话",
-    detail.session ? `${detail.session.user_message || ""}\n状态：${detail.session.status || ""}\n风险：${detail.session.risk_level || ""}` : "未关联会话",
-    "",
-    "## 会话时间线",
-    Array.isArray(detail.timeline) && detail.timeline.length
-      ? detail.timeline.map((item) => `- ${formatTime(item.created_at)} ${item.title || item.event_type}: ${maintenanceTimelineDetail(item.detail)}`).join("\n")
-      : "暂无时间线",
-  ];
-  return sections.join("\n");
-}
-
-async function openSelfMaintenanceActionDetail(actionId) {
-  const detail = await api(`/api/self-maintenance/actions/${actionId}`);
-  const input = detail.input || {};
-  selfMaintenanceState.lastSession = detail.session || selfMaintenanceState.lastSession;
-  $("#self-maintenance-detail-title").textContent = input.title || detail.action_type || "维护动作详情";
-  $("#self-maintenance-detail-meta").textContent = `${detail.status || "维护动作"} · ${detail.created_at || ""}`;
-  $("#self-maintenance-detail-fields").innerHTML = `
-    <div><small>动作ID</small><strong>${h(detail.id || "未记录")}</strong></div>
-    <div><small>会话ID</small><strong>${h(detail.session_id || "未记录")}</strong></div>
-    <div><small>类型</small><strong>${h(detail.action_type || "未记录")}</strong></div>
-    <div><small>状态</small><strong>${h(detail.status || "未记录")}</strong></div>
-    <div><small>批准人</small><strong>${h(detail.approved_by || "未批准")}</strong></div>
-    <div><small>错误</small><strong>${h(detail.error_message || "无")}</strong></div>
-    <div><small>Runner 命令</small><strong>${h((detail.runner_commands || []).length)}</strong></div>
-  `;
-  $("#self-maintenance-detail-body").textContent = formatSelfMaintenanceActionDetail(detail);
-  if (detail.timeline) renderSelfMaintenanceTimeline(detail.timeline || []);
-  $("#self-maintenance-detail-modal").hidden = false;
-}
-
-function closeSelfMaintenanceSessionDetail() {
-  $("#self-maintenance-detail-modal").hidden = true;
-}
-
-function renderSelfMaintenanceActionHistory(actions) {
-  const node = $("#self-maintenance-action-history");
-  if (!node) return;
-  node.innerHTML =
-    (actions || [])
-      .map((row) => {
-        const input = row.input || {};
-        const codePlan = row.action_type === "code_patch_plan";
-        const canCreateHandoff = codePlan && ["Proposed", "Validated", "ValidationFailed", "HandoffReady"].includes(row.status);
-        const canViewHandoff = codePlan && row.result?.handoff;
-        const canRunValidation = codePlan && !["ReviewAccepted", "ReviewRejected"].includes(row.status);
-        const canReportImplementation = codePlan && !["ReviewAccepted", "ReviewRejected"].includes(row.status);
-        const reviewable = row.action_type === "code_patch_plan" && ["PatchReady", "PatchFailed"].includes(row.status);
-        const runnerCommands = Array.isArray(row.runner_commands) ? row.runner_commands : [];
-        return `
-        <div class="row">
-          <div><strong>${h(input.title || row.action_type)}</strong><br /><small>${h(row.id)}</small></div>
-          <div><small>类型</small><br />${h(row.action_type)}</div>
-          <div><small>状态</small><br />${h(row.status)}</div>
-          <div>
-            <small>${h(row.error_message || summarizeMaintenanceActionResult(row.result) || row.created_at)}</small>
-            ${runnerCommands.length ? `<pre class="test-result show">${h(runnerCommands.join("\n"))}</pre>` : ""}
-            <div class="actions row-actions">
-                    <button class="button ghost" type="button" data-action="view-maintenance-action-detail" data-id="${h(row.id)}">查看详情</button>
-                    ${canCreateHandoff ? `<button class="button ghost" type="button" data-action="create-maintenance-handoff" data-id="${h(row.id)}">${row.status === "HandoffReady" ? "重新生成交接包" : "生成交接包"}</button>` : ""}
-                    ${canViewHandoff ? `<button class="button ghost" type="button" data-action="view-maintenance-handoff" data-id="${h(row.id)}">查看交接包</button>` : ""}
-                    ${canRunValidation ? `<button class="button ghost" type="button" data-action="run-maintenance-validation" data-id="${h(row.id)}">运行验证</button>` : ""}
-                    ${canReportImplementation ? `<button class="button ghost" type="button" data-action="report-maintenance-implementation" data-id="${h(row.id)}">回填执行</button>` : ""}
-                    ${reviewable ? `<button class="button ghost" type="button" data-action="review-maintenance-action" data-id="${h(row.id)}" data-decision="ReviewAccepted">接受</button>` : ""}
-                    ${reviewable ? `<button class="button ghost" type="button" data-action="review-maintenance-action" data-id="${h(row.id)}" data-decision="NeedsRevision">继续修改</button>` : ""}
-                    ${reviewable ? `<button class="button ghost" type="button" data-action="review-maintenance-action" data-id="${h(row.id)}" data-decision="ReviewRejected">驳回</button>` : ""}
-                  </div>
-          </div>
-        </div>`;
-      })
-      .join("") || `<div class="row"><div>暂无维护动作</div></div>`;
-}
-
-async function refreshSelfMaintenance() {
-  const sessionState = tableStates.selfMaintenanceSessions;
-  const actionState = tableStates.selfMaintenanceActions;
-  selfMaintenanceState.includeArchived = Boolean($("#self-maintenance-include-archived")?.checked);
-  const sessionFilterForm = $("#self-maintenance-session-filter-form");
-  if (sessionFilterForm) {
-    sessionState.status = sessionFilterForm.querySelector("[name=status]")?.value || "";
-    sessionState.risk_level = sessionFilterForm.querySelector("[name=risk_level]")?.value || "";
-  }
-  const actionFilterForm = $("#self-maintenance-action-filter-form");
-  if (actionFilterForm) {
-    actionState.action_type = actionFilterForm.querySelector("[name=action_type]")?.value || "";
-    actionState.status = actionFilterForm.querySelector("[name=status]")?.value || "";
-  }
-  const sessionParams = queryFromState(sessionState);
-  const sessionsQuery = `${sessionParams}${sessionParams && selfMaintenanceState.includeArchived ? "&" : ""}${selfMaintenanceState.includeArchived ? "include_archived=true" : ""}`;
-  const actionParams = queryFromState(actionState);
-  const [context, sessionsPayload, actionsPayload] = await Promise.all([
-    api("/api/self-maintenance/context"),
-    api(`/api/self-maintenance/sessions?${sessionsQuery}`),
-    api(`/api/self-maintenance/actions?${actionParams.toString()}`),
-  ]);
-  selfMaintenanceState.context = context;
-  renderSelfMaintenanceContext(context);
-  const sessions = normalizeListPayload(sessionsPayload, sessionState);
-  const actions = normalizeListPayload(actionsPayload, { page_size: 8 });
-  setSelectOptions("#self-maintenance-session-filter-form [name=status]", sessions.status_options || [], "全部状态", sessionState.status);
-  setSelectOptions("#self-maintenance-session-filter-form [name=risk_level]", sessions.risk_level_options || [], "全部风险", sessionState.risk_level);
-  setSelectOptions("#self-maintenance-action-filter-form [name=action_type]", actions.action_type_options || [], "全部类型", actionState.action_type);
-  setSelectOptions("#self-maintenance-action-filter-form [name=status]", actions.status_options || [], "全部状态", actionState.status);
-  $("#self-maintenance-sessions").innerHTML =
-    (sessions.items || [])
-      .map(
-        (row) => `
-        <div class="row">
-          <div><strong>${h(row.user_message)}</strong><br /><small>${h(row.id)}</small></div>
-          <div><small>风险</small><br />${h(row.risk_level)}</div>
-          <div><small>状态</small><br />${h(row.status)}</div>
-          <div>
-            <small>${h(row.created_at)}</small>
-            <div class="actions row-actions">
-              <button class="button ghost" type="button" data-action="view-maintenance-detail" data-id="${h(row.id)}">查看详情</button>
-              <button class="button ghost" type="button" data-action="view-maintenance-timeline" data-id="${h(row.id)}">查看时间线</button>
-              ${row.status !== "Archived" ? `<button class="button ghost" type="button" data-action="archive-maintenance-session" data-id="${h(row.id)}">归档</button>` : ""}
-            </div>
-          </div>
-        </div>`
-      )
-      .join("") || `<div class="row"><div>${selfMaintenanceState.includeArchived ? "暂无维护会话" : "暂无未归档维护会话"}</div></div>`;
-  const timelineSessionId = selfMaintenanceState.lastSession?.id || sessions.items?.[0]?.id || "";
-  if (timelineSessionId) {
-    try {
-      const timelinePayload = await api(`/api/self-maintenance/sessions/${timelineSessionId}/timeline`);
-      renderSelfMaintenanceTimeline(timelinePayload.timeline || []);
-    } catch (error) {
-      renderSelfMaintenanceTimeline([]);
-    }
-  } else {
-    renderSelfMaintenanceTimeline([]);
-  }
-  renderSelfMaintenanceActionHistory(actions.items || []);
-  renderListPagination("#self-maintenance-sessions-pagination", "selfMaintenanceSessions", sessions);
-  renderListPagination("#self-maintenance-actions-pagination", "selfMaintenanceActions", actions);
-}
-
 async function refreshJobs() {
   const data = normalizeListPayload(await api(`/api/jobs?${queryFromState(tableStates.jobs)}`), tableStates.jobs);
   const rows = data.items || [];
@@ -2085,7 +1803,7 @@ async function loadTemplate() {
 async function refreshAll() {
   await Promise.all([
     refreshDashboard(),
-    refreshSelfMaintenance(),
+    refreshSkills(),
     refreshDepartments(),
     refreshTasks(),
     refreshOutbound(),
@@ -2118,8 +1836,6 @@ const tableRefreshers = {
   audit: refreshOps,
   backups: refreshOps,
   reviewRules: async () => renderInitialReviewRules(),
-  selfMaintenanceSessions: refreshSelfMaintenance,
-  selfMaintenanceActions: refreshSelfMaintenance,
 };
 
 const clearListConfigs = {
@@ -2908,298 +2624,6 @@ $("#model-chat-form").addEventListener("submit", async (event) => {
   }
 });
 
-$("#self-maintenance-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const input = form.querySelector("[name=message]");
-  const button = form.querySelector("button[type=submit]");
-  const message = input.value.trim();
-  if (!message) {
-    toast("请输入要诊断的问题");
-    return;
-  }
-  button.disabled = true;
-  $("#self-maintenance-result").textContent = "正在收集上下文并生成诊断...";
-  try {
-    const result = await api("/api/self-maintenance/diagnose", {
-      method: "POST",
-      body: JSON.stringify({
-        message,
-        use_llm: Boolean(form.querySelector("[name=use_llm]")?.checked),
-      }),
-    });
-    selfMaintenanceState.lastSession = result;
-    $("#self-maintenance-result").textContent = result.diagnosis_md || "诊断完成，但没有返回文本。";
-    renderSelfMaintenanceContext(result.collected_context);
-    renderSelfMaintenanceActions(result.proposed_actions || []);
-    input.value = "";
-    toast(`诊断完成：${result.risk_level}`);
-    await refreshSelfMaintenance();
-  } catch (error) {
-    $("#self-maintenance-result").textContent = error.message || "诊断失败";
-    notifyError(error, ["自维护", "诊断失败"]);
-  } finally {
-    button.disabled = false;
-    input.focus();
-  }
-});
-
-$("#self-maintenance-code-plan-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const input = form.querySelector("[name=message]");
-  const button = form.querySelector("button[type=submit]");
-  const message = input.value.trim();
-  if (!message) {
-    toast("请输入要规划的修复或升级需求");
-    return;
-  }
-  button.disabled = true;
-  $("#self-maintenance-result").textContent = "正在生成代码修复草案...";
-  try {
-    const result = await api("/api/self-maintenance/code-plan", {
-      method: "POST",
-      body: JSON.stringify({
-        message,
-        session_id: selfMaintenanceState.lastSession?.id || null,
-        use_llm: Boolean(form.querySelector("[name=use_llm]")?.checked),
-      }),
-    });
-    selfMaintenanceState.lastSession = result;
-    $("#self-maintenance-result").textContent = result.diagnosis_md || "代码修复草案已生成。";
-    renderSelfMaintenanceContext(result.collected_context);
-    renderSelfMaintenanceActions(result.proposed_actions || []);
-    input.value = "";
-    toast("代码修复草案已生成");
-    await refreshSelfMaintenance();
-  } catch (error) {
-    $("#self-maintenance-result").textContent = error.message || "生成代码修复草案失败";
-    notifyError(error, ["自维护", "代码草案失败"]);
-  } finally {
-    button.disabled = false;
-    input.focus();
-  }
-});
-
-$("#self-maintenance-actions")?.addEventListener("click", async (event) => {
-  const target = event.target.closest("button[data-action=apply-config-patch]");
-  if (!target) return;
-  const adminPassword = window.prompt("请输入管理员密码确认应用该配置修复。");
-  if (adminPassword === null) return;
-  if (!adminPassword.trim()) {
-    toast("管理员密码不能为空");
-    return;
-  }
-  const ok = window.confirm("确认应用该配置修复？此操作会写入运行期配置并记录审计。");
-  if (!ok) return;
-  try {
-    await api(`/api/self-maintenance/actions/${target.dataset.id}/apply`, {
-      method: "POST",
-      body: JSON.stringify({ admin_password: adminPassword }),
-    });
-    toast("配置修复已应用");
-    if (selfMaintenanceState.lastSession?.id) {
-      const detail = await api(`/api/self-maintenance/sessions/${selfMaintenanceState.lastSession.id}`);
-      selfMaintenanceState.lastSession = detail;
-      renderSelfMaintenanceActions(detail.proposed_actions || []);
-    }
-    await Promise.all([refreshSelfMaintenance(), refreshConfig(), refreshOps()]);
-  } catch (error) {
-    notifyError(error, ["自维护", "应用配置失败"]);
-  }
-});
-
-$("#self-maintenance-sessions")?.addEventListener("click", async (event) => {
-  const target = event.target.closest("button[data-action=view-maintenance-detail], button[data-action=view-maintenance-timeline], button[data-action=archive-maintenance-session]");
-  if (!target) return;
-  if (target.dataset.action === "view-maintenance-detail") {
-    try {
-      await openSelfMaintenanceSessionDetail(target.dataset.id);
-    } catch (error) {
-      notifyError(error, ["自维护", "读取详情失败"]);
-    }
-    return;
-  }
-  if (target.dataset.action === "archive-maintenance-session") {
-    const adminPassword = window.prompt("请输入管理员密码确认归档该维护会话。");
-    if (adminPassword === null) return;
-    if (!adminPassword.trim()) {
-      toast("管理员密码不能为空");
-      return;
-    }
-    const note = window.prompt("归档备注", "已处理完成") || "";
-    try {
-      await api(`/api/self-maintenance/sessions/${target.dataset.id}/archive`, {
-        method: "POST",
-        body: JSON.stringify({ admin_password: adminPassword, note }),
-      });
-      toast("维护会话已归档");
-      if (selfMaintenanceState.lastSession?.id === target.dataset.id) {
-        selfMaintenanceState.lastSession = null;
-      }
-      await refreshSelfMaintenance();
-    } catch (error) {
-      notifyError(error, ["自维护", "归档失败"]);
-    }
-    return;
-  }
-  try {
-    const timelinePayload = await api(`/api/self-maintenance/sessions/${target.dataset.id}/timeline`);
-    selfMaintenanceState.lastSession = timelinePayload.session || selfMaintenanceState.lastSession;
-    renderSelfMaintenanceTimeline(timelinePayload.timeline || []);
-    toast("维护时间线已载入");
-  } catch (error) {
-    notifyError(error, ["自维护", "读取时间线失败"]);
-  }
-});
-
-$("#self-maintenance-include-archived")?.addEventListener("change", async () => {
-  tableStates.selfMaintenanceSessions.page = 1;
-  await refreshSelfMaintenance();
-});
-
-$("#self-maintenance-session-filter-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  tableStates.selfMaintenanceSessions.page = 1;
-  await refreshSelfMaintenance();
-});
-
-$("#self-maintenance-session-filter-form")?.addEventListener("change", async () => {
-  tableStates.selfMaintenanceSessions.page = 1;
-  await refreshSelfMaintenance();
-});
-
-$("#self-maintenance-action-filter-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  tableStates.selfMaintenanceActions.page = 1;
-  await refreshSelfMaintenance();
-});
-
-$("#self-maintenance-action-filter-form")?.addEventListener("change", async () => {
-  tableStates.selfMaintenanceActions.page = 1;
-  await refreshSelfMaintenance();
-});
-
-$("#self-maintenance-action-history")?.addEventListener("click", async (event) => {
-  const target = event.target.closest("button[data-action=view-maintenance-action-detail], button[data-action=review-maintenance-action], button[data-action=create-maintenance-handoff], button[data-action=view-maintenance-handoff], button[data-action=run-maintenance-validation], button[data-action=report-maintenance-implementation]");
-  if (!target) return;
-  if (target.dataset.action === "view-maintenance-action-detail") {
-    try {
-      await openSelfMaintenanceActionDetail(target.dataset.id);
-    } catch (error) {
-      notifyError(error, ["自维护", "读取动作详情失败"]);
-    }
-    return;
-  }
-  if (target.dataset.action === "view-maintenance-handoff") {
-    try {
-      const detail = await api(`/api/self-maintenance/actions/${target.dataset.id}/handoff`);
-      renderSelfMaintenanceHandoff(detail);
-      toast("交接包已载入");
-    } catch (error) {
-      notifyError(error, ["自维护", "读取交接包失败"]);
-    }
-    return;
-  }
-  const adminPassword = window.prompt("请输入管理员密码确认自维护动作。");
-  if (adminPassword === null) return;
-  if (!adminPassword.trim()) {
-    toast("管理员密码不能为空");
-    return;
-  }
-  if (target.dataset.action === "create-maintenance-handoff") {
-    try {
-      await api(`/api/self-maintenance/actions/${target.dataset.id}/handoff`, {
-        method: "POST",
-        body: JSON.stringify({ admin_password: adminPassword }),
-      });
-      toast("交接包已生成");
-      await refreshSelfMaintenance();
-    } catch (error) {
-      notifyError(error, ["自维护", "生成交接包失败"]);
-    }
-    return;
-  }
-  if (target.dataset.action === "run-maintenance-validation") {
-    const commandText = window.prompt(
-      "验证命令，只允许白名单命令；可用逗号或换行分隔",
-      "node --check backend/app/static/app.js"
-    );
-    if (commandText === null) return;
-    const commands = splitRoutingNames(commandText);
-    const timeoutInput = window.prompt("单条命令超时时间（秒）", "300");
-    if (timeoutInput === null) return;
-    const timeoutSeconds = Number(timeoutInput || 300);
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 900) {
-      toast("超时时间必须在 1-900 秒之间");
-      return;
-    }
-    try {
-      await api(`/api/self-maintenance/actions/${target.dataset.id}/validate`, {
-        method: "POST",
-        body: JSON.stringify({
-          admin_password: adminPassword,
-          commands,
-          timeout_seconds: Math.round(timeoutSeconds),
-        }),
-      });
-      toast("验证已完成");
-      await refreshSelfMaintenance();
-    } catch (error) {
-      notifyError(error, ["自维护", "运行验证失败"]);
-    }
-    return;
-  }
-  if (target.dataset.action === "report-maintenance-implementation") {
-    const status = (window.prompt("执行状态：PatchReady 或 PatchFailed", "PatchReady") || "").trim();
-    if (!["PatchReady", "PatchFailed"].includes(status)) {
-      toast("执行状态只能是 PatchReady 或 PatchFailed");
-      return;
-    }
-    const summary = (window.prompt("执行摘要", status === "PatchReady" ? "补丁已完成，等待人工复核" : "补丁执行失败，需要继续修改") || "").trim();
-    if (!summary) {
-      toast("执行摘要不能为空");
-      return;
-    }
-    const changedFiles = splitRoutingNames(window.prompt("改动文件，使用逗号或换行分隔", "") || "");
-    const tests = splitRoutingNames(window.prompt("已运行测试，使用逗号或换行分隔", "python3 -m pytest") || "");
-    const residualRisks = splitRoutingNames(window.prompt("残余风险，使用逗号或换行分隔；没有可留空", "") || "");
-    try {
-      await api(`/api/self-maintenance/actions/${target.dataset.id}/implementation`, {
-        method: "POST",
-        body: JSON.stringify({
-          admin_password: adminPassword,
-          status,
-          summary,
-          changed_files: changedFiles,
-          tests,
-          residual_risks: residualRisks,
-        }),
-      });
-      toast("执行记录已回填");
-      await refreshSelfMaintenance();
-    } catch (error) {
-      notifyError(error, ["自维护", "回填执行失败"]);
-    }
-    return;
-  }
-  const note = window.prompt("请输入复核备注。", target.dataset.decision === "ReviewAccepted" ? "人工复核通过" : "") || "";
-  try {
-    await api(`/api/self-maintenance/actions/${target.dataset.id}/review`, {
-      method: "POST",
-      body: JSON.stringify({
-        admin_password: adminPassword,
-        decision: target.dataset.decision,
-        note,
-      }),
-    });
-    toast("复核结论已记录");
-    await refreshSelfMaintenance();
-  } catch (error) {
-    notifyError(error, ["自维护", "记录复核失败"]);
-  }
-});
-
 $("#cleanup-preview").addEventListener("click", async () => {
   const result = await api("/api/cleanup/preview", { method: "POST" });
   toast(`可清理 ${result.mail_count} 封非目标邮件，附件 ${result.attachment_count} 个`);
@@ -3345,10 +2769,7 @@ $("#mail-detail-modal")?.addEventListener("click", (event) => {
   if (event.target.id === "mail-detail-modal") closeMailDetail();
 });
 
-$("#self-maintenance-detail-close")?.addEventListener("click", closeSelfMaintenanceSessionDetail);
-$("#self-maintenance-detail-modal")?.addEventListener("click", (event) => {
-  if (event.target.id === "self-maintenance-detail-modal") closeSelfMaintenanceSessionDetail();
-});
+
 
 $("#exceptions-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");

@@ -247,6 +247,66 @@ label {
   padding: 0;
   font-size: 17px;
 }
+/* 技能实验室 (Skill Lab) */
+.skill-lab-container {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 2rem;
+  margin-top: 1rem;
+}
+
+.skill-list-panel, .skill-gen-panel {
+  background: var(--bg-hover);
+  padding: 1.5rem;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+}
+
+.compact-list .skill-row {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.compact-list .skill-row:last-child {
+  border-bottom: none;
+}
+
+.skill-row strong {
+  color: var(--primary-color);
+  font-size: 0.95rem;
+}
+
+.skill-row p {
+  margin: 0.25rem 0 0;
+  color: var(--text-color-light);
+}
+
+.code-preview {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 1rem;
+  border-radius: 8px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 0.85rem;
+  overflow-x: auto;
+  max-height: 400px;
+  border: 1px solid #333;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.status-tag {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 100px;
+  background: var(--success-bg);
+  color: var(--success-text);
+}
 
 .button {
   padding: 0 14px;

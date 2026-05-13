@@ -30,8 +30,6 @@ from backend.app.models import (
     MailMessage,
     MailWorkflowMatch,
     MailTemplate,
-    MaintenanceAction,
-    MaintenanceSession,
     ModelProviderConfig,
     OrderRequirement,
     OutboundMailJob,
@@ -63,14 +61,6 @@ from backend.app.schemas import (
     ProductionQuestionRequest,
     TaskClearRequest,
     SalesReplyRequest,
-    SelfMaintenanceActionApplyRequest,
-    SelfMaintenanceCodePlanRequest,
-    SelfMaintenanceDiagnoseRequest,
-    SelfMaintenanceHandoffRequest,
-    SelfMaintenanceImplementationReportRequest,
-    SelfMaintenanceReviewRequest,
-    SelfMaintenanceSessionArchiveRequest,
-    SelfMaintenanceValidationRequest,
     TaskManualCloseRequest,
     TemplateUpdate,
     WorkflowContactMapUpdate,
@@ -107,21 +97,6 @@ from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
-from backend.app.services.self_maintenance import (
-    apply_maintenance_action,
-    archive_maintenance_session,
-    build_self_maintenance_context,
-    create_code_patch_plan,
-    create_maintenance_handoff_package,
-    create_maintenance_diagnosis,
-    maintenance_session_timeline,
-    read_maintenance_handoff_package,
-    report_maintenance_implementation,
-    review_maintenance_implementation,
-    run_maintenance_validation,
-    serialize_maintenance_action,
-    serialize_maintenance_session,
-)
 from backend.app.services.workflow_rules import (
     activate_workflow_version,
     chat_generate_workflow_rule,
@@ -167,7 +142,8 @@ from backend.app.services.products import (
     delete_promotion_rule,
     toggle_promotion_rule,
 )
-
+from backend.app.services.skills.registry import registry
+from backend.app.services.skills.factory import SkillFactory
 
 app = FastAPI(title="商务生产任务单智能体 MVP")
 
@@ -231,6 +207,9 @@ async def startup() -> None:
     with SessionLocal() as session:
         seed_defaults(session)
         session.commit()
+    # 加载动态生成的技能
+    registry.load_dynamic_skills()
+    
     if settings.mail_auto_worker_enabled:
         global mail_worker_task
         mail_worker_task = asyncio.create_task(mail_auto_worker_loop())
@@ -248,7 +227,7 @@ async def mail_auto_worker_loop() -> None:
     await asyncio.sleep(await asyncio.to_thread(configured_mail_worker_interval_seconds))
     while True:
         try:
-            result = await asyncio.to_thread(run_mail_auto_worker_once)
+            result = await run_mail_auto_worker_once()
             logger.info("mail auto worker result: %s", result)
         except Exception:
             logger.exception("mail auto worker iteration failed")
@@ -1998,11 +1977,46 @@ def mailbox_sync(limit: int = 20, session: Session = Depends(get_session)) -> di
 
 
 @app.post("/api/mailbox/auto-run-once")
-def mailbox_auto_run_once() -> dict:
+async def mailbox_auto_run_once() -> dict:
     try:
-        return run_mail_auto_worker_once()
+        return await run_mail_auto_worker_once()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/skills/list")
+def list_skills() -> list[dict[str, str]]:
+    return registry.list_skills()
+
+
+@app.post("/api/skills/generate")
+async def generate_skill(request: Request, session: Session = Depends(get_session)) -> dict:
+    body = await request.json()
+    requirement = body.get("requirement")
+    if not requirement:
+        raise HTTPException(status_code=400, detail="requirement is required")
+    
+    try:
+        # 1. 调用 LLM 生成代码
+        gen_result = await SkillFactory.generate_skill(session, requirement)
+        skill_name = gen_result["skill_name"]
+        code = gen_result["code"]
+        
+        # 2. 保存并热加载
+        success = SkillFactory.save_and_load(skill_name, code)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to save or load the generated skill")
+            
+        return {
+            "success": True,
+            "skill_name": skill_name,
+            "message": f"技能 {skill_name} 已生成并成功加载。",
+            "code_preview": code[:500] + "..." if len(code) > 500 else code
+        }
+    except Exception as e:
+        logger.exception("Skill generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/jobs")
@@ -2286,343 +2300,6 @@ def chat_model_provider(payload: ModelChatTestRequest, session: Session = Depend
     return {"ok": True, "reply": extract_chat_content(output), "raw": output}
 
 
-@app.get("/api/self-maintenance/context")
-def self_maintenance_context(session: Session = Depends(get_session)) -> dict:
-    return build_self_maintenance_context(session)
-
-
-@app.post("/api/self-maintenance/diagnose")
-def self_maintenance_diagnose(
-    payload: SelfMaintenanceDiagnoseRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    try:
-        row = create_maintenance_diagnosis(
-            session,
-            user_message=payload.message,
-            actor=getattr(request.state, "username", "system"),
-            use_llm=payload.use_llm,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceDiagnosed",
-            actor=getattr(request.state, "username", "system"),
-            related_object_type="MaintenanceSession",
-            related_object_id=row.id,
-            detail=dumps({"risk_level": row.risk_level}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_session(row, include_context=True)
-
-
-@app.post("/api/self-maintenance/code-plan")
-def self_maintenance_code_plan(
-    payload: SelfMaintenanceCodePlanRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    try:
-        row = create_code_patch_plan(
-            session,
-            user_message=payload.message,
-            actor=getattr(request.state, "username", "system"),
-            source_session_id=payload.session_id,
-            use_llm=payload.use_llm,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceCodePlanCreated",
-            actor=getattr(request.state, "username", "system"),
-            related_object_type="MaintenanceSession",
-            related_object_id=row.id,
-            detail=dumps({"risk_level": row.risk_level}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return self_maintenance_session_detail(row.id, session)
-
-
-@app.get("/api/self-maintenance/sessions")
-def list_self_maintenance_sessions(
-    include_archived: bool = False,
-    status: str | None = None,
-    risk_level: str | None = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    session: Session = Depends(get_session),
-) -> dict:
-    query = session.query(MaintenanceSession)
-    if not include_archived:
-        query = query.filter(MaintenanceSession.status != "Archived")
-    if status and status.strip():
-        query = query.filter(MaintenanceSession.status == status.strip())
-    if risk_level and risk_level.strip():
-        query = query.filter(MaintenanceSession.risk_level == risk_level.strip())
-    return page_response(
-        query.order_by(MaintenanceSession.created_at.desc()),
-        serialize_maintenance_session,
-        page,
-        page_size,
-        {
-            "status_options": distinct_values(session, MaintenanceSession.status),
-            "risk_level_options": distinct_values(session, MaintenanceSession.risk_level),
-        },
-    )
-
-
-@app.get("/api/self-maintenance/sessions/{session_id}")
-def self_maintenance_session_detail(session_id: str, session: Session = Depends(get_session)) -> dict:
-    row = session.get(MaintenanceSession, session_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="maintenance session not found")
-    actions = (
-        session.query(MaintenanceAction)
-        .filter_by(session_id=session_id)
-        .order_by(MaintenanceAction.created_at)
-        .all()
-    )
-    return {
-        **serialize_maintenance_session(row, include_context=True),
-        "actions": [serialize_maintenance_action(action) for action in actions],
-        "timeline": maintenance_session_timeline(session, session_id)["timeline"],
-    }
-
-
-@app.get("/api/self-maintenance/sessions/{session_id}/timeline")
-def self_maintenance_session_timeline(session_id: str, session: Session = Depends(get_session)) -> dict:
-    try:
-        return maintenance_session_timeline(session, session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.post("/api/self-maintenance/sessions/{session_id}/archive")
-def self_maintenance_session_archive(
-    session_id: str,
-    payload: SelfMaintenanceSessionArchiveRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        row = archive_maintenance_session(session, session_id, note=payload.note, actor=actor)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.commit()
-    return serialize_maintenance_session(row, include_context=True)
-
-
-@app.get("/api/self-maintenance/actions")
-def list_self_maintenance_actions(
-    action_type: str | None = None,
-    status: str | None = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    session: Session = Depends(get_session),
-) -> dict:
-    query = session.query(MaintenanceAction)
-    if action_type and action_type.strip():
-        query = query.filter(MaintenanceAction.action_type == action_type.strip())
-    if status and status.strip():
-        query = query.filter(MaintenanceAction.status == status.strip())
-    return page_response(
-        query.order_by(MaintenanceAction.created_at.desc()),
-        serialize_maintenance_action,
-        page,
-        page_size,
-        {
-            "action_type_options": distinct_values(session, MaintenanceAction.action_type),
-            "status_options": distinct_values(session, MaintenanceAction.status),
-        },
-    )
-
-
-@app.get("/api/self-maintenance/actions/{action_id}")
-def self_maintenance_action_detail(action_id: str, session: Session = Depends(get_session)) -> dict:
-    action = session.get(MaintenanceAction, action_id)
-    if action is None:
-        raise HTTPException(status_code=404, detail="maintenance action not found")
-    maintenance_session = session.get(MaintenanceSession, action.session_id)
-    payload = serialize_maintenance_action(action)
-    payload["session"] = serialize_maintenance_session(maintenance_session) if maintenance_session else None
-    payload["timeline"] = maintenance_session_timeline(session, action.session_id)["timeline"] if maintenance_session else []
-    return payload
-
-
-@app.post("/api/self-maintenance/actions/{action_id}/apply")
-def self_maintenance_action_apply(
-    action_id: str,
-    payload: SelfMaintenanceActionApplyRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        action = apply_maintenance_action(session, action_id, actor=actor)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceActionApplied",
-            actor=actor,
-            related_object_type="MaintenanceAction",
-            related_object_id=action.id,
-            detail=dumps({"action_type": action.action_type, "result": loads(action.result_json, {})}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_action(action)
-
-
-@app.post("/api/self-maintenance/actions/{action_id}/implementation")
-def self_maintenance_action_implementation(
-    action_id: str,
-    payload: SelfMaintenanceImplementationReportRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        action = report_maintenance_implementation(
-            session,
-            action_id,
-            status=payload.status,
-            summary=payload.summary,
-            changed_files=payload.changed_files,
-            tests=payload.tests,
-            residual_risks=payload.residual_risks,
-            actor=actor,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceImplementationReported",
-            actor=actor,
-            related_object_type="MaintenanceAction",
-            related_object_id=action.id,
-            detail=dumps({"status": action.status, "result": loads(action.result_json, {}).get("implementation", {})}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_action(action)
-
-
-@app.post("/api/self-maintenance/actions/{action_id}/handoff")
-def self_maintenance_action_handoff(
-    action_id: str,
-    payload: SelfMaintenanceHandoffRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        action = create_maintenance_handoff_package(session, action_id, actor=actor)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceHandoffCreated",
-            actor=actor,
-            related_object_type="MaintenanceAction",
-            related_object_id=action.id,
-            detail=dumps({"status": action.status, "handoff": loads(action.result_json, {}).get("handoff", {})}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_action(action)
-
-
-@app.post("/api/self-maintenance/actions/{action_id}/validate")
-def self_maintenance_action_validate(
-    action_id: str,
-    payload: SelfMaintenanceValidationRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        action = run_maintenance_validation(
-            session,
-            action_id,
-            selected_commands=payload.commands or None,
-            timeout_seconds=payload.timeout_seconds,
-            actor=actor,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceValidationCompleted",
-            actor=actor,
-            related_object_type="MaintenanceAction",
-            related_object_id=action.id,
-            detail=dumps({"status": action.status, "validation": loads(action.result_json, {}).get("validation", {})}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_action(action)
-
-
-@app.get("/api/self-maintenance/actions/{action_id}/handoff")
-def self_maintenance_action_handoff_detail(
-    action_id: str,
-    session: Session = Depends(get_session),
-) -> dict:
-    try:
-        return read_maintenance_handoff_package(session, action_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/self-maintenance/actions/{action_id}/review")
-def self_maintenance_action_review(
-    action_id: str,
-    payload: SelfMaintenanceReviewRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-) -> dict:
-    require_admin_password(payload.admin_password)
-    actor = getattr(request.state, "username", "system")
-    try:
-        action = review_maintenance_implementation(
-            session,
-            action_id,
-            decision=payload.decision,
-            note=payload.note,
-            actor=actor,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    session.add(
-        AuditEvent(
-            event_type="SelfMaintenanceImplementationReviewed",
-            actor=actor,
-            related_object_type="MaintenanceAction",
-            related_object_id=action.id,
-            detail=dumps({"status": action.status, "review": loads(action.result_json, {}).get("review", {})}),
-            created_at=now_utc(),
-        )
-    )
-    session.commit()
-    return serialize_maintenance_action(action)
 
 
 @app.get("/api/departments")
