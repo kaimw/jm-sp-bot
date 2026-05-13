@@ -14,7 +14,7 @@ from backend.app.services.mail_adapter import (
     AUTO_WORKFLOW_MAIL_TYPES,
     OUTBOUND_PRIORITY_NOTIFY,
     send_pending_auto_workflow_mails_smtp,
-    send_pending_smtp,
+    send_outbound_jobs_smtp,
     sync_imap_mailbox,
 )
 from backend.app.services.workflow import bot_enabled, get_config
@@ -36,18 +36,13 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-import asyncio
-from backend.app.services.skills.executor import SkillExecutor
-from backend.app.services.skills.mail_skills import * # Ensure skills are registered
-
-async def run_mail_auto_worker_once() -> dict:
+def run_mail_auto_worker_once() -> dict:
     started = monotonic()
     _WORKER_STATUS["run_count"] = int(_WORKER_STATUS.get("run_count") or 0) + 1
     _WORKER_STATUS["last_started_at"] = _iso_now()
     _WORKER_STATUS["last_error"] = None
     
     with SessionLocal() as session:
-        executor = SkillExecutor(session)
         try:
             if not bot_enabled(session):
                 return _finish_worker_run(
@@ -83,30 +78,18 @@ async def run_mail_auto_worker_once() -> dict:
             # 2. 高优先级通道技能
             high_priority_count = _pending_high_priority_count(session)
             if high_priority_count > 0:
-                skill_res = await executor.run("send_high_priority_mails", limit=settings.mail_auto_worker_limit)
-                if skill_res.success:
-                    result["high_priority_mails"] = skill_res.data
-                else:
-                    result["high_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": skill_res.message}
+                result["high_priority_mails"] = _send_high_priority_mails(session, limit=settings.mail_auto_worker_limit)
                 session.commit()
 
             # 3. 低优先级通道技能
             low_priority_count = pending_auto_workflow_mail_count(session)
             if low_priority_count > 0:
-                skill_res = await executor.run("send_auto_workflow_mails", limit=settings.mail_auto_worker_limit)
-                if skill_res.success:
-                    result["low_priority_mails"] = skill_res.data
-                else:
-                    result["low_priority_mails"] = {"sent": 0, "failed": 0, "total": 0, "error": skill_res.message}
+                result["low_priority_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
                 session.commit()
 
             # 4. 收件同步技能 (只有在没有待发邮件时才同步，避免 SMTP 风控)
             if high_priority_count == 0 and low_priority_count == 0:
-                skill_res = await executor.run("receive_mails", limit=settings.mail_auto_worker_limit)
-                if skill_res.success:
-                    result["synced"] = skill_res.data
-                else:
-                    result["synced"] = {"imported": 0, "queued": 0, "error": skill_res.message}
+                result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
                 session.commit()
             else:
                 result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
@@ -145,10 +128,15 @@ def pending_receipt_ack_count() -> int:
 
 
 def pending_auto_workflow_mail_count(session: Session | None = None) -> int:
+    now = datetime.now(timezone.utc)
     if session is not None:
         return (
             session.query(OutboundMailJob)
-            .filter(OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES), OutboundMailJob.status == "Pending")
+            .filter(
+                OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES),
+                OutboundMailJob.status == "Pending",
+                (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+            )
             .count()
         )
     with SessionLocal() as owned_session:
@@ -187,20 +175,23 @@ def _pending_high_priority_count(session: Session) -> int:
 def _send_high_priority_mails(session: Session, *, limit: int = 5) -> dict:
     """只发高优先级（priority < NOTIFY）的待发邮件。"""
     now = datetime.now(timezone.utc)
-    jobs = (
-        session.query(OutboundMailJob)
-        .filter(
-            OutboundMailJob.status == "Pending",
-            OutboundMailJob.priority < _HIGH_PRIORITY_THRESHOLD,
-            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+    job_ids = [
+        row.id
+        for row in (
+            session.query(OutboundMailJob)
+            .filter(
+                OutboundMailJob.status == "Pending",
+                OutboundMailJob.priority < _HIGH_PRIORITY_THRESHOLD,
+                (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+            )
+            .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
+            .limit(limit)
+            .all()
         )
-        .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
-        .limit(limit)
-        .all()
-    )
-    if not jobs:
+    ]
+    if not job_ids:
         return {"sent": 0, "failed": 0, "total": 0}
-    return send_pending_smtp(session, limit=limit)
+    return send_outbound_jobs_smtp(session, job_ids)
 
 
 def _check_oldest_pending_age(session: Session) -> None:

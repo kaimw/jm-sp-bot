@@ -71,7 +71,7 @@ def parse_pdf_text(content: bytes) -> str:
         reader = PdfReader(io.BytesIO(content))
         parts = []
         for index, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
+            text = repair_mojibake_text(page.extract_text() or "")
             if text.strip():
                 parts.append(f"[page {index}]\n{text.strip()}")
         if parts:
@@ -102,7 +102,27 @@ def decode_pdf_literal(value: str) -> str:
     try:
         return decoded.encode("latin-1").decode("utf-8")
     except UnicodeError:
-        return decoded
+        return repair_mojibake_text(decoded)
+
+
+def repair_mojibake_text(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if any(marker in text for marker in ("Ã", "Â", "å", "æ", "è", "é", "ï¼")):
+        for source_encoding in ("latin-1", "cp1252"):
+            try:
+                raw = text.encode(source_encoding)
+            except UnicodeEncodeError:
+                continue
+            for target_encoding in ("utf-8", "gb18030", "gbk", "big5"):
+                try:
+                    repaired = raw.decode(target_encoding)
+                except UnicodeDecodeError:
+                    continue
+                if repaired != text and "\ufffd" not in repaired:
+                    return repaired
+    return text
 
 
 def parse_zip(file_name: str, content: bytes, *, max_zip_bytes: int, max_depth: int, depth: int) -> ParsedAttachment:

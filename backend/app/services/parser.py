@@ -20,7 +20,7 @@ class ExtractedRequirement:
 
 FIELD_PATTERNS = {
     "customer_name": r"(?:客户|客户名称)[:：]\s*(?P<value>.+)",
-    "product_summary": r"(?:产品|产品名称|产品规格|产品/规格|规格|物料名称|品名)[:：]\s*(?P<value>[^\n]+?)(?=\s*(?:数量|交期)[:：]|$)",
+    "product_summary": r"(?:物料|物料名称|物料规格|物料/规格|产品|产品名称|产品规格|产品/规格|商品|商品名称|商品规格|商品/规格|规格|品名)[:：]\s*(?P<value>[^\n]+?)(?=\s*(?:数量|交期)[:：]|$)",
     "quantity_text": r"(?:数量|生产数量)[:：]\s*(?P<value>.+)",
     "expected_delivery_date": r"(?:交期|期望交期|交付日期)[:：]\s*(?P<value>.+)",
     "external_order_no": r"(?:订单号|订单编号)[:：]\s*(?P<value>.+)",
@@ -36,7 +36,7 @@ QUOTE_CUT_MARKERS = [
     "\n在 ",
     "\n原始邮件",
 ]
-ORDER_REQUEST_KEYWORDS = ["生产订单", "生产需求", "订单需求", "下单", "产品", "请排产", "排产"]
+ORDER_REQUEST_KEYWORDS = ["生产订单", "生产需求", "订单需求", "下单", "物料", "产品", "商品", "请排产", "排产"]
 NATURAL_ORDER_PATTERN = re.compile(
     r"(?P<customer>[\u4e00-\u9fffA-Za-z0-9（）()·._-]{2,40}?)(?:需要|要|需|订购|采购|购买|下单)"
     r"(?P<item>[^，。,；;\n]+)",
@@ -150,7 +150,7 @@ def extract_requirement(subject: str, body: str, from_address: str) -> Extracted
         label
         for label, value in [
             ("客户名称", values["customer_name"]),
-            ("产品/规格", values["product_summary"]),
+            ("物料/规格", values["product_summary"]),
             ("数量", values["quantity_text"]),
             ("期望交期", values["expected_delivery_date"]),
         ]

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import uuid
+from datetime import timedelta
+
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.models import MailMessage, ProcessingJob, now_utc
 from backend.app.services.jsonutil import loads
 from backend.app.services.workflow import process_inbound_mail
 
 
 def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
+    recover_stale_processing_jobs(session)
+    worker = f"processing-{uuid.uuid4()}"
     job_ids = [
         row.id
         for row in (
@@ -30,6 +36,9 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 {
                     "status": "Running",
                     "attempt_count": ProcessingJob.attempt_count + 1,
+                    "locked_by": worker,
+                    "locked_until": now_utc() + timedelta(seconds=settings.processing_job_lease_seconds),
+                    "started_at": now_utc(),
                     "updated_at": now_utc(),
                 },
                 synchronize_session=False,
@@ -75,6 +84,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 raise RuntimeError(f"unknown job type: {job.job_type}")
             job.status = "Completed"
             job.error_message = None
+            clear_processing_lock(job)
             completed += 1
             job.updated_at = now_utc()
             session.commit()
@@ -85,7 +95,35 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 continue
             job.status = "Failed"
             job.error_message = str(exc)
+            clear_processing_lock(job)
             job.updated_at = now_utc()
             failed += 1
             session.commit()
     return {"completed": completed, "failed": failed, "total": handled}
+
+
+def clear_processing_lock(job: ProcessingJob) -> None:
+    job.locked_by = None
+    job.locked_until = None
+    job.started_at = None
+
+
+def recover_stale_processing_jobs(session: Session) -> int:
+    now = now_utc()
+    stale_jobs = (
+        session.query(ProcessingJob)
+        .filter(
+            ProcessingJob.status == "Running",
+            ProcessingJob.locked_until.is_not(None),
+            ProcessingJob.locked_until < now,
+        )
+        .all()
+    )
+    for job in stale_jobs:
+        job.status = "Pending"
+        job.error_message = "processing lease expired; job returned to pending"
+        clear_processing_lock(job)
+        job.updated_at = now
+    if stale_jobs:
+        session.commit()
+    return len(stale_jobs)

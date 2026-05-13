@@ -59,6 +59,7 @@ from backend.app.services.initial_review import initial_review_config, remember_
 from backend.app.services.model_provider import build_openai_chat_payload, call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, execute_cleanup, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
+from backend.app.services.products import create_spu, create_sku, set_channel_pricing
 from backend.app.services.self_maintenance import (
     apply_maintenance_action,
     archive_maintenance_session,
@@ -118,6 +119,11 @@ def make_session():
     seed_defaults(session)
     session.commit()
     return session
+
+
+def reset_db_mail_throttle(session):
+    session.query(SystemConfig).filter(SystemConfig.key.like("mail_throttle.%")).delete(synchronize_session=False)
+    session.commit()
 
 
 def configure_department(session):
@@ -907,7 +913,7 @@ def test_task_issue_attachment_filename_has_chinese_compatible_headers(monkeypat
     class FakeSMTP:
         sent_messages = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -1519,7 +1525,7 @@ def test_production_question_sales_reply_reissue_flow(monkeypatch):
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -1667,8 +1673,8 @@ def test_weekly_report_enqueue_uses_configured_recipients_and_is_idempotent():
     assert "生成时间：" in first.body
     assert "统计周期：" in first.body
     assert "北京时间" in first.body
-    assert "二、已确认产品订单统计（分产品）" in first.body
-    assert "三、未确认产品订单统计（分产品）" in first.body
+    assert "二、已确认物料订单统计（分物料）" in first.body
+    assert "三、未确认物料订单统计（分物料）" in first.body
     assert "四、销售 Top10 统计（需求总数和已确认总数）" in first.body
     assert "待处理异常" not in first.body
     assert "待发送邮件" not in first.body
@@ -1732,7 +1738,7 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     class FakeSMTP:
         sent_messages = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             self.host = host
             self.port = port
 
@@ -1756,21 +1762,36 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     result = send_pending_smtp(session, limit=10)
     session.commit()
 
-    # 新行为：3 封全部被处理，不再受 send_attempts>=1 限制
-    # - ok: Sent
-    # - missing_recipient: 收件人缺失 → 直接 Failed（不可恢复错误）
-    # - send_failure: SMTP 异常 → 保持 Pending（指数退避重试，next_retry_at 被设置）
     assert result["sent"] == 1
-    assert result["failed"] == 2   # missing_recipient(Failed) + send_failure(scheduled retry)
-    assert result["total"] == 3
+    assert result["failed"] == 0
+    assert result["total"] == 1
     assert ok.status == "Sent"
+    assert missing_recipient.status == "Pending"
+    assert send_failure.status == "Pending"
+    assert FakeSMTP.sent_messages == [("OK", "bot.market@jimuyida.com", ["ok@jimuyida.com"])]
+
+    reset_mail_login_throttle()
+    reset_db_mail_throttle(session)
+    result_missing = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    assert result_missing["sent"] == 0
+    assert result_missing["failed"] == 1
+    assert result_missing["total"] == 1
     assert missing_recipient.status == "Failed"
+    assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendFailed").count() == 1
+
+    reset_mail_login_throttle()
+    reset_db_mail_throttle(session)
+    result_failure = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    assert result_failure["sent"] == 0
+    assert result_failure["failed"] == 1
+    assert result_failure["total"] == 1
     assert send_failure.status == "Pending"
     assert send_failure.attempt_count == 1
     assert send_failure.next_retry_at is not None
-    assert FakeSMTP.sent_messages == [("OK", "bot.market@jimuyida.com", ["ok@jimuyida.com"])]
-    # missing_recipient 直接失败进异常队列(1条)；send_failure 还在重试中，不进异常队列
-    assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendFailed").count() == 1
 
     # 手动清除 next_retry_at 以模拟超过冷却期
     send_failure.next_retry_at = None
@@ -1780,6 +1801,7 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     session.commit()
 
     reset_mail_login_throttle()
+    reset_db_mail_throttle(session)
     result2 = send_pending_smtp(session, limit=10)
     session.commit()
 
@@ -1794,6 +1816,123 @@ def test_smtp_send_marks_success_failure_and_retry(monkeypatch):
     session.commit()
 
     assert retried.status == "Pending"
+
+
+def test_smtp_send_uses_non_blocking_throttle_and_timeout(monkeypatch):
+    session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    first = OutboundMailJob(
+        mail_type="Manual",
+        to_json=dumps(["first@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="FIRST",
+        body="hello",
+        idempotency_key="smtp-first-nonblocking",
+        status="Pending",
+    )
+    second = OutboundMailJob(
+        mail_type="Manual",
+        to_json=dumps(["second@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="SECOND",
+        body="hello",
+        idempotency_key="smtp-second-nonblocking",
+        status="Pending",
+    )
+    session.add_all([first, second])
+    session.commit()
+
+    class FakeSMTP:
+        sent_subjects = []
+        timeouts = []
+
+        def __init__(self, host, port, **kwargs):
+            self.timeouts.append(kwargs.get("timeout"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def login(self, username, password):
+            assert password == "runtime-secret"
+
+        def send_message(self, msg, from_addr, to_addrs):
+            self.sent_subjects.append(msg["Subject"])
+
+    monkeypatch.setattr("backend.app.services.mail_adapter.smtplib.SMTP_SSL", FakeSMTP)
+
+    result = send_pending_smtp(session, limit=10)
+    throttled = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    assert result == {"sent": 1, "failed": 0, "total": 1}
+    assert throttled["sent"] == 0
+    assert throttled["total"] == 0
+    assert "throttled_until" in throttled
+    assert first.status == "Sent"
+    assert second.status == "Pending"
+    assert second.next_retry_at is not None
+    assert FakeSMTP.sent_subjects == ["FIRST"]
+    assert FakeSMTP.timeouts == [30]
+
+
+def test_stale_sending_outbound_moves_to_send_unknown_and_can_retry():
+    session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    stale = OutboundMailJob(
+        mail_type="Manual",
+        to_json=dumps(["sales@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="STALE",
+        body="hello",
+        idempotency_key="smtp-stale-sending",
+        status="Sending",
+        locked_by="old-worker",
+        locked_until=now_utc() - timedelta(minutes=10),
+        sending_started_at=now_utc() - timedelta(minutes=15),
+    )
+    session.add(stale)
+    session.commit()
+
+    result = send_pending_smtp(session, limit=10)
+    session.commit()
+
+    assert result == {"sent": 0, "failed": 0, "total": 0}
+    assert stale.status == "SendUnknown"
+    assert stale.locked_by is None
+    assert session.query(ExceptionCase).filter_by(exception_type="OutboundMailSendUnknown").count() == 1
+
+    retried = retry_outbound_mail(session, stale.id)
+    session.commit()
+    assert retried.status == "Pending"
+    assert retried.attempt_count == 0
+
+
+def test_stale_processing_job_returns_to_pending_then_runs():
+    session = make_session()
+    stale = ProcessingJob(
+        job_type="process_inbound_mail",
+        payload_json=dumps({"mail_id": "missing"}),
+        status="Running",
+        attempt_count=1,
+        locked_by="old-worker",
+        locked_until=now_utc() - timedelta(minutes=30),
+        started_at=now_utc() - timedelta(minutes=40),
+    )
+    session.add(stale)
+    session.commit()
+
+    result = run_pending_jobs(session, limit=10)
+    session.commit()
+
+    assert result == {"completed": 0, "failed": 1, "total": 1}
+    assert stale.status == "Failed"
+    assert stale.attempt_count == 2
+    assert stale.locked_by is None
 
 
 def test_smtp_send_skips_when_bot_disabled():
@@ -2297,6 +2436,36 @@ def test_mail_auto_worker_skips_when_bot_disabled(monkeypatch):
     assert session.query(ProcessingJob).filter_by(status="Pending").count() == 1
 
 
+def test_mail_auto_worker_future_retry_does_not_block_imap_sync(monkeypatch):
+    session = make_session()
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    future_retry = OutboundMailJob(
+        mail_type="SalesReceiptAck",
+        to_json=dumps(["sales@jimuyida.com"]),
+        cc_json=dumps([]),
+        subject="FUTURE RETRY",
+        body="hello",
+        idempotency_key="future-retry-does-not-block-sync",
+        status="Pending",
+        next_retry_at=now_utc() + timedelta(minutes=30),
+    )
+    session.add(future_retry)
+    session.commit()
+
+    monkeypatch.setattr("backend.app.services.mail_worker.SessionLocal", lambda: nullcontext(session))
+    monkeypatch.setattr(
+        "backend.app.services.mail_worker.sync_imap_mailbox",
+        lambda sync_session, limit=20: {"imported": 1, "queued": 1},
+    )
+
+    result = run_mail_auto_worker_once()
+
+    assert result["synced"] == {"imported": 1, "queued": 1}
+    assert result["high_priority_mails"] == {"sent": 0, "failed": 0, "total": 0}
+    assert future_retry.status == "Pending"
+
+
 def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
     session = make_session()
     set_config(session, "bot_enabled", "true", is_secret=False)
@@ -2325,7 +2494,7 @@ def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -2379,7 +2548,7 @@ def test_pending_receipt_ack_sender_does_not_send_task_issues(monkeypatch):
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -2557,7 +2726,7 @@ def test_sales_reply_to_initial_review_supplement_creates_task_and_receipt_after
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -2753,6 +2922,88 @@ def test_custom_initial_review_rule_rejects_sales_order():
     assert session.query(ProductionTaskVersion).count() == 0
 
 
+def test_product_price_review_rejects_below_map_price():
+    session = make_session()
+    configure_department(session)
+    spu = create_spu(session, "SPU-G100", "G100 展示柜")
+    session.flush()
+    sku = create_sku(session, spu.id, "G100")
+    session.flush()
+    set_channel_pricing(session, sku.id, "default", tier_a_price=12000, map_price=10000)
+    session.commit()
+
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 价格低于限价",
+        body_text="\n".join(
+            [
+                "客户名称：价格客户",
+                "产品：G100",
+                "数量：10台",
+                "单价：90元",
+                "期望交期：2026-07-20",
+                "订单号：SO-PRICE-LOW",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    case = session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").one()
+    detail = loads(case.detail, {})
+    supplement = session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").one()
+    requirement = session.query(OrderRequirement).filter_by(source_mail_id=mail.id).one()
+
+    assert task is None
+    assert requirement.status == "ReviewFailed"
+    assert any("低于最低限价" in flag for flag in detail["risk_flags"])
+    assert any("物料 G100 审核失败" in item["message"] for item in detail["review_failures"])
+    assert "低于最低限价" in supplement.body
+    assert session.query(ProductionTask).count() == 0
+
+
+def test_product_price_review_allows_price_at_or_above_map_price_without_llm(monkeypatch):
+    session = make_session()
+    configure_department(session)
+    spu = create_spu(session, "SPU-G200", "G200 展示柜")
+    session.flush()
+    sku = create_sku(session, spu.id, "G200")
+    session.flush()
+    set_channel_pricing(session, sku.id, "default", tier_a_price=12000, map_price=10000)
+    session.commit()
+
+    def fail_model_call(*args, **kwargs):
+        raise AssertionError("price review should not call LLM when exact SKU and price are present")
+
+    monkeypatch.setattr("backend.app.services.products.call_model", fail_model_call, raising=False)
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 价格合规",
+        body_text="\n".join(
+            [
+                "客户名称：价格合规客户",
+                "产品：G200",
+                "数量：10台",
+                "单价：120元",
+                "期望交期：2026-07-20",
+                "订单号：SO-PRICE-OK",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    requirement = session.query(OrderRequirement).filter_by(source_mail_id=mail.id).one()
+    assert task is not None
+    assert requirement.status == "TaskCreated"
+    assert session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="TaskIssue").count() == 1
+
+
 def test_initial_review_config_includes_readonly_builtin_rules():
     session = make_session()
     set_config(
@@ -2917,7 +3168,7 @@ def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeyp
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -2937,17 +3188,16 @@ def test_pending_auto_workflow_sender_includes_task_issues_and_questions(monkeyp
     result = send_pending_auto_workflow_mails_smtp(session, limit=10)
     session.commit()
 
-    # 新的多封发送行为：AUTO_WORKFLOW 类型的 8 封全部发出（limit=10 > 8封总量）
-    assert result == {"sent": 8, "failed": 0, "total": 8}
+    assert result == {"sent": 1, "failed": 0, "total": 1}
     assert ack.status == "Sent"
-    assert review.status == "Sent"
-    assert question_forward.status == "Sent"
-    assert question_receipt.status == "Sent"
-    assert task_issue.status == "Sent"
-    assert weekly_report.status == "Sent"
-    assert production_confirmed.status == "Sent"
-    assert confirmation_receipt.status == "Sent"
-    assert len(FakeSMTP.sent_subjects) == 8
+    assert review.status == "Pending"
+    assert question_forward.status == "Pending"
+    assert question_receipt.status == "Pending"
+    assert task_issue.status == "Pending"
+    assert weekly_report.status == "Pending"
+    assert production_confirmed.status == "Pending"
+    assert confirmation_receipt.status == "Pending"
+    assert FakeSMTP.sent_subjects == [ack.subject]
 
 
 def test_pending_auto_workflow_sender_includes_production_rejected(monkeypatch):
@@ -2969,7 +3219,7 @@ def test_pending_auto_workflow_sender_includes_production_rejected(monkeypatch):
     class FakeSMTP:
         sent_subjects = []
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             pass
 
         def __enter__(self):
@@ -4726,6 +4976,77 @@ def test_imported_workflow_routes_task_after_explicit_email_routing():
     binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one()
     assert binding.workflow_code
     assert "物流发货方式" not in as_list(binding.missing_fields_json)
+
+
+def test_workflow_material_details_are_extracted_and_rendered_in_task_mail():
+    session = make_session()
+    import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "material_detail_flow",
+                "workflow_name": "物料详情流程",
+                "match": {"subject_patterns": ["物料详情测试"]},
+                "routing": {"to_names": ["zhangyan@jimuyida.com"], "cc_names": []},
+                "subject_template": "[生产任务单][{{task_no}}][{{customer_name}}][{{product_summary}}][V{{version_no}}]",
+                "body_template": "\n".join(
+                    [
+                        "生产部同事好：",
+                        "客户名称：{{customer_name}}",
+                        "物料/规格：{{product_summary}}",
+                        "数量：{{quantity_text}}",
+                        "期望交期：{{expected_delivery_date}}",
+                    ]
+                ),
+                "required_fields": [
+                    "customer_name",
+                    "product_summary",
+                    "quantity_text",
+                    "expected_delivery_date",
+                    "material_details",
+                ],
+                "required_attachments": [],
+                "review_rules": [],
+            }
+        ],
+        actor="tester",
+        auto_publish=True,
+        llm_used=False,
+    )
+    session.commit()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 物料详情测试",
+        body_text="\n".join(
+            [
+                "客户名称：测试客户",
+                "产品：示例产品A",
+                "期望交期：2026-07-01",
+                "物料详情描述：",
+                "物料编码：MAT-A001",
+                "物料名称：示例产品A",
+                "数量：120套",
+                "物流发货方式：顺丰",
+            ]
+        ),
+    )
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=task.requirement_id).one()
+    assert "物料详情描述" not in as_list(binding.missing_fields_json)
+    extracted = loads(binding.extracted_fields_json, {})
+    assert "物料编码：MAT-A001" in extracted["material_details"]
+    assert "物料名称：示例产品A" in extracted["material_details"]
+    assert "数量：120套" in extracted["material_details"]
+    version = session.query(ProductionTaskVersion).filter_by(task_id=task.id, version_no=1).one()
+    assert "物料详情描述：" in version.body
+    assert "物料编码：MAT-A001" in version.body
+    assert "物料名称：示例产品A" in version.body
+    assert "数量：120套" in version.body
 
 
 def test_imported_workflow_without_primary_contact_mapping_routes_to_internal_exception():

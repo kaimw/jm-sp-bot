@@ -37,6 +37,10 @@ MIGRATION_TABLE_ORDER = [
     "mail_workflow_matches",
     "cleanup_jobs",
     "backup_jobs",
+    "product_spus",
+    "product_skus",
+    "channel_pricings",
+    "promotion_rules",
 ]
 
 DEFERRED_COLUMN_UPDATES = {

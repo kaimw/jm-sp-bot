@@ -38,6 +38,10 @@ class Settings:
         int_env("MAIL_RATE_LIMIT_INTERVAL_SECONDS", MAIL_LOGIN_MIN_INTERVAL_SECONDS),
     )
     mail_auto_worker_limit: int = int_env("MAIL_AUTO_WORKER_LIMIT", 20)
+    mail_smtp_timeout_seconds: int = max(5, int_env("MAIL_SMTP_TIMEOUT_SECONDS", 30))
+    mail_imap_timeout_seconds: int = max(5, int_env("MAIL_IMAP_TIMEOUT_SECONDS", 30))
+    outbound_send_lease_seconds: int = max(60, int_env("OUTBOUND_SEND_LEASE_SECONDS", 300))
+    processing_job_lease_seconds: int = max(60, int_env("PROCESSING_JOB_LEASE_SECONDS", 600))
 
     bot_email: str = os.getenv("BOT_EMAIL", "bot.market@jimuyida.com")
     bot_email_password: str = os.getenv("BOT_EMAIL_PASSWORD", "")

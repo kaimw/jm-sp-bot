@@ -36,7 +36,7 @@ EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 EMAIL_TOKEN_PATTERN = re.compile(r"[^@\s,;<>，；、]+@[^@\s,;<>，；、]+\.[^@\s,;<>，；、]+")
 CORE_FIELD_LABELS = {
     "customer_name": "客户名称",
-    "product_summary": "产品/规格",
+    "product_summary": "物料/规格",
     "quantity_text": "数量",
     "expected_delivery_date": "期望交期",
     "external_order_no": "订单号",
@@ -52,7 +52,7 @@ DEFAULT_TEMPLATE_BODY = """生产部同事好：
 客户名称：{{customer_name}}
 销售人员：{{salesperson_name}} <{{salesperson_email}}>
 
-产品/规格：{{product_summary}}
+物料/规格：{{product_summary}}
 数量：{{quantity_text}}
 期望交期：{{expected_delivery_date}}
 流程类型：{{workflow_name}}
@@ -81,6 +81,7 @@ FIELD_HINTS = {
     "return_time": {"label": "归还时间", "keywords": ["归还时间"]},
     "sample_approval_screenshot": {"label": "样机借用审批截图", "keywords": ["样机借用审批截图"]},
 }
+MATERIAL_DETAIL_CHILD_LABELS = {"物料编码", "产品编码", "商品编码", "物料名称", "产品名称", "商品名称", "数量", "需求数量", "规格型号", "型号"}
 ALLOWED_REVIEW_FIELDS = set(FIELD_LABELS)
 ALLOWED_REVIEW_OPERATORS = {item["key"] for item in OPERATOR_OPTIONS}
 WORKFLOW_CHAT_SYSTEM_PROMPT = (
@@ -652,7 +653,41 @@ def _build_rule_from_section(index: int, name: str, section_text: str) -> dict[s
     }
 
 
-def _ensure_task_template_variables(subject_template: str, body_template: str) -> tuple[str, str]:
+def workflow_template_field_label(field: str) -> str:
+    if field in CORE_FIELD_LABELS:
+        return CORE_FIELD_LABELS[field]
+    hints = FIELD_HINTS.get(field)
+    if hints:
+        return str(hints.get("label") or field)
+    return field
+
+
+def _template_has_variable(template: str, field: str) -> bool:
+    return re.search(r"\{\{\s*" + re.escape(field) + r"\s*\}\}", template or "") is not None
+
+
+def append_required_field_template_lines(body_template: str, required_fields: list[str]) -> str:
+    body = body_template.strip() or DEFAULT_TEMPLATE_BODY
+    missing_fields = [
+        field
+        for field in required_fields
+        if field
+        and field not in CORE_FIELD_LABELS
+        and not _template_has_variable(body, field)
+    ]
+    if not missing_fields:
+        return body
+    lines = ["流程必填信息："]
+    for field in missing_fields:
+        lines.append(f"{workflow_template_field_label(field)}：{{{{{field}}}}}")
+    return "\n\n".join([body.rstrip(), "\n".join(lines)])
+
+
+def _ensure_task_template_variables(
+    subject_template: str,
+    body_template: str,
+    required_fields: list[str] | None = None,
+) -> tuple[str, str]:
     subject = subject_template.strip() or DEFAULT_TEMPLATE_SUBJECT
     body = body_template.strip() or DEFAULT_TEMPLATE_BODY
     if "{{task_no}}" not in subject:
@@ -663,6 +698,7 @@ def _ensure_task_template_variables(subject_template: str, body_template: str) -
         body = DEFAULT_TEMPLATE_BODY.rstrip()
         if original_body and original_body != DEFAULT_TEMPLATE_BODY.strip():
             body = "\n\n".join([body, "原流程邮件模板：", original_body])
+    body = append_required_field_template_lines(body, required_fields or [])
     return subject, body
 
 
@@ -748,10 +784,10 @@ def _normalize_rule(rule: dict[str, Any], fallback_index: int, *, email_only_rou
         cc_names = _normalize_list(routing.get("cc_names") or routing.get("cc"))
     subject_template = str(rule.get("subject_template") or "").strip() or DEFAULT_TEMPLATE_SUBJECT
     body_template = str(rule.get("body_template") or "").strip() or DEFAULT_TEMPLATE_BODY
-    subject_template, body_template = _ensure_task_template_variables(subject_template, body_template)
     required_fields = _normalize_list(rule.get("required_fields"))
     if not required_fields:
         required_fields = _required_fields_from_text(name, body_template)
+    subject_template, body_template = _ensure_task_template_variables(subject_template, body_template, required_fields)
     required_attachments = _normalize_list(rule.get("required_attachments"))
     review_rules = _normalize_review_rules(rule.get("review_rules"))
     if not review_rules:
@@ -1637,17 +1673,67 @@ def extract_workflow_fields(source_text: str, required_fields: list[str]) -> dic
         hints = FIELD_HINTS.get(field)
         if hints is None:
             continue
-        value = ""
-        for keyword in hints["keywords"]:
-            match = re.search(rf"{re.escape(keyword)}[:：]\s*(.+)", source_text)
-            if match:
-                value = match.group(1).strip()
-                break
-            if keyword in source_text:
-                value = keyword
+        value = _extract_workflow_field_value(source_text, field, [str(item) for item in hints["keywords"]])
         if value:
             extracted[field] = value
     return extracted
+
+
+def _field_line_label(line: str) -> str | None:
+    match = re.match(r"\s*([^:：]{1,30})\s*[:：]", line)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _workflow_field_stop_labels(current_field: str) -> set[str]:
+    labels = {"附件", "邮件主题", "邮件内容模板", "邮件收件人", "邮件抄送人"}
+    labels.update(CORE_FIELD_LABELS.values())
+    for hints in FIELD_HINTS.values():
+        labels.add(str(hints.get("label") or ""))
+        labels.update(str(item) for item in hints.get("keywords", []))
+    hints = FIELD_HINTS.get(current_field) or {}
+    labels.discard(str(hints.get("label") or ""))
+    for keyword in hints.get("keywords", []):
+        labels.discard(str(keyword))
+    if current_field == "material_details":
+        labels.difference_update(MATERIAL_DETAIL_CHILD_LABELS)
+    return {item for item in labels if item}
+
+
+def _collect_following_field_lines(lines: list[str], start_index: int, current_field: str) -> list[str]:
+    stop_labels = _workflow_field_stop_labels(current_field)
+    values: list[str] = []
+    for line in lines[start_index + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if values:
+                break
+            continue
+        label = _field_line_label(stripped)
+        if label and label in stop_labels:
+            break
+        values.append(stripped)
+    return values
+
+
+def _extract_workflow_field_value(source_text: str, field: str, keywords: list[str]) -> str:
+    lines = [line.rstrip() for line in source_text.splitlines()]
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for keyword in keywords:
+            match = re.match(rf"^\s*{re.escape(keyword)}\s*[:：]\s*(.*)$", stripped)
+            if match:
+                first_value = match.group(1).strip()
+                values = [first_value] if first_value else []
+                if field == "material_details" or not first_value:
+                    values.extend(_collect_following_field_lines(lines, index, field))
+                return "\n".join(item for item in values if item).strip() or keyword
+            if keyword in stripped:
+                return stripped[:500]
+    return ""
 
 
 def resolve_contact_emails(

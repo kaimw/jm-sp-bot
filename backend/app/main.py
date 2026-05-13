@@ -129,6 +129,29 @@ from backend.app.services.workflow import (
     weekly_report_recipients,
     weekly_report_subject,
 )
+
+
+def self_maintenance_action_detail(action_id: str, session: Session) -> dict:
+    from backend.app.models import MaintenanceAction
+    from backend.app.services.self_maintenance import maintenance_session_timeline
+
+    action = session.get(MaintenanceAction, action_id)
+    if action is None:
+        raise HTTPException(status_code=404, detail="maintenance action not found")
+    payload = maintenance_session_timeline(session, action.session_id)
+    result = loads(action.result_json, {})
+    input_payload = loads(action.input_json, {})
+    return {
+        "id": action.id,
+        "session_id": action.session_id,
+        "action_type": action.action_type,
+        "status": action.status,
+        "input": input_payload,
+        "result": result,
+        "runner_commands": input_payload.get("runner_commands") or input_payload.get("validation_commands") or [],
+        "session": payload["session"],
+        "timeline": payload["timeline"],
+    }
 from backend.app.services.products import (
     create_spu,
     create_sku,
@@ -227,7 +250,7 @@ async def mail_auto_worker_loop() -> None:
     await asyncio.sleep(await asyncio.to_thread(configured_mail_worker_interval_seconds))
     while True:
         try:
-            result = await run_mail_auto_worker_once()
+            result = await asyncio.to_thread(run_mail_auto_worker_once)
             logger.info("mail auto worker result: %s", result)
         except Exception:
             logger.exception("mail auto worker iteration failed")
@@ -534,6 +557,7 @@ def config_int(session: Session, key: str, default: int) -> int:
 
 
 def system_queue_health(session: Session) -> dict:
+    now = now_utc()
     outbound_counts = dict(
         session.query(OutboundMailJob.status, func.count(OutboundMailJob.id))
         .group_by(OutboundMailJob.status)
@@ -552,20 +576,57 @@ def system_queue_health(session: Session) -> dict:
     )
     pending_auto = (
         session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.status == "Pending",
+            OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES),
+            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+        )
+        .count()
+    )
+    pending_auto_total = (
+        session.query(OutboundMailJob)
         .filter(OutboundMailJob.status == "Pending", OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES))
         .count()
     )
-    pending_manual = max(0, int(outbound_counts.get("Pending", 0) or 0) - pending_auto)
+    pending_due = (
+        session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.status == "Pending",
+            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
+        )
+        .count()
+    )
+    pending_future_retry = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Pending", OutboundMailJob.next_retry_at.is_not(None), OutboundMailJob.next_retry_at > now)
+        .count()
+    )
+    sending_stale = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.status == "Sending", OutboundMailJob.locked_until.is_not(None), OutboundMailJob.locked_until < now)
+        .count()
+    )
+    processing_stale = (
+        session.query(ProcessingJob)
+        .filter(ProcessingJob.status == "Running", ProcessingJob.locked_until.is_not(None), ProcessingJob.locked_until < now)
+        .count()
+    )
+    pending_manual = max(0, int(outbound_counts.get("Pending", 0) or 0) - pending_auto_total)
     return {
         "outbound": {
             "counts": outbound_counts,
+            "pending_due": pending_due,
+            "pending_future_retry": pending_future_retry,
             "pending_auto_dispatchable": pending_auto,
+            "pending_auto_total": pending_auto_total,
             "pending_manual_only": pending_manual,
+            "sending_stale": sending_stale,
             "oldest_pending_id": oldest_pending.id if oldest_pending else None,
             "oldest_pending_age_seconds": seconds_since(oldest_pending.created_at) if oldest_pending else None,
             "single_run_send_limit": 1,
+            "send_lease_seconds": settings.outbound_send_lease_seconds,
         },
-        "processing": {"counts": processing_counts},
+        "processing": {"counts": processing_counts, "running_stale": processing_stale, "lease_seconds": settings.processing_job_lease_seconds},
     }
 
 
@@ -2014,7 +2075,7 @@ def mailbox_sync(limit: int = 20, session: Session = Depends(get_session)) -> di
 @app.post("/api/mailbox/auto-run-once")
 async def mailbox_auto_run_once() -> dict:
     try:
-        return await run_mail_auto_worker_once()
+        return await asyncio.to_thread(run_mail_auto_worker_once)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterator
 
 from sqlalchemy.engine import make_url
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from backend.app.config import settings
@@ -68,6 +68,49 @@ def init_db() -> None:
     from backend.app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    ensure_runtime_schema()
+
+
+def ensure_runtime_schema() -> None:
+    """Add nullable runtime columns for existing deployments without a migration tool."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "outbound_mail_jobs" in tables:
+        _ensure_columns(
+            "outbound_mail_jobs",
+            {
+                "locked_by": "VARCHAR(128)",
+                "locked_until": _datetime_type(),
+                "sending_started_at": _datetime_type(),
+                "sent_at": _datetime_type(),
+            },
+        )
+    if "processing_jobs" in tables:
+        _ensure_columns(
+            "processing_jobs",
+            {
+                "locked_by": "VARCHAR(128)",
+                "locked_until": _datetime_type(),
+                "started_at": _datetime_type(),
+            },
+        )
+
+
+def _datetime_type() -> str:
+    if engine.dialect.name == "postgresql":
+        return "TIMESTAMP WITH TIME ZONE"
+    return "DATETIME"
+
+
+def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
+    inspector = inspect(engine)
+    existing = {column["name"] for column in inspector.get_columns(table_name)}
+    missing = [(name, sql_type) for name, sql_type in columns.items() if name not in existing]
+    if not missing:
+        return
+    with engine.begin() as connection:
+        for name, sql_type in missing:
+            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {sql_type}"))
 
 
 @contextmanager

@@ -37,6 +37,7 @@ from backend.app.services.parser import ExtractedRequirement, classify_mail, ext
 from backend.app.services.templates import render_template
 from backend.app.services.workflow_rules import (
     CORE_FIELD_LABELS,
+    append_required_field_template_lines,
     extract_workflow_fields,
     match_workflow_for_mail,
     resolve_contact_emails,
@@ -44,7 +45,8 @@ from backend.app.services.workflow_rules import (
     workflow_binding_for_requirement,
 )
 from backend.app.services.products import (
-    extract_products_with_llm,
+    config_bool,
+    extract_order_products_for_review,
     review_order_products,
 )
 
@@ -619,19 +621,20 @@ def upsert_requirement_workflow_binding(
     binding.route_to_json = dumps(to_emails)
     binding.route_cc_json = dumps(cc_emails)
     binding.subject_template = str(rule.get("subject_template") or "") or "[生产任务单][{{task_no}}][{{customer_name}}][{{product_summary}}][V{{version_no}}]"
-    binding.body_template = str(rule.get("body_template") or "") or (
+    body_template = str(rule.get("body_template") or "") or (
         "生产部同事好：\n\n"
         "请根据以下信息安排生产评估和排产。\n\n"
         "任务单编号：{{task_no}}\n"
         "版本：V{{version_no}}\n"
         "客户名称：{{customer_name}}\n"
         "销售人员：{{salesperson_name}} <{{salesperson_email}}>\n\n"
-        "产品/规格：{{product_summary}}\n"
+        "物料/规格：{{product_summary}}\n"
         "数量：{{quantity_text}}\n"
         "期望交期：{{expected_delivery_date}}\n\n"
         "请确认是否可以安排生产。如信息不足，请直接回复本邮件说明疑问点。\n\n"
         "{{bot_signature}}\n"
     )
+    binding.body_template = append_required_field_template_lines(body_template, required_fields)
     binding.required_fields_json = dumps(required_fields)
     binding.required_attachments_json = dumps(required_attachments)
     binding.extracted_fields_json = dumps(extracted_fields)
@@ -692,7 +695,7 @@ def merge_extracted_requirement(
         label
         for label, value in [
             ("客户名称", values["customer_name"]),
-            ("产品/规格", values["product_summary"]),
+            ("物料/规格", values["product_summary"]),
             ("数量", values["quantity_text"]),
             ("期望交期", values["expected_delivery_date"]),
         ]
@@ -820,10 +823,10 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
     # ---------------------------------------------------------
     # Product Management Review Integration
     # ---------------------------------------------------------
-    product_review_failures = []
-    product_risk_flags = []
-    if requirement.product_summary:
-        extracted_items = extract_products_with_llm(session, requirement.product_summary)
+    product_review_failures: list[ReviewFailure] = []
+    product_risk_flags: list[str] = []
+    if config_bool(session, "product_price_review_enabled", True) and requirement.product_summary:
+        extracted_items = extract_order_products_for_review(session, requirement.product_summary, source_text)
         if extracted_items:
             reviewed_items = review_order_products(session, extracted_items)
             for item in reviewed_items:
@@ -832,18 +835,23 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
                     flags = res.get("risk_flags", [])
                     product_risk_flags.extend(flags)
                     for f in flags:
+                        sku_label = item.get("sku_id") or item.get("sku_code") or "未识别SKU"
                         product_review_failures.append(
                             ReviewFailure(
                                 field="product_summary",
-                                field_label="产品明细审核",
-                                rule_name="商品中台合规校验",
-                                message=f"产品 {item.get('sku_code', 'Unknown')} 审核失败: {f}",
+                                field_label="物料明细审核",
+                                rule_name="物料中心合规校验",
+                                message=f"物料 {sku_label} 审核失败：{f}",
                             )
                         )
             
-            # Save the structured items back to requirement or a new field if needed.
-            # Since we didn't add a field to OrderRequirement for this, we will just 
-            # log it in the audit or risk flags for now.
+            add_audit(
+                session,
+                "ProductPriceReviewCompleted",
+                "OrderRequirement",
+                requirement.id,
+                {"items": reviewed_items, "risk_flags": product_risk_flags},
+            )
     # ---------------------------------------------------------
 
     all_failures = [*review.failures, *workflow_failures, *product_review_failures]
@@ -981,7 +989,7 @@ def apply_requirement_supplement_updates(
     updates: list[str] = []
     field_pairs = [
         ("customer_name", extracted.customer_name, "客户名称"),
-        ("product_summary", extracted.product_summary, "产品/规格"),
+        ("product_summary", extracted.product_summary, "物料/规格"),
         ("quantity_text", extracted.quantity_text, "数量"),
         ("expected_delivery_date", extracted.expected_delivery_date, "期望交期"),
         ("external_order_no", extracted.external_order_no, "订单号"),
@@ -1225,7 +1233,7 @@ def enqueue_initial_review_rejection(
                 *(["", "其他初审原因：", *[f"- {reason}" for reason in other_reason_lines]] if other_reason_lines else []),
                 "",
                 f"当前识别客户：{requirement.customer_name or '未识别'}",
-                f"当前识别产品：{requirement.product_summary or '未识别'}",
+                f"当前识别物料：{requirement.product_summary or '未识别'}",
                 f"当前识别数量：{requirement.quantity_text or '未识别'}",
                 f"当前识别交期：{requirement.expected_delivery_date or '未识别'}",
                 f"当前识别订单号：{requirement.external_order_no or '未识别'}",
@@ -1459,7 +1467,7 @@ def record_production_question(
             "",
             "当前任务信息：",
             f"客户名称：{requirement.customer_name or ''}",
-            f"产品/规格：{requirement.product_summary or ''}",
+            f"物料/规格：{requirement.product_summary or ''}",
             f"数量：{requirement.quantity_text or ''}",
             f"期望交期：{requirement.expected_delivery_date or ''}",
             "",
@@ -1530,7 +1538,7 @@ def close_conversation_for_max_rounds(
             "",
             "当前订单信息：",
             f"客户名称：{requirement.customer_name or ''}",
-            f"产品/规格：{requirement.product_summary or ''}",
+            f"物料/规格：{requirement.product_summary or ''}",
             f"数量：{requirement.quantity_text or ''}",
             f"期望交期：{requirement.expected_delivery_date or ''}",
             "",
@@ -1667,7 +1675,7 @@ def task_brief(task: ProductionTask) -> dict[str, object]:
     return {
         "task_no": task.task_no,
         "customer": requirement.customer_name or "未识别客户",
-        "product": requirement.product_summary or "未识别产品",
+        "product": requirement.product_summary or "未识别物料",
         "quantity": requirement.quantity_text or "未识别数量",
         "expected_delivery": requirement.expected_delivery_date or "未识别交期",
         "external_order_no": requirement.external_order_no or "未识别订单号",
@@ -1685,7 +1693,7 @@ def requirement_brief(requirement: OrderRequirement, task: ProductionTask | None
         "requirement_no": requirement.internal_order_no,
         "task_no": task.task_no if task else "",
         "customer": requirement.customer_name or "未识别客户",
-        "product": requirement.product_summary or "未识别产品",
+        "product": requirement.product_summary or "未识别物料",
         "quantity": requirement.quantity_text or "未识别数量",
         "expected_delivery": requirement.expected_delivery_date or "未识别交期",
         "external_order_no": requirement.external_order_no or "未识别订单号",
@@ -1926,7 +1934,7 @@ def enqueue_production_pending_tasks_reply(session: Session, source_mail: MailMe
 
     if tasks:
         lines = [
-            f"{index}. {task.task_no} | {task.requirement.customer_name or '未识别客户'} | {task.requirement.product_summary or '未识别产品'} | {task.requirement.quantity_text or '未识别数量'} | 交期 {task.requirement.expected_delivery_date or '未识别'} | 状态 {task.status}"
+            f"{index}. {task.task_no} | {task.requirement.customer_name or '未识别客户'} | {task.requirement.product_summary or '未识别物料'} | {task.requirement.quantity_text or '未识别数量'} | 交期 {task.requirement.expected_delivery_date or '未识别'} | 状态 {task.status}"
             for index, task in enumerate(tasks, start=1)
         ]
         instruction = "如需确认指定任务，请回复：确认排产 任务编号，例如：确认排产 PT-20260422-0001。"
@@ -2221,7 +2229,7 @@ def _apply_reply_updates(task: ProductionTask, reply_text: str) -> list[str]:
     updates: list[str] = []
     field_pairs = [
         ("customer_name", extracted.customer_name, "客户名称"),
-        ("product_summary", extracted.product_summary, "产品/规格"),
+        ("product_summary", extracted.product_summary, "物料/规格"),
         ("quantity_text", extracted.quantity_text, "数量"),
         ("expected_delivery_date", extracted.expected_delivery_date, "期望交期"),
         ("external_order_no", extracted.external_order_no, "订单号"),
@@ -2413,7 +2421,7 @@ def enqueue_sales_reply_reissue_receipt(session: Session, sent_job: OutboundMail
             "",
             "当前任务信息：",
             f"客户名称：{task.requirement.customer_name or ''}",
-            f"产品/规格：{task.requirement.product_summary or ''}",
+            f"物料/规格：{task.requirement.product_summary or ''}",
             f"数量：{task.requirement.quantity_text or ''}",
             f"期望交期：{task.requirement.expected_delivery_date or ''}",
             "",
@@ -2460,7 +2468,7 @@ def enqueue_requirement_supplement_receipt(session: Session, sent_job: OutboundM
             "",
             "当前任务信息：",
             f"客户名称：{task.requirement.customer_name or ''}",
-            f"产品/规格：{task.requirement.product_summary or ''}",
+            f"物料/规格：{task.requirement.product_summary or ''}",
             f"数量：{task.requirement.quantity_text or ''}",
             f"期望交期：{task.requirement.expected_delivery_date or ''}",
             f"订单号：{task.requirement.external_order_no or ''}",
@@ -3043,7 +3051,7 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
 def required_missing_fields(requirement: OrderRequirement) -> list[str]:
     checks = [
         ("客户名称", requirement.customer_name),
-        ("产品/规格", requirement.product_summary),
+        ("物料/规格", requirement.product_summary),
         ("数量", requirement.quantity_text),
         ("期望交期", requirement.expected_delivery_date),
     ]
@@ -3283,7 +3291,7 @@ def dashboard_bucket_index(value: datetime, start_local: datetime, bucket_type: 
 def dashboard_product_stats(tasks: list[ProductionTask]) -> list[dict[str, object]]:
     stats: dict[str, dict[str, object]] = {}
     for task in tasks:
-        product = (task.requirement.product_summary or "未识别产品").strip() or "未识别产品"
+        product = (task.requirement.product_summary or "未识别物料").strip() or "未识别物料"
         row = stats.setdefault(product, {"product": product, "total": 0, "confirmed_total": 0})
         row["total"] = int(row["total"]) + 1
         if is_confirmed_task(task):
@@ -3316,7 +3324,7 @@ def dashboard_location_stats(session: Session, tasks: list[ProductionTask]) -> l
         if location is None:
             continue
         city = str(location["city"])
-        product = (task.requirement.product_summary or "未识别产品").strip() or "未识别产品"
+        product = (task.requirement.product_summary or "未识别物料").strip() or "未识别物料"
         row = stats.setdefault(
             city,
             {
@@ -3478,7 +3486,7 @@ def product_order_stats(tasks: list[ProductionTask], *, confirmed: bool) -> list
     for task in tasks:
         if is_confirmed_task(task) != confirmed:
             continue
-        product = (task.requirement.product_summary or "未识别产品").strip() or "未识别产品"
+        product = (task.requirement.product_summary or "未识别物料").strip() or "未识别物料"
         counts[product] = counts.get(product, 0) + 1
     return [{"product": product, "order_count": count} for product, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
 
@@ -3602,14 +3610,14 @@ def weekly_report_mail_body(report_data: dict) -> str:
         lines.append(f"- {period['label']}：{period['range_label']}，需求 {stats['demand_total']} 单，已确认 {stats['confirmed_total']} 单，未确认 {stats['unconfirmed_total']} 单")
 
     lines.append("")
-    lines.append("二、已确认产品订单统计（分产品）")
+    lines.append("二、已确认物料订单统计（分物料）")
     for key in period_order:
         period = periods[key]
         lines.append(f"{period['label']}：{period['range_label']}")
         lines.extend(_format_product_stats(period["confirmed_products"]))
 
     lines.append("")
-    lines.append("三、未确认产品订单统计（分产品）")
+    lines.append("三、未确认物料订单统计（分物料）")
     for key in period_order:
         period = periods[key]
         lines.append(f"{period['label']}：{period['range_label']}")
@@ -3668,10 +3676,15 @@ def retry_outbound_mail(session: Session, job_id: str, actor: str = "business-ow
     job = session.get(OutboundMailJob, job_id)
     if job is None:
         raise ValueError("outbound mail job not found")
-    if job.status not in {"Failed", "Pending"}:
+    if job.status not in {"Failed", "Pending", "SendUnknown"}:
         raise ValueError(f"outbound mail status {job.status} cannot be retried")
     previous_status = job.status
     job.status = "Pending"
+    job.next_retry_at = None
+    job.locked_by = None
+    job.locked_until = None
+    job.sending_started_at = None
+    job.attempt_count = 0
     add_audit(
         session,
         "OutboundMailRetryQueued",

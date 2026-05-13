@@ -32,6 +32,14 @@ def _parse_date(v):
     except Exception:
         return None
 
+
+def _first_val(row, *names):
+    for name in names:
+        value = _clean_val(row.get(name))
+        if value is not None:
+            return value
+    return None
+
 def preview_excel_import(file_path: str, session: Session) -> Dict[str, Any]:
     """Parse the Excel file and return a preview of changes (New, Conflict)."""
     xls = pd.ExcelFile(file_path)
@@ -43,8 +51,9 @@ def preview_excel_import(file_path: str, session: Session) -> Dict[str, Any]:
     }
     
     # 1. Parse SPU
-    if "SPU_产品基础信息" in xls.sheet_names:
-        df_spu = pd.read_excel(xls, "SPU_产品基础信息")
+    spu_sheet = next((name for name in ["SPU_物料基础信息", "SPU_产品基础信息"] if name in xls.sheet_names), None)
+    if spu_sheet:
+        df_spu = pd.read_excel(xls, spu_sheet)
         for _, row in df_spu.iterrows():
             spu_id = _clean_val(row.get("SPU_ID"))
             if not spu_id:
@@ -52,12 +61,12 @@ def preview_excel_import(file_path: str, session: Session) -> Dict[str, Any]:
             
             item = {
                 "spu_id": str(spu_id),
-                "name": str(_clean_val(row.get("产品名称(中文)")) or ""),
-                "name_en": _clean_val(row.get("产品名称(英文)")),
-                "product_line": _clean_val(row.get("产品线")),
-                "product_type": _clean_val(row.get("产品类型")),
+                "name": str(_first_val(row, "物料名称(中文)", "产品名称(中文)", "商品名称(中文)") or ""),
+                "name_en": _first_val(row, "物料名称(英文)", "产品名称(英文)", "商品名称(英文)"),
+                "product_line": _first_val(row, "物料线", "产品线", "商品线"),
+                "product_type": _first_val(row, "物料类型", "产品类型", "商品类型"),
                 "brand": _clean_val(row.get("品牌")),
-                "positioning": _clean_val(row.get("产品定位")),
+                "positioning": _first_val(row, "物料定位", "产品定位", "商品定位"),
                 "launch_time": _clean_val(row.get("上市时间")),
                 "lifecycle": _clean_val(row.get("生命周期")),
                 "core_selling_points": _clean_val(row.get("核心卖点")),

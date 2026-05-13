@@ -19,7 +19,7 @@ DEFAULT_TASK_BODY = """生产部同事好：
 客户名称：{{customer_name}}
 销售人员：{{salesperson_name}} <{{salesperson_email}}>
 
-产品/规格：{{product_summary}}
+物料/规格：{{product_summary}}
 数量：{{quantity_text}}
 期望交期：{{expected_delivery_date}}
 
@@ -89,6 +89,9 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "conversation_max_rounds", "3", is_secret=False)
     ensure_config(session, "outbound_failed_alert_threshold", "1", is_secret=False)
     ensure_config(session, "outbound_pending_age_alert_seconds", "3600", is_secret=False)
+    ensure_config(session, "product_price_review_enabled", "true", is_secret=False)
+    ensure_config(session, "product_price_review_require_unit_price", "false", is_secret=False)
+    ensure_config(session, "product_price_review_llm_enabled", "false", is_secret=False)
     ensure_config(session, "workflow_contact_map_json", "{}", is_secret=False)
     if settings.baidu_map_ak:
         map_config = session.get(SystemConfig, "baidu_map_ak")

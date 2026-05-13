@@ -33,7 +33,7 @@
         <a href="#review-rules" data-page-link="review-rules">初审规则</a>
         <a href="#integration" data-page-link="integration">接入</a>
         <a href="#departments" data-page-link="departments">生产邮箱</a>
-        <a href="#products" data-page-link="products">商品管理</a>
+        <a href="#products" data-page-link="products">物料管理</a>
         <a href="#reports" data-page-link="reports">周报</a>
         <a href="#mails" data-page-link="mails">邮件</a>
         <a href="#outbound" data-page-link="outbound">外发</a>
@@ -63,9 +63,9 @@
         <div id="system-health" class="health-panel"></div>
       </section>
 
-      <section class="page" data-page="products" data-title="商品管理" data-subtitle="管理产品 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
+      <section class="page" data-page="products" data-title="物料管理" data-subtitle="管理物料 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
         <div class="tabs" id="products-tabs">
-          <button type="button" class="active" data-tab="spu">产品 SPU</button>
+          <button type="button" class="active" data-tab="spu">物料 SPU</button>
           <button type="button" data-tab="sku">存货 SKU</button>
           <button type="button" data-tab="pricing">渠道价格</button>
           <button type="button" data-tab="promotions">促销规则</button>
@@ -208,7 +208,7 @@
           <label>邮件主题 <input name="subject" value="生产订单需求 - 测试客户" /></label>
           <label class="wide">邮件正文
             <textarea name="body_text">客户名称：测试客户
-产品：积木展示架 A1
+物料：积木展示架 A1
 数量：120 套
 期望交期：2026-05-20
 订单号：SO-TEST-001</textarea>
@@ -414,11 +414,11 @@
         <form id="task-filter-form" class="task-filter-bar">
           <div class="filter-search">
             <span aria-hidden="true">⌕</span>
-            <input name="q" aria-label="全文搜索" placeholder="任务号 / 客户 / 产品 / 订单号 / 销售邮箱" />
+            <input name="q" aria-label="全文搜索" placeholder="任务号 / 客户 / 物料 / 订单号 / 销售邮箱" />
           </div>
           <select name="status" aria-label="状态"><option value="">全部状态</option></select>
           <input name="customer" aria-label="客户" placeholder="客户" />
-          <input name="product" aria-label="产品" placeholder="产品" />
+          <input name="product" aria-label="物料" placeholder="物料" />
           <input name="salesperson" aria-label="销售邮箱" placeholder="销售邮箱" />
           <input name="order_no" aria-label="订单号" placeholder="订单号" />
           <input name="delivery" aria-label="交期" placeholder="交期" />
@@ -682,6 +682,10 @@
                 <small>正文</small>
                 <pre id="workflow-mail-preview-body"></pre>
               </div>
+              <div class="workflow-mail-preview-block">
+                <small>已勾选必填字段</small>
+                <div id="workflow-mail-preview-required-fields" class="workflow-preview-required-fields"></div>
+              </div>
             </section>
           </div>
           <div class="actions wide">
@@ -755,12 +759,12 @@
     <div id="product-spu-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-spu-title">
         <div class="modal-head">
-          <div><small>商品中心</small><h2 id="product-spu-title">新增 SPU</h2></div>
+          <div><small>物料中心</small><h2 id="product-spu-title">新增 SPU</h2></div>
           <button id="product-spu-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <form id="product-spu-form" class="form-grid compact-form">
           <label>SPU代码 <input name="spu_code" required placeholder="如: SP-1001" /></label>
-          <label>商品名称 <input name="name" required placeholder="例如: 星巴克拿铁" /></label>
+          <label>物料名称 <input name="name" required placeholder="例如: JM-MAT-1001" /></label>
           <label>品牌 <input name="brand" placeholder="选填" /></label>
           <label>品类 <input name="category" placeholder="选填" /></label>
           <button type="submit" class="button wide">保存</button>
@@ -771,7 +775,7 @@
     <div id="product-sku-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-sku-title">
         <div class="modal-head">
-          <div><small>商品中心</small><h2 id="product-sku-title">新增 SKU</h2></div>
+          <div><small>物料中心</small><h2 id="product-sku-title">新增 SKU</h2></div>
           <button id="product-sku-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <form id="product-sku-form" class="form-grid compact-form">
@@ -786,7 +790,7 @@
     <div id="product-pricing-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-pricing-title">
         <div class="modal-head">
-          <div><small>商品中心</small><h2 id="product-pricing-title">配置渠道价格</h2></div>
+          <div><small>物料中心</small><h2 id="product-pricing-title">配置渠道价格</h2></div>
           <button id="product-pricing-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <form id="product-pricing-form" class="form-grid compact-form">
@@ -807,7 +811,7 @@
     <div id="product-promotion-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-promotion-title">
         <div class="modal-head">
-          <div><small>商品中心</small><h2 id="product-promotion-title">新增促销规则</h2></div>
+          <div><small>物料中心</small><h2 id="product-promotion-title">新增促销规则</h2></div>
           <button id="product-promotion-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <form id="product-promotion-form" class="form-grid compact-form">
@@ -826,7 +830,7 @@
     <div id="product-import-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-import-title" style="max-width: 800px;">
         <div class="modal-head">
-          <div><small>商品中心</small><h2 id="product-import-title">导入 Excel</h2></div>
+          <div><small>物料中心</small><h2 id="product-import-title">导入 Excel</h2></div>
           <button id="product-import-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <form id="product-import-form" class="form-grid compact-form">

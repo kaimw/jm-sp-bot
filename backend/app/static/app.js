@@ -455,7 +455,7 @@ function renderDemandMap(points, current, periods) {
   const productRows = topRows(current.product_top10 || [], "total", "product", 7);
   return `
     <div class="geo-dashboard">
-      <div id="baidu-demand-map" class="baidu-map" aria-label="产品需求地理分布"></div>
+      <div id="baidu-demand-map" class="baidu-map" aria-label="物料需求地理分布"></div>
       <div id="baidu-map-empty" class="baidu-map-empty" ${rows.length ? "hidden" : ""}>当前周期暂无可识别的需求地。</div>
       <div class="map-period-control segmented-control" role="tablist" aria-label="统计周期">
         ${renderPeriodTabs(periods)}
@@ -466,7 +466,7 @@ function renderDemandMap(points, current, periods) {
       </div>
       <div class="map-overlay map-overlay-right">
         ${chartPanel("人员排行", "销售需求量 Top 7", renderRankingChart(salesRows, "暂无人员数据"), "floating-ranking-card")}
-        ${chartPanel("产品排行", "产品需求量 Top 7", renderRankingChart(productRows, "暂无产品数据"), "floating-ranking-card")}
+        ${chartPanel("物料排行", "物料需求量 Top 7", renderRankingChart(productRows, "暂无物料数据"), "floating-ranking-card")}
       </div>
     </div>`;
 }
@@ -651,7 +651,7 @@ async function refreshTasks() {
             <small>${h(row.customer_name || "未识别客户")} · ${h(row.salesperson_email || "未知销售")}</small><br />
             <small>${h(row.external_order_no || "无订单号")}</small>
           </div>
-          <div>${h(row.product_summary || "未识别产品")}<br /><small>${h(row.quantity_text || "")} ${h(row.expected_delivery_date || "")}</small></div>
+          <div>${h(row.product_summary || "未识别物料")}<br /><small>${h(row.quantity_text || "")} ${h(row.expected_delivery_date || "")}</small></div>
           <div><small>${h(row.status)}</small></div>
           <div><small>创建时间</small><br />${h(formatTime(row.created_at))}</div>
           <div class="actions">
@@ -804,23 +804,35 @@ async function refreshSkills() {
   
   await guardedAction(["技能实验室", "加载列表"], async () => {
     const skills = await api("/api/skills/list");
-    listNode.innerHTML = skills.map(skill => `
-      <div class="row skill-row ${skill.active ? "" : "disabled-row"}">
-        <div class="skill-info">
-          <strong>${h(skill.name)}</strong>
-          ${skill.active ? "" : '<span class="status-tag warning">已停用</span>'}
-          <p><small>${h(skill.description || "无描述")}</small></p>
+    listNode.innerHTML = skills.map((skill) => {
+      const active = skill.active !== false && skill.enabled !== false;
+      const statusLabel = skill.status_label || (active ? "已启用" : "已停用");
+      const sourceLabel = skill.source === "dynamic" ? "动态技能" : "内置技能";
+      return `
+        <div class="row skill-row ${active ? "enabled-row" : "disabled-row"}">
+          <div class="skill-info">
+            <div class="skill-title-line">
+              <strong>${h(skill.name)}</strong>
+              <span class="skill-status ${active ? "is-enabled" : "is-disabled"}">${h(statusLabel)}</span>
+              <span class="skill-source">${h(sourceLabel)}</span>
+            </div>
+            <p><small>${h(skill.description || "无描述")}</small></p>
+          </div>
+          <div class="actions">
+            ${
+              skill.toggleable
+                ? `<button class="button ghost" data-action="toggle-skill" data-id="${h(skill.name)}" data-active="${active}">${active ? "停用" : "启用"}</button>`
+                : ""
+            }
+            ${
+              skill.deletable
+                ? `<button class="icon-button danger" data-action="delete-skill" data-id="${h(skill.name)}" title="删除">🗑️</button>`
+                : ""
+            }
+          </div>
         </div>
-        <div class="actions">
-          <button class="icon-button" data-action="toggle-skill" data-id="${h(skill.name)}" data-active="${skill.active}" title="${skill.active ? "停用" : "启用"}">
-            ${skill.active ? "🚫" : "✅"}
-          </button>
-          <button class="icon-button danger" data-action="delete-skill" data-id="${h(skill.name)}" title="删除">
-            🗑️
-          </button>
-        </div>
-      </div>
-    `).join("") || '<div class="row">暂无可用技能</div>';
+      `;
+    }).join("") || '<div class="row">暂无可用技能</div>';
   });
 }
 
@@ -1039,6 +1051,11 @@ function renderTemplateWithContext(template, context) {
   });
 }
 
+function workflowTemplateHasVariable(template, field) {
+  const escaped = String(field || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\{\\{\\s*${escaped}\\s*\\}\\}`).test(String(template || ""));
+}
+
 function workflowFieldLabel(field) {
   const fromInitial = optionLabel(initialReviewState.field_options || [], field);
   if (fromInitial && fromInitial !== field) return fromInitial;
@@ -1056,6 +1073,47 @@ function workflowFieldLabel(field) {
     expected_time: "期望时间",
   };
   return extra[field] || field;
+}
+
+function ensureWorkflowRequiredFieldsInBody(bodyTemplate, requiredFields) {
+  const body = String(bodyTemplate || "").trim();
+  const extraFields = (requiredFields || []).filter((field) => {
+    const key = String(field || "").trim();
+    if (!key) return false;
+    if (["customer_name", "product_summary", "quantity_text", "expected_delivery_date", "external_order_no"].includes(key)) return false;
+    return !workflowTemplateHasVariable(body, key);
+  });
+  if (!extraFields.length) return body;
+  const lines = ["流程必填信息：", ...extraFields.map((field) => `${workflowFieldLabel(field)}：{{${field}}}`)];
+  return [body, lines.join("\n")].filter(Boolean).join("\n\n");
+}
+
+function workflowPreviewContext(rule) {
+  const workflowName = String(rule?.workflow_name || "示例流程").trim() || "示例流程";
+  return {
+    task_no: "JM-RW-2026001",
+    version_no: "1",
+    customer_name: "示例客户",
+    salesperson_name: "商务部小J",
+    salesperson_email: "bot.business@jimuyida.com",
+    product_summary: "示例物料A",
+    quantity_text: "120套",
+    expected_delivery_date: "2026-05-20",
+    external_order_no: "SO-DEMO-2026001",
+    workflow_name: workflowName,
+    material_details: "物料编码：MAT-A001\n物料名称：示例物料A\n数量：120套",
+    logistics_method: "顺丰",
+    shipping_time_requirement: "2026-05-18 前出货",
+    customer_receiver_info: "示例省示例市示例路 88 号，张三 13800000000",
+    delivery_requirement: "木箱加固",
+    shipping_warehouse: "武汉仓",
+    borrow_time: "2026-05-15",
+    return_time: "2026-06-15",
+    sample_approval_screenshot: "已附审批截图",
+    initiator: "商务部小J",
+    expected_time: "2026-05-20",
+    bot_signature: "商务部小J",
+  };
 }
 
 async function loadProductionDepartmentOptions() {
@@ -1084,6 +1142,7 @@ function productionMainEmailOptions() {
 function updateWorkflowMailPreview(ruleOrRaw = "") {
   const subjectNode = $("#workflow-mail-preview-subject");
   const bodyNode = $("#workflow-mail-preview-body");
+  const requiredNode = $("#workflow-mail-preview-required-fields");
   if (!subjectNode || !bodyNode) return;
   let rule;
   if (typeof ruleOrRaw === "string") {
@@ -1091,6 +1150,7 @@ function updateWorkflowMailPreview(ruleOrRaw = "") {
     if (!source) {
       subjectNode.textContent = "请先选择流程规则";
       bodyNode.textContent = "请先选择流程规则";
+      if (requiredNode) requiredNode.innerHTML = `<span class="empty-note">请先选择流程规则</span>`;
       return;
     }
     try {
@@ -1098,32 +1158,28 @@ function updateWorkflowMailPreview(ruleOrRaw = "") {
     } catch (error) {
       subjectNode.textContent = "JSON 解析失败";
       bodyNode.textContent = error?.message || "请检查 JSON 格式";
+      if (requiredNode) requiredNode.innerHTML = `<span class="empty-note">JSON 解析失败</span>`;
       return;
     }
   } else {
     rule = ruleOrRaw || {};
   }
-  const workflowName = String(rule?.workflow_name || "示例流程").trim() || "示例流程";
-  const context = {
-    task_no: "JM-RW-2026001",
-    version_no: "1",
-    customer_name: "示例客户",
-    salesperson_name: "商务部小J",
-    salesperson_email: "bot.business@jimuyida.com",
-    product_summary: "示例产品A",
-    quantity_text: "120套",
-    expected_delivery_date: "2026-05-20",
-    workflow_name: workflowName,
-    bot_signature: "商务部小J",
-  };
+  const context = workflowPreviewContext(rule);
+  const requiredFields = Array.isArray(rule?.required_fields) ? rule.required_fields.map((item) => String(item || "").trim()).filter(Boolean) : [];
   const subjectTemplate = String(rule?.subject_template || "").trim();
-  const bodyTemplate = String(rule?.body_template || "").trim();
+  const bodyTemplate = ensureWorkflowRequiredFieldsInBody(String(rule?.body_template || "").trim(), requiredFields);
   subjectNode.textContent = subjectTemplate
     ? renderTemplateWithContext(subjectTemplate, context)
     : "（未配置 subject_template，保存后将使用系统默认主题模板）";
   bodyNode.textContent = bodyTemplate
     ? renderTemplateWithContext(bodyTemplate, context)
     : "（未配置 body_template，保存后将使用系统默认正文模板）";
+  if (requiredNode) {
+    requiredNode.innerHTML =
+      requiredFields
+        .map((field) => `<span class="workflow-preview-field"><strong>${h(workflowFieldLabel(field))}</strong><small>${h(context[field] || "示例值")}</small></span>`)
+        .join("") || `<span class="empty-note">当前流程未勾选必填字段。</span>`;
+  }
 }
 
 function syncWorkflowRuleEditorState() {
@@ -1748,7 +1804,7 @@ async function openWorkflow(id) {
   const data = await api(`/api/tasks/${id}/workflow`);
   const task = data.task || {};
   $("#workflow-task-no").textContent = task.task_no || "生产任务";
-  $("#workflow-title").textContent = `${task.customer_name || "未识别客户"} · ${task.product_summary || "未识别产品"}`;
+  $("#workflow-title").textContent = `${task.customer_name || "未识别客户"} · ${task.product_summary || "未识别物料"}`;
   $("#workflow-steps").innerHTML = (data.steps || [])
     .map(
       (step) => `
@@ -2207,7 +2263,7 @@ $("#workflow-simulate-open")?.addEventListener("click", async () => {
   if (subject === null) return;
   const body = window.prompt(
     "模拟邮件正文",
-    "客户名称：测试客户\n产品：积木展示架 A1\n数量：120套\n期望交期：2026-05-20\n订单号：SIM-001"
+    "客户名称：测试客户\n物料：积木展示架 A1\n数量：120套\n期望交期：2026-05-20\n订单号：SIM-001"
   );
   if (body === null) return;
   const fromAddress = window.prompt("销售发件人", "sales@jimuyida.com");
@@ -2839,7 +2895,7 @@ $("#exceptions-list").addEventListener("click", async (event) => {
   if (action === "patch-exception") {
     const customer_name = window.prompt("客户名称，留空则不修改", "");
     if (customer_name === null) return;
-    const product_summary = window.prompt("产品/规格，留空则不修改", "");
+    const product_summary = window.prompt("物料/规格，留空则不修改", "");
     if (product_summary === null) return;
     const quantity_text = window.prompt("数量，留空则不修改", "");
     if (quantity_text === null) return;
@@ -3043,7 +3099,7 @@ document.addEventListener("click", async (e) => {
     e.preventDefault();
     const id = target.dataset.id;
     if (!confirm("确定要删除该促销规则吗？")) return;
-    await guardedAction(["商品中心", "删除促销规则"], async () => {
+    await guardedAction(["物料中心", "删除促销规则"], async () => {
       await api(`/api/promotions/${id}`, { method: "DELETE" });
       toast("删除成功");
       refreshProductsPromotions();
@@ -3054,7 +3110,7 @@ document.addEventListener("click", async (e) => {
     e.preventDefault();
     const id = target.dataset.id;
     const isActive = target.dataset.active === "true";
-    await guardedAction(["商品中心", "切换状态"], async () => {
+    await guardedAction(["物料中心", "切换状态"], async () => {
       await api(`/api/promotions/${id}/toggle?is_active=${!isActive}`, { method: "POST" });
       toast("操作成功");
       refreshProductsPromotions();
@@ -3074,7 +3130,7 @@ let editingPromotionId = null;
 $("#product-import-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
-  await guardedAction(["商品中心", "导入预览"], async () => {
+  await guardedAction(["物料中心", "导入预览"], async () => {
     const data = await api("/api/products/import/preview", {
       method: "POST",
       body: formData,
@@ -3105,7 +3161,7 @@ $("#product-import-form")?.addEventListener("submit", async (e) => {
 
 $("#product-import-confirm-btn")?.addEventListener("click", async () => {
   if (!currentImportPreviewData) return;
-  await guardedAction(["商品中心", "确认导入"], async () => {
+  await guardedAction(["物料中心", "确认导入"], async () => {
     const result = await api("/api/products/import/confirm", {
       method: "POST",
       body: JSON.stringify(currentImportPreviewData),
@@ -3124,7 +3180,7 @@ $("#product-import-confirm-btn")?.addEventListener("click", async () => {
 $("#product-spu-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
-  await guardedAction(["商品中心", "新增 SPU"], async () => {
+  await guardedAction(["物料中心", "新增 SPU"], async () => {
     await api("/api/products/spu", {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(formData)),
@@ -3146,7 +3202,7 @@ $("#product-sku-form")?.addEventListener("submit", async (e) => {
     toast("属性 JSON 格式错误");
     return;
   }
-  await guardedAction(["商品中心", "新增 SKU"], async () => {
+  await guardedAction(["物料中心", "新增 SKU"], async () => {
     await api("/api/products/sku", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -3173,7 +3229,7 @@ $("#product-pricing-form")?.addEventListener("submit", async (e) => {
   ["promo_start_time", "promo_end_time"].forEach(k => {
     if (!payload[k]) payload[k] = null;
   });
-  await guardedAction(["商品中心", "配置价格"], async () => {
+  await guardedAction(["物料中心", "配置价格"], async () => {
     await api("/api/pricing", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -3206,7 +3262,7 @@ $("#product-promotion-form")?.addEventListener("submit", async (e) => {
   const url = editingPromotionId ? `/api/promotions/${editingPromotionId}` : "/api/promotions";
   const method = editingPromotionId ? "PATCH" : "POST";
 
-  await guardedAction(["商品中心", label], async () => {
+  await guardedAction(["物料中心", label], async () => {
     await api(url, {
       method: method,
       body: JSON.stringify(payload),

@@ -179,7 +179,7 @@ def weekly_report_csv_rows(session: Session) -> list[dict]:
         for row in period["confirmed_products"]:
             rows.append(
                 {
-                    "section": "已确认产品订单统计（分产品）",
+                    "section": "已确认物料订单统计（分物料）",
                     "period": period["label"],
                     "product": row["product"],
                     "salesperson": "",
@@ -192,7 +192,7 @@ def weekly_report_csv_rows(session: Session) -> list[dict]:
         for row in period["unconfirmed_products"]:
             rows.append(
                 {
-                    "section": "未确认产品订单统计（分产品）",
+                    "section": "未确认物料订单统计（分物料）",
                     "period": period["label"],
                     "product": row["product"],
                     "salesperson": "",

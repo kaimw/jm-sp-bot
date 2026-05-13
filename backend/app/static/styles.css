@@ -265,6 +265,8 @@ label {
 .compact-list .skill-row {
   padding: 0.75rem;
   border-bottom: 1px solid var(--border-color);
+  align-items: center;
+  gap: 12px;
 }
 
 .compact-list .skill-row:last-child {
@@ -279,6 +281,43 @@ label {
 .skill-row p {
   margin: 0.25rem 0 0;
   color: var(--text-color-light);
+}
+
+.skill-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skill-status,
+.skill-source {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.skill-status.is-enabled {
+  border-color: rgba(22, 163, 74, 0.35);
+  background: rgba(22, 163, 74, 0.1);
+  color: #15803d;
+}
+
+.skill-status.is-disabled {
+  border-color: rgba(217, 119, 6, 0.35);
+  background: rgba(217, 119, 6, 0.1);
+  color: #b45309;
+}
+
+.skill-source {
+  background: var(--surface-muted);
+  color: var(--muted);
 }
 
 .code-preview {
@@ -1868,7 +1907,7 @@ textarea:focus {
 
 .workflow-mail-preview {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 10px;
   min-height: 0;
   max-height: none;
@@ -1913,14 +1952,44 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
-.workflow-mail-preview-block:last-child pre {
+#workflow-mail-preview-body {
   min-height: 0;
   max-height: none;
   height: 100%;
 }
 
-.workflow-mail-preview-block:last-child {
-  min-height: 0;
+.workflow-preview-required-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 34px;
+  max-height: 110px;
+  overflow: auto;
+}
+
+.workflow-preview-field {
+  display: inline-grid;
+  gap: 2px;
+  max-width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.workflow-preview-field strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.workflow-preview-field small {
+  max-width: 260px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 #toast {
@@ -2300,4 +2369,17 @@ textarea:focus {
   .section-head {
     gap: 8px;
   }
+}
+
+.skill-row.disabled-row {
+  background-color: var(--bg-hover);
+}
+
+.skill-row .actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.skill-info {
+  flex: 1;
 }

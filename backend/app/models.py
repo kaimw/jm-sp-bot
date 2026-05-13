@@ -162,6 +162,9 @@ class ProcessingJob(Base):
     status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
+    locked_by: Mapped[str | None] = mapped_column(String(128))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
@@ -181,6 +184,34 @@ class ModelCallLog(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
+
+class MaintenanceSession(Base):
+    __tablename__ = "maintenance_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_message: Mapped[str] = mapped_column(Text, nullable=False)
+    diagnosis_md: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(32), default="Medium", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Open", nullable=False)
+    proposed_actions_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MaintenanceAction(Base):
+    __tablename__ = "maintenance_actions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(String(36), ForeignKey("maintenance_sessions.id"), nullable=False)
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Proposed", nullable=False)
+    input_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
 
@@ -318,6 +349,10 @@ class OutboundMailJob(Base):
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     # 优先级（越小越高）：10=收件回执 20=业务推进 30=任务单 40=通知 60=周报
     priority: Mapped[int] = mapped_column(Integer, default=40, nullable=False)
+    locked_by: Mapped[str | None] = mapped_column(String(128))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sending_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 

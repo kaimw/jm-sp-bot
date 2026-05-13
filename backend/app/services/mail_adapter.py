@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import email
 import imaplib
-import math
 import smtplib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.header import Header, decode_header
@@ -15,10 +15,15 @@ import re
 
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.models import AttachmentAsset, MailMessage, OutboundMailJob
 from backend.app.services.attachment_parser import ParsedAttachment, parse_attachment
 from backend.app.services.jsonutil import as_list, dumps
-from backend.app.services.mail_throttle import mail_login_interval_seconds, reserve_mail_login, reserve_mail_send
+from backend.app.services.mail_throttle import (
+    mail_login_interval_seconds,
+    reserve_mail_login,
+    reserve_mail_send_slot,
+)
 from backend.app.services.parser import classify_mail, normalize_latest_reply
 from backend.app.services.storage import save_attachment
 from backend.app.services.workflow import (
@@ -226,7 +231,7 @@ def sync_imap_mailbox(session: Session, *, limit: int = 20) -> dict:
     imported = 0
     queued = 0
     reserve_mail_login("imap", username, interval_seconds=mail_login_interval_seconds(session))
-    with imaplib.IMAP4_SSL(host, port) as imap:
+    with imaplib.IMAP4_SSL(host, port, timeout=settings.mail_imap_timeout_seconds) as imap:
         imap.login(username, password)
         imap.select("INBOX")
         _, search_data = imap.search(None, "UNSEEN")
@@ -406,6 +411,7 @@ def mark_outbound_failure(session: Session, job: OutboundMailJob, error: str) ->
     """向后兼容：直接标记 Failed，不重试（用于收件人缺失等无法恢复的错误）。"""
     job.status = "Failed"
     job.last_error = error[:1000]
+    _clear_outbound_lock(job)
     detail = {
         "outbound_job_id": job.id,
         "mail_type": job.mail_type,
@@ -430,7 +436,9 @@ def mark_outbound_retry_or_fail(session: Session, job: OutboundMailJob, error: s
     job.last_error = error[:1000]
     if job.attempt_count <= OUTBOUND_MAX_AUTO_RETRIES:
         # 保持 Pending 状态，设置下次可重试时间
+        job.status = "Pending"
         job.next_retry_at = _next_retry_at(job.attempt_count)
+        _clear_outbound_lock(job)
         add_audit(
             session,
             "OutboundMailRetryScheduled",
@@ -445,6 +453,7 @@ def mark_outbound_retry_or_fail(session: Session, job: OutboundMailJob, error: s
     else:
         # 超过最大重试次数，标记失败并进异常队列
         job.status = "Failed"
+        _clear_outbound_lock(job)
         detail = {
             "outbound_job_id": job.id,
             "mail_type": job.mail_type,
@@ -464,23 +473,120 @@ def mark_outbound_retry_or_fail(session: Session, job: OutboundMailJob, error: s
         add_audit(session, "OutboundMailSendFailed", "OutboundMailJob", job.id, detail)
 
 
+def _clear_outbound_lock(job: OutboundMailJob) -> None:
+    job.locked_by = None
+    job.locked_until = None
+    job.sending_started_at = None
+
+
+def _release_claimed_jobs(session: Session, jobs: list[OutboundMailJob], *, next_retry_at: datetime | None = None) -> None:
+    for job in jobs:
+        if job.status == "Sending":
+            job.status = "Pending"
+            if next_retry_at is not None:
+                job.next_retry_at = next_retry_at
+            _clear_outbound_lock(job)
+    session.commit()
+
+
+def recover_stale_outbound_sending(session: Session) -> int:
+    now = datetime.now(timezone.utc)
+    stale_jobs = (
+        session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.status == "Sending",
+            OutboundMailJob.locked_until.is_not(None),
+            OutboundMailJob.locked_until < now,
+        )
+        .all()
+    )
+    for job in stale_jobs:
+        job.status = "SendUnknown"
+        job.last_error = "send lease expired before final SMTP result was recorded"
+        _clear_outbound_lock(job)
+        detail = {
+            "outbound_job_id": job.id,
+            "mail_type": job.mail_type,
+            "subject": job.subject,
+            "message": job.last_error,
+        }
+        record_exception_case(
+            session,
+            related_task_id=job.related_task_id,
+            exception_type="OutboundMailSendUnknown",
+            severity="High",
+            detail=detail,
+        )
+        add_audit(session, "OutboundMailSendUnknown", "OutboundMailJob", job.id, detail)
+    return len(stale_jobs)
+
+
+def _due_outbound_filter(now: datetime):
+    return (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now)
+
+
+def claim_outbound_jobs(
+    session: Session,
+    *,
+    limit: int,
+    mail_types: set[str] | None = None,
+    priority_lt: int | None = None,
+    job_ids: list[str] | None = None,
+    worker_id: str | None = None,
+) -> list[OutboundMailJob]:
+    recover_stale_outbound_sending(session)
+    now = datetime.now(timezone.utc)
+    worker = worker_id or f"outbound-{uuid.uuid4()}"
+    query = session.query(OutboundMailJob).filter(
+        OutboundMailJob.status == "Pending",
+        _due_outbound_filter(now),
+    )
+    if mail_types is not None:
+        query = query.filter(OutboundMailJob.mail_type.in_(mail_types))
+    if priority_lt is not None:
+        query = query.filter(OutboundMailJob.priority < priority_lt)
+    if job_ids is not None:
+        query = query.filter(OutboundMailJob.id.in_(job_ids))
+    ids = [
+        row.id
+        for row in query.order_by(OutboundMailJob.priority, OutboundMailJob.created_at).limit(limit).all()
+    ]
+    if not ids:
+        session.flush()
+        return []
+    locked_until = now + timedelta(seconds=settings.outbound_send_lease_seconds)
+    claimed_count = (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.id.in_(ids), OutboundMailJob.status == "Pending", _due_outbound_filter(now))
+        .update(
+            {
+                "status": "Sending",
+                "locked_by": worker,
+                "locked_until": locked_until,
+                "sending_started_at": now,
+            },
+            synchronize_session=False,
+        )
+    )
+    session.commit()
+    if claimed_count == 0:
+        return []
+    session.expire_all()
+    return (
+        session.query(OutboundMailJob)
+        .filter(OutboundMailJob.locked_by == worker, OutboundMailJob.status == "Sending")
+        .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
+        .all()
+    )
+
+
 def send_pending_smtp(session: Session, *, limit: int = 20) -> dict:
     host = get_config(session, "smtp_host", "smtp.exmail.qq.com")
     port = int(get_config(session, "smtp_port", "465"))
     username = get_config(session, "bot_email", "bot.market@jimuyida.com")
     password = get_config(session, "bot_email_password", "")
     display_name = normalize_bot_display_name(get_config(session, "bot_display_name", "商务部小J"))
-    now = datetime.now(timezone.utc)
-    jobs = (
-        session.query(OutboundMailJob)
-        .filter(
-            OutboundMailJob.status == "Pending",
-            (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
-        )
-        .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
-        .limit(limit)
-        .all()
-    )
+    jobs = claim_outbound_jobs(session, limit=min(max(1, limit), 1))
     return send_outbound_jobs_with_account(
         session,
         jobs,
@@ -498,12 +604,7 @@ def send_outbound_jobs_smtp(session: Session, job_ids: list[str], *, include_gen
     username = get_config(session, "bot_email", "bot.market@jimuyida.com")
     password = get_config(session, "bot_email_password", "")
     display_name = normalize_bot_display_name(get_config(session, "bot_display_name", "商务部小J"))
-    jobs = (
-        session.query(OutboundMailJob)
-        .filter(OutboundMailJob.id.in_(job_ids), OutboundMailJob.status == "Pending")
-        .order_by(OutboundMailJob.created_at)
-        .all()
-    )
+    jobs = claim_outbound_jobs(session, limit=min(max(1, len(job_ids)), 1), job_ids=job_ids)
     return send_outbound_jobs_with_account(
         session,
         jobs,
@@ -563,22 +664,22 @@ def send_pending_receipt_acks_smtp(session: Session, *, limit: int = 20) -> dict
 
 
 def send_pending_auto_workflow_mails_smtp(session: Session, *, limit: int = 20) -> dict:
-    now = datetime.now(timezone.utc)
-    job_ids = [
-        row.id
-        for row in (
-            session.query(OutboundMailJob)
-            .filter(
-                OutboundMailJob.mail_type.in_(AUTO_WORKFLOW_MAIL_TYPES),
-                OutboundMailJob.status == "Pending",
-                (OutboundMailJob.next_retry_at.is_(None)) | (OutboundMailJob.next_retry_at <= now),
-            )
-            .order_by(OutboundMailJob.priority, OutboundMailJob.created_at)
-            .limit(limit)
-            .all()
-        )
-    ]
-    return send_outbound_jobs_smtp(session, job_ids, include_generated_followups=True)
+    jobs = claim_outbound_jobs(session, limit=min(max(1, limit), 1), mail_types=AUTO_WORKFLOW_MAIL_TYPES)
+    host = get_config(session, "smtp_host", "smtp.exmail.qq.com")
+    port = int(get_config(session, "smtp_port", "465"))
+    username = get_config(session, "bot_email", "bot.market@jimuyida.com")
+    password = get_config(session, "bot_email_password", "")
+    display_name = normalize_bot_display_name(get_config(session, "bot_display_name", "商务部小J"))
+    return send_outbound_jobs_with_account(
+        session,
+        jobs,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        display_name=display_name,
+        include_generated_followups=True,
+    )
 
 
 def send_pending_auto_sales_replies_smtp(session: Session, *, limit: int = 20) -> dict:
@@ -598,10 +699,12 @@ def send_outbound_jobs_with_account(
 ) -> dict:
     display_name = normalize_bot_display_name(display_name)
     if not bot_enabled(session):
+        _release_claimed_jobs(session, jobs)
         return {"sent": 0, "failed": 0, "total": 0, "skipped": "bot is disabled"}
     if not jobs:
         return {"sent": 0, "failed": 0, "total": 0}
     if not password:
+        _release_claimed_jobs(session, jobs)
         raise RuntimeError(f"smtp password is not configured for {username}")
 
     # 最多发 jobs 列表的长度封（已由调用方 limit 参数截取）
@@ -613,52 +716,75 @@ def send_outbound_jobs_with_account(
     sent_ids: set[str] = set()
     queue = list(jobs)
     interval_seconds = mail_login_interval_seconds(session)
-    reserve_mail_login("smtp", username, interval_seconds=interval_seconds)
-    with smtplib.SMTP_SSL(host, port) as smtp:
-        smtp.login(username, password)
-        index = 0
-        while index < len(queue) and send_attempts < send_limit:
-            job = queue[index]
-            index += 1
-            if job.id in sent_ids or job.status != "Pending":
-                continue
-            total += 1
-            recipients = as_list(job.to_json) + as_list(job.cc_json)
-            if not recipients:
-                # 收件人缺失是不可恢复错误，直接 Failed
-                mark_outbound_failure(session, job, "missing recipients")
+    throttled_until = reserve_mail_send_slot(session, username, interval_seconds=interval_seconds)
+    if throttled_until is not None:
+        _release_claimed_jobs(session, jobs, next_retry_at=throttled_until)
+        return {"sent": 0, "failed": 0, "total": 0, "throttled_until": throttled_until.isoformat()}
+
+    try:
+        reserve_mail_login("smtp", username, interval_seconds=interval_seconds)
+    except RuntimeError:
+        throttled_until = datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
+        _release_claimed_jobs(session, jobs, next_retry_at=throttled_until)
+        return {"sent": 0, "failed": 0, "total": 0, "throttled_until": throttled_until.isoformat()}
+    session.commit()
+    try:
+        with smtplib.SMTP_SSL(host, port, timeout=settings.mail_smtp_timeout_seconds) as smtp:
+            smtp.login(username, password)
+            index = 0
+            while index < len(queue) and send_attempts < send_limit:
+                job = queue[index]
+                index += 1
+                if job.id in sent_ids or job.status not in {"Pending", "Sending"}:
+                    continue
+                total += 1
+                recipients = as_list(job.to_json) + as_list(job.cc_json)
+                if not recipients:
+                    # 收件人缺失是不可恢复错误，直接 Failed
+                    mark_outbound_failure(session, job, "missing recipients")
+                    failed += 1
+                    session.commit()
+                    continue  # 跳过该封，不中断其他邮件
+                send_attempts += 1
+                try:
+                    msg = EmailMessage(policy=OUTBOUND_EMAIL_POLICY)
+                    msg["From"] = formataddr((display_name, username))
+                    msg["To"] = ", ".join(as_list(job.to_json))
+                    if as_list(job.cc_json):
+                        msg["Cc"] = ", ".join(as_list(job.cc_json))
+                    msg["Subject"] = job.subject
+                    msg.set_content(job.body)
+                    attach_original_order_files(session, msg, job)
+                    smtp.send_message(msg, from_addr=username, to_addrs=recipients)
+                except Exception as exc:
+                    # SMTP 发送异常：指数退避重试，不中断队列中其他邮件
+                    mark_outbound_retry_or_fail(session, job, str(exc))
+                    failed += 1
+                    session.commit()
+                    continue  # 继续发下一封
+                job.status = "Sent"
+                job.sent_at = datetime.now(timezone.utc)
+                _clear_outbound_lock(job)
+                add_audit(session, "OutboundMailSent", "OutboundMailJob", job.id, {"recipients": recipients, "mail_type": job.mail_type})
+                sent_ids.add(job.id)
+                generated_followups = [
+                    enqueue_sales_reply_reissue_receipt(session, job),
+                    enqueue_requirement_supplement_receipt(session, job),
+                ]
+                session.flush()
+                session.commit()
+                if include_generated_followups:
+                    for generated in generated_followups:
+                        if generated is not None and generated.status == "Pending" and generated.id not in sent_ids:
+                            queue.append(generated)
+                sent += 1
+    except Exception as exc:
+        for job in jobs:
+            if job.status == "Sending":
+                total += 1
+                mark_outbound_retry_or_fail(session, job, f"smtp connect/login failed: {exc}")
                 failed += 1
-                continue  # 跳过该封，不中断其他邮件
-            reserve_mail_send(username, interval_seconds=interval_seconds, blocking=True)
-            send_attempts += 1
-            try:
-                msg = EmailMessage(policy=OUTBOUND_EMAIL_POLICY)
-                msg["From"] = formataddr((display_name, username))
-                msg["To"] = ", ".join(as_list(job.to_json))
-                if as_list(job.cc_json):
-                    msg["Cc"] = ", ".join(as_list(job.cc_json))
-                msg["Subject"] = job.subject
-                msg.set_content(job.body)
-                attach_original_order_files(session, msg, job)
-                smtp.send_message(msg, from_addr=username, to_addrs=recipients)
-            except Exception as exc:
-                # SMTP 发送异常：指数退避重试，不中断队列中其他邮件
-                mark_outbound_retry_or_fail(session, job, str(exc))
-                failed += 1
-                continue  # 继续发下一封
-            job.status = "Sent"
-            add_audit(session, "OutboundMailSent", "OutboundMailJob", job.id, {"recipients": recipients, "mail_type": job.mail_type})
-            sent_ids.add(job.id)
-            generated_followups = [
-                enqueue_sales_reply_reissue_receipt(session, job),
-                enqueue_requirement_supplement_receipt(session, job),
-            ]
-            session.flush()
-            if include_generated_followups:
-                for generated in generated_followups:
-                    if generated is not None and generated.status == "Pending" and generated.id not in sent_ids:
-                        queue.append(generated)
-            sent += 1
+        session.commit()
     return {"sent": sent, "failed": failed, "total": total}
 
 
@@ -689,7 +815,7 @@ def send_direct_smtp(
     msg.set_content(body)
     reserve_mail_login("smtp", username)
     reserve_mail_send(username)
-    with smtplib.SMTP_SSL(host, port) as smtp:
+    with smtplib.SMTP_SSL(host, port, timeout=settings.mail_smtp_timeout_seconds) as smtp:
         smtp.login(username, password)
         smtp.send_message(msg, from_addr=username, to_addrs=recipients)
 

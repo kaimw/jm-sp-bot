@@ -33,7 +33,7 @@ def run_tencent_mail_e2e(session: Session) -> dict:
     body = "\n".join(
         [
             f"客户名称：端到端测试客户-{test_id}",
-            "产品：腾讯企业邮箱端到端测试展架",
+            "物料：腾讯企业邮箱端到端测试展架",
             "数量：1套",
             "期望交期：2026-05-20",
             f"订单号：E2E-{test_id}",

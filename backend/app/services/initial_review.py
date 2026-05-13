@@ -17,7 +17,7 @@ def get_config(session: Session, key: str, fallback: str = "") -> str:
 
 FIELD_OPTIONS = [
     {"key": "customer_name", "label": "客户名称"},
-    {"key": "product_summary", "label": "产品/规格"},
+    {"key": "product_summary", "label": "物料/规格"},
     {"key": "quantity_text", "label": "数量"},
     {"key": "expected_delivery_date", "label": "期望交期"},
     {"key": "external_order_no", "label": "订单号"},
@@ -48,8 +48,8 @@ SYSTEM_INITIAL_REVIEW_RULES = [
         "name": "核心字段完整性检查",
         "field": "source_text",
         "operator": "system_check",
-        "value": "客户名称、产品/规格、数量、期望交期",
-        "message": "客户名称、产品/规格、数量、期望交期为系统必填信息，缺失时会自动要求销售补充。",
+        "value": "客户名称、物料/规格、数量、期望交期",
+        "message": "客户名称、物料/规格、数量、期望交期为系统必填信息，缺失时会自动要求销售补充。",
         "enabled": True,
         "read_only": True,
         "is_builtin": True,
@@ -70,7 +70,7 @@ SYSTEM_INITIAL_REVIEW_RULES = [
         "name": "24小时重复提交检查",
         "field": "source_text",
         "operator": "system_check",
-        "value": "同一销售、同一订单号或同一客户/产品/数量/交期",
+        "value": "同一销售、同一订单号或同一客户/物料/数量/交期",
         "message": "同一销售在24小时内重复提交同一需求时，系统会回复已提交并提示不要重复提交。",
         "enabled": True,
         "read_only": True,
