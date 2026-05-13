@@ -414,6 +414,57 @@ def test_database_url_normalization_masking_and_health():
     assert "url" in health
 
 
+def test_runtime_schema_adds_outbound_retry_columns(monkeypatch):
+    from sqlalchemy import inspect, text
+    import backend.app.database as database
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE outbound_mail_jobs (
+                    id VARCHAR(36) PRIMARY KEY,
+                    related_task_id VARCHAR(36),
+                    related_version_id VARCHAR(36),
+                    mail_type VARCHAR(64) NOT NULL,
+                    to_json TEXT NOT NULL,
+                    cc_json TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    idempotency_key VARCHAR(512) UNIQUE NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    created_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO outbound_mail_jobs (
+                    id, mail_type, to_json, cc_json, subject, body,
+                    idempotency_key, status, created_at
+                )
+                VALUES (
+                    'job-1', 'TaskIssue', '[]', '[]', 'subject', 'body',
+                    'idem-1', 'Pending', '2026-05-13 00:00:00'
+                )
+                """
+            )
+        )
+
+    monkeypatch.setattr(database, "engine", engine)
+    database.ensure_runtime_schema()
+
+    columns = {column["name"] for column in inspect(engine).get_columns("outbound_mail_jobs")}
+    assert {"attempt_count", "next_retry_at", "last_error", "priority"}.issubset(columns)
+    with engine.connect() as connection:
+        row = connection.execute(text("SELECT attempt_count, priority FROM outbound_mail_jobs WHERE id = 'job-1'")).one()
+    assert row.attempt_count == 0
+    assert row.priority == 40
+
+
 def test_order_to_task_approval_flow():
     session = make_session()
     configure_department(session)

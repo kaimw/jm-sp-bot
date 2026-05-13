@@ -79,6 +79,10 @@ def ensure_runtime_schema() -> None:
         _ensure_columns(
             "outbound_mail_jobs",
             {
+                "attempt_count": "INTEGER DEFAULT 0",
+                "next_retry_at": _datetime_type(),
+                "last_error": "VARCHAR(1000)",
+                "priority": "INTEGER DEFAULT 40",
                 "locked_by": "VARCHAR(128)",
                 "locked_until": _datetime_type(),
                 "sending_started_at": _datetime_type(),
