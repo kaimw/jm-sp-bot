@@ -1,0 +1,268 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="760" viewBox="0 0 1240 760">
+  <defs>
+    <style>
+      .title { font: 700 20px "Arial", "Noto Sans SC", sans-serif; fill: #111; }
+      .label { font: 16px "Arial", "Noto Sans SC", sans-serif; fill: #111; }
+      .small { font: 13px "Arial", "Noto Sans SC", sans-serif; fill: #111; }
+      .tiny { font: 11px "Arial", "Noto Sans SC", sans-serif; fill: #111; }
+      .bold { font-weight: 700; }
+      .panel { fill: #f4fbf7; stroke: none; }
+      .memory { fill: #eef7fd; stroke: none; }
+      .dashed { fill: none; stroke: #222; stroke-width: 1.3; stroke-dasharray: 6 4; }
+      .solid { fill: none; stroke: #222; stroke-width: 1.7; }
+      .thin { fill: none; stroke: #222; stroke-width: 1.1; }
+      .arrow { stroke: #666; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .arrow2 { stroke: #666; stroke-width: 2.2; fill: none; marker-end: url(#arrow); marker-start: url(#arrowStart); }
+      .icon { fill: none; stroke: #111; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .soft-green { fill: #def5e6; }
+      .soft-blue { fill: #d9eafa; }
+      .soft-purple { fill: #eadcff; }
+      .soft-yellow { fill: #fff4cc; }
+      .white { fill: #fff; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L8,3 z" fill="#666"/>
+    </marker>
+    <marker id="arrowStart" markerWidth="10" markerHeight="10" refX="2" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M8,0 L8,6 L0,3 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="760" fill="#ffffff"/>
+
+  <!-- Top action -->
+  <rect x="540" y="34" width="160" height="38" class="soft-green"/>
+  <text x="620" y="59" text-anchor="middle" class="title">Action</text>
+
+  <!-- Left actors -->
+  <g transform="translate(38,124)">
+    <circle cx="42" cy="28" r="13" class="icon"/>
+    <path d="M25 78v-20c0-17 34-17 34 0v20" class="icon"/>
+    <path d="M19 78h48" class="icon"/>
+    <rect x="74" y="34" width="34" height="28" rx="3" class="icon"/>
+    <path d="M81 48l6-6M87 54l10-10" class="icon"/>
+    <rect x="16" y="84" width="80" height="34" rx="4" class="icon"/>
+    <path d="M29 101h53M42 92v18" class="thin"/>
+    <text x="62" y="144" text-anchor="middle" class="label bold">商务数字分身</text>
+    <text x="62" y="164" text-anchor="middle" class="small">Single Agent</text>
+  </g>
+
+  <path d="M95 306v54" class="arrow"/>
+
+  <g transform="translate(28,380)">
+    <rect x="0" y="0" width="32" height="32" rx="4" class="icon"/>
+    <path d="M8 18l6-6M15 23l10-10" class="icon"/>
+    <circle cx="64" cy="16" r="14" class="icon"/>
+    <rect x="106" y="0" width="32" height="32" rx="4" class="icon"/>
+    <path d="M114 17h16M122 9v16" class="icon"/>
+    <circle cx="16" cy="62" r="12" class="icon"/>
+    <circle cx="70" cy="62" r="12" class="icon"/>
+    <circle cx="122" cy="62" r="12" class="icon"/>
+    <path d="M16 74v22M70 74v22M122 74v22M16 96h106" class="icon"/>
+    <text x="70" y="128" text-anchor="middle" class="label bold">多角色协作</text>
+    <text x="70" y="148" text-anchor="middle" class="small">Sales / Business / Production</text>
+  </g>
+
+  <path d="M180 210c-38 0-38 0-38 24v82c0 22-18 22-18 22c18 0 18 0 18 22v80c0 24 0 24 38 24" class="solid" stroke="#aaa" stroke-width="4"/>
+
+  <!-- Internal panel -->
+  <rect x="220" y="78" width="360" height="170" rx="14" class="panel"/>
+  <text x="400" y="103" text-anchor="middle" class="label">Internal</text>
+  <rect x="240" y="112" width="320" height="102" rx="10" class="dashed"/>
+
+  <g transform="translate(263,132)">
+    <rect x="0" y="0" width="42" height="40" rx="3" class="icon"/>
+    <path d="M7 9h28M7 18h18M7 27h26" class="icon"/>
+    <path d="M44 10h26M44 30h26" class="icon"/>
+    <circle cx="78" cy="10" r="7" class="icon"/>
+    <circle cx="78" cy="30" r="7" class="icon"/>
+    <text x="40" y="74" text-anchor="middle" class="small">推理规划</text>
+    <text x="40" y="91" text-anchor="middle" class="tiny">Reasoning</text>
+  </g>
+
+  <g transform="translate(374,128)">
+    <rect x="0" y="8" width="62" height="50" rx="4" class="icon"/>
+    <path d="M10 48l14-18 13 11 13-24" class="icon"/>
+    <circle cx="18" cy="18" r="9" class="icon"/>
+    <path d="M55 2v20M45 12h20M58 36l9 9" class="icon"/>
+    <text x="32" y="78" text-anchor="middle" class="small">经验学习</text>
+    <text x="32" y="95" text-anchor="middle" class="tiny">Learning</text>
+  </g>
+
+  <g transform="translate(488,126)">
+    <rect x="0" y="9" width="30" height="24" rx="3" class="icon"/>
+    <path d="M8 21l6-6M16 27l7-7" class="icon"/>
+    <rect x="3" y="43" width="24" height="28" rx="2" class="icon"/>
+    <path d="M9 52h12M9 60h12" class="icon"/>
+    <ellipse cx="66" cy="14" rx="30" ry="9" class="icon"/>
+    <path d="M36 14v47c0 5 13 9 30 9s30-4 30-9V14M36 36c0 5 13 9 30 9s30-4 30-9" class="icon"/>
+    <text x="50" y="95" text-anchor="middle" class="small">检索治理</text>
+    <text x="50" y="112" text-anchor="middle" class="tiny">Retrieval</text>
+  </g>
+
+  <!-- Feedback -->
+  <g transform="translate(603,122)">
+    <path d="M28 6a28 28 0 0 1 26 18M54 24l-10-2 6-8" class="icon"/>
+    <path d="M56 54a28 28 0 0 1-50-14M6 40l10 2-6 8" class="icon"/>
+    <text x="30" y="84" text-anchor="middle" class="label bold">Feedback</text>
+    <text x="30" y="104" text-anchor="middle" class="label bold">&amp; Refine</text>
+  </g>
+
+  <!-- External panel -->
+  <rect x="690" y="78" width="490" height="170" rx="14" class="panel"/>
+  <text x="935" y="103" text-anchor="middle" class="label">External</text>
+  <rect x="710" y="112" width="450" height="102" rx="10" class="dashed"/>
+
+  <text x="800" y="137" text-anchor="middle" class="small">数字环境</text>
+  <text x="1002" y="137" text-anchor="middle" class="small">人与外部智能体</text>
+  <line x1="890" y1="122" x2="890" y2="205" class="thin" stroke-dasharray="5 4"/>
+
+  <g transform="translate(738,153)">
+    <rect x="0" y="0" width="34" height="28" rx="3" class="icon"/>
+    <path d="M8 16l6-6M16 22l10-10" class="icon"/>
+    <text x="17" y="50" text-anchor="middle" class="small">API</text>
+  </g>
+  <g transform="translate(815,151)">
+    <rect x="0" y="16" width="52" height="31" rx="3" class="icon"/>
+    <path d="M8 47h36M14 16v-8h24v8" class="icon"/>
+    <circle cx="26" cy="31" r="6" class="icon"/>
+    <text x="26" y="68" text-anchor="middle" class="small">OJ/ERP</text>
+  </g>
+  <g transform="translate(934,148)">
+    <circle cx="23" cy="20" r="17" class="icon"/>
+    <path d="M12 26c6-12 16-12 22 0M17 15h12M23 36v12" class="icon"/>
+    <text x="23" y="73" text-anchor="middle" class="small">Human</text>
+  </g>
+  <g transform="translate(1046,146)">
+    <rect x="14" y="22" width="40" height="32" rx="8" class="icon"/>
+    <circle cx="26" cy="37" r="3" fill="#111"/>
+    <circle cx="42" cy="37" r="3" fill="#111"/>
+    <path d="M34 7v15M27 7h14M21 54v13M47 54v13" class="icon"/>
+    <text x="34" y="83" text-anchor="middle" class="small">Other Agents</text>
+  </g>
+
+  <!-- Memory -->
+  <rect x="220" y="332" width="320" height="250" rx="14" class="memory"/>
+  <rect x="312" y="296" width="132" height="38" class="soft-blue"/>
+  <text x="378" y="321" text-anchor="middle" class="title">Memory</text>
+  <text x="292" y="365" text-anchor="middle" class="label">Procedural</text>
+  <text x="440" y="365" text-anchor="middle" class="label">Episodic</text>
+
+  <rect x="238" y="380" width="138" height="108" rx="8" class="dashed"/>
+  <rect x="392" y="380" width="130" height="108" rx="8" class="dashed"/>
+  <rect x="238" y="506" width="138" height="58" rx="8" class="dashed"/>
+  <rect x="392" y="506" width="130" height="58" rx="8" class="dashed"/>
+
+  <g transform="translate(254,392)">
+    <circle cx="18" cy="18" r="13" class="icon"/>
+    <path d="M31 11h24v20H31zM37 17h12M37 24h12M18 31v26" class="icon"/>
+    <text x="67" y="34" text-anchor="middle" class="small">Skill 代码</text>
+    <rect x="2" y="62" width="50" height="30" rx="3" class="icon"/>
+    <path d="M8 80h36M13 72h6M24 72h6M35 72h6" class="icon"/>
+    <text x="78" y="83" text-anchor="middle" class="small">模型预算</text>
+  </g>
+  <g transform="translate(408,392)">
+    <rect x="0" y="0" width="52" height="34" rx="3" class="icon"/>
+    <path d="M12 19l8-8M22 25l12-12" class="icon"/>
+    <text x="74" y="24" text-anchor="middle" class="small">相关代码</text>
+    <rect x="13" y="58" width="28" height="34" rx="2" class="icon"/>
+    <path d="M20 67h14M20 75h14M20 83h10" class="icon"/>
+    <text x="78" y="82" text-anchor="middle" class="small">案例样本</text>
+  </g>
+  <g transform="translate(258,516)">
+    <ellipse cx="28" cy="10" rx="22" ry="7" class="icon"/>
+    <path d="M6 10v30c0 4 10 7 22 7s22-3 22-7V10M6 25c0 4 10 7 22 7s22-3 22-7" class="icon"/>
+    <text x="92" y="31" text-anchor="middle" class="small">规则库</text>
+  </g>
+  <g transform="translate(406,518)">
+    <rect x="0" y="8" width="48" height="34" rx="2" class="icon"/>
+    <path d="M7 18h34M7 28h25M8 42v11M40 42v11M3 53h42" class="icon"/>
+    <text x="82" y="30" text-anchor="middle" class="small">历史消息</text>
+  </g>
+
+  <!-- LLM center -->
+  <g transform="translate(585,364)">
+    <path d="M37 0v22M17 22h40c9 0 16 7 16 16v44c0 9-7 16-16 16H17C8 98 1 91 1 82V38c0-9 7-16 16-16z" class="icon"/>
+    <circle cx="23" cy="54" r="5" fill="#111"/>
+    <circle cx="52" cy="54" r="5" fill="#111"/>
+    <path d="M25 76h25M0 56h-18M74 56h18" class="icon"/>
+    <text x="37" y="130" text-anchor="middle" class="title">LLM</text>
+  </g>
+
+  <!-- Environment -->
+  <rect x="690" y="300" width="490" height="282" rx="14" class="dashed"/>
+  <text x="935" y="333" text-anchor="middle" class="title" letter-spacing="5">Environment</text>
+  <rect x="868" y="358" width="180" height="38" class="soft-purple"/>
+  <text x="958" y="383" text-anchor="middle" class="title">Perception</text>
+
+  <!-- Environment icons -->
+  <g transform="translate(720,344)">
+    <circle cx="0" cy="0" r="16" class="icon"/>
+    <path d="M-10 2c7-4 13-4 20 0M-5 -12c-5 9-4 19 2 27M6 -12c5 10 4 19-2 27" class="thin"/>
+    <path d="M98 20l30-28 30 28M111 20v36h34V20" class="icon"/>
+    <circle cx="196" cy="0" r="18" class="icon"/>
+    <path d="M196 -28v12M196 16v12M168 0h12M212 0h12M176 -20l8 8M216 -20l-8 8M176 20l8-8M216 20l-8-8" class="icon"/>
+  </g>
+  <g transform="translate(1020,322)">
+    <rect x="0" y="0" width="42" height="28" rx="2" class="icon"/>
+    <rect x="52" y="4" width="18" height="36" rx="2" class="icon"/>
+    <path d="M21 28v18M12 46h28" class="icon"/>
+    <rect x="8" y="72" width="54" height="28" rx="3" class="icon"/>
+    <circle cx="22" cy="86" r="4" fill="#111"/>
+    <circle cx="48" cy="86" r="4" fill="#111"/>
+    <path d="M35 100v20M20 120h30" class="icon"/>
+  </g>
+
+  <g transform="translate(726,402)">
+    <rect x="0" y="0" width="118" height="104" rx="4" class="icon"/>
+    <circle cx="23" cy="24" r="17" class="icon"/>
+    <circle cx="59" cy="24" r="17" class="icon"/>
+    <circle cx="95" cy="24" r="17" class="icon"/>
+    <path d="M15 78h96M24 58l18 30h-36zM59 58l18 30h-36zM94 58l18 30h-36z" class="icon"/>
+  </g>
+  <g transform="translate(736,532)">
+    <rect x="0" y="0" width="112" height="38" rx="4" class="icon"/>
+    <path d="M18 19l18-12 18 12-18 12zM58 19l18-12 18 12-18 12z" class="icon"/>
+  </g>
+
+  <g transform="translate(896,430)">
+    <text x="38" y="0" text-anchor="middle" class="label">Textual</text>
+    <rect x="0" y="25" width="32" height="24" rx="2" class="icon"/>
+    <path d="M16 49v16M5 65h22" class="icon"/>
+    <path d="M54 21v72" class="thin"/>
+    <rect x="70" y="24" width="30" height="22" rx="2" class="icon"/>
+    <path d="M85 46v14M60 60h50M60 60v18M85 60v18M110 60v18" class="icon"/>
+    <text x="126" y="45" class="small">UML</text>
+    <path d="M3 100l38-38M8 64l31 31" class="icon"/>
+    <text x="126" y="82" class="small">执行结果</text>
+    <rect x="0" y="118" width="28" height="32" rx="2" class="icon"/>
+    <path d="M7 128h14M7 137h14M7 146h10" class="icon"/>
+    <text x="126" y="136" class="small">Text/Code</text>
+  </g>
+
+  <g transform="translate(1058,424)">
+    <text x="44" y="0" text-anchor="middle" class="label">Visual</text>
+    <rect x="15" y="18" width="54" height="48" rx="9" class="dashed"/>
+    <path d="M44 28c16 6 15 28-2 31M39 35c7 3 7 13-1 17M34 42c3 2 3 5 0 7" class="icon"/>
+    <rect x="102" y="25" width="20" height="52" rx="2" class="icon"/>
+    <path d="M107 34h10M107 45h10M107 56h10M107 67h10" class="thin"/>
+    <text x="44" y="100" text-anchor="middle" class="label">Auditory</text>
+    <rect x="14" y="118" width="66" height="44" rx="8" class="dashed"/>
+    <path d="M25 142h42M35 132v20M49 128v28M62 136v12" class="icon"/>
+    <path d="M116 126l12 48M111 151l22-6" class="icon"/>
+  </g>
+
+  <!-- Connectors -->
+  <path d="M380 250v42" class="arrow2"/>
+  <path d="M540 456h45" class="arrow2"/>
+  <path d="M660 456h30" class="arrow2"/>
+  <path d="M620 248v90" class="arrow2"/>
+  <path d="M936 248v48" class="arrow2"/>
+  <path d="M540 456h45" class="arrow2"/>
+  <path d="M850 456h48" class="arrow"/>
+  <path d="M850 512h48" class="arrow"/>
+  <path d="M620 72v46" class="arrow"/>
+
+  <text x="620" y="710" text-anchor="middle" class="title">商务生产任务单智能体：Agent + Skill 总体架构</text>
+  <text x="620" y="735" text-anchor="middle" class="small">规则优先 · 技能治理 · 业务记忆 · 低成本模型调用 · 低风险任务单自动下达</text>
+</svg>

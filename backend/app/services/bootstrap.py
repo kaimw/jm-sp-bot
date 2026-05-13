@@ -84,7 +84,7 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "initial_review_enabled", "true", is_secret=False)
     ensure_config(session, "initial_review_required_fields_json", dumps(["customer_name", "product_summary", "quantity_text", "expected_delivery_date"]), is_secret=False)
     ensure_config(session, "initial_review_rules_json", "[]", is_secret=False)
-    ensure_config(session, "bot_enabled", "false", is_secret=False)
+    ensure_config(session, "bot_enabled", "true", is_secret=False)
     ensure_config(session, "llm_fallback_enabled", "true", is_secret=False)
     ensure_config(session, "conversation_max_rounds", "3", is_secret=False)
     ensure_config(session, "outbound_failed_alert_threshold", "1", is_secret=False)

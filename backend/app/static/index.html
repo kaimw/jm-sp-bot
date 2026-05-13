@@ -50,7 +50,7 @@
           <p id="page-subtitle">核心状态、队列水位和待处理风险。</p>
         </div>
         <div class="top-actions">
-          <button id="system-toggle" type="button" class="button system-toggle">系统状态</button>
+          <button id="system-toggle" type="button" class="button system-toggle">暂停机器人</button>
           <button id="business-data-clear" type="button" class="button warn">清空数据</button>
           <button id="logout" type="button" class="button ghost">退出</button>
         </div>
@@ -319,10 +319,10 @@
           <label>外发失败告警阈值 <input name="outbound_failed_alert_threshold" type="number" min="1" /></label>
           <label>Pending 超时告警秒数 <input name="outbound_pending_age_alert_seconds" type="number" min="60" step="60" /></label>
           <label>百度地图 AK <input name="baidu_map_ak" type="password" placeholder="留空不修改" autocomplete="off" /></label>
-          <label class="switch-line">
-            <input name="bot_enabled" type="checkbox" />
-            <span>启用机器人邮箱监听/发送</span>
-          </label>
+          <div class="status-readout">
+            <span>机器人邮箱监听/发送</span>
+            <strong id="runtime-bot-enabled-status">随服务启动自动开启</strong>
+          </div>
           <label class="switch-line">
             <input name="llm_fallback_enabled" type="checkbox" />
             <span>启用 LLM 兜底识别</span>

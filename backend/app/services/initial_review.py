@@ -214,6 +214,14 @@ def initial_review_config(session: Session, *, include_workflow_rules: bool = Fa
         if include_workflow_rules
         else loads(get_config(session, INITIAL_REVIEW_RULES_KEY, "[]"), [])
     )
+    if not include_workflow_rules:
+        custom_rules = [
+            rule
+            for rule in custom_rules
+            if isinstance(rule, dict)
+            and not rule.get("is_workflow_rule")
+            and not str(rule.get("id") or "").startswith("workflow:")
+        ]
     display_rules = [dict(rule) for rule in SYSTEM_INITIAL_REVIEW_RULES] + [rule for rule in custom_rules if isinstance(rule, dict)]
     return {
         "enabled": get_config(session, "initial_review_enabled", "true").lower() in {"1", "true", "yes", "on"},

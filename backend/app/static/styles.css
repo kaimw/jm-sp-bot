@@ -45,6 +45,22 @@ textarea {
   font: inherit;
 }
 
+.link-button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 0;
+  text-align: left;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
 h1,
 h2,
 p {
@@ -1422,6 +1438,27 @@ textarea:focus {
   accent-color: var(--accent);
 }
 
+.status-readout {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.status-readout span {
+  color: var(--muted);
+}
+
+.status-readout strong {
+  color: var(--accent);
+}
+
 .check-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(140px, 1fr));
@@ -1531,6 +1568,10 @@ textarea:focus {
 
 .task-row {
   grid-template-columns: minmax(300px, 1.45fr) minmax(230px, 1.05fr) minmax(90px, 0.45fr) minmax(170px, 0.7fr) minmax(220px, auto);
+}
+
+.outbound-row {
+  grid-template-columns: minmax(260px, 1.35fr) minmax(160px, 0.8fr) minmax(140px, 0.7fr) minmax(160px, 0.75fr) minmax(190px, auto);
 }
 
 .task-row .actions {

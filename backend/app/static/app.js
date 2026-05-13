@@ -693,6 +693,31 @@ function renderTaskPagination(data) {
   `;
 }
 
+async function jumpToTask(taskId, taskNo = "") {
+  const query = String(taskNo || taskId || "").trim();
+  if (!query) return;
+  taskQueryState = {
+    ...taskQueryState,
+    q: query,
+    status: "",
+    customer: "",
+    product: "",
+    salesperson: "",
+    order_no: "",
+    delivery: "",
+    page: 1,
+  };
+  const form = $("#task-filter-form");
+  if (form) {
+    form.reset();
+    form.querySelector("[name=q]").value = query;
+  }
+  window.location.hash = "tasks";
+  setActivePage("tasks");
+  await refreshTasks();
+  toast(`已定位任务：${taskNo || taskId}`);
+}
+
 function mailStatusClass(status) {
   return {
     Sent: "status-sent",
@@ -730,10 +755,11 @@ async function refreshOutbound() {
     rows
       .map(
         (row) => `
-        <div class="row clickable-row" data-outbound-id="${h(row.id)}" role="button" tabindex="0" title="查看外发邮件详情">
+        <div class="row outbound-row clickable-row" data-outbound-id="${h(row.id)}" role="button" tabindex="0" title="查看外发邮件详情">
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.mail_type)}</small></div>
           <div><small>主送</small><br />${h(row.to.join(", ") || "无")}</div>
           <div><small>抄送</small><br />${h(row.cc.join(", ") || "无")}</div>
+          <div><small>发送时间</small><br />${h(row.sent_at ? formatTime(row.sent_at) : "未发送")}</div>
           <div>
             <small class="status-text ${mailStatusClass(row.status)}">${h(row.status)}</small>
             ${renderPendingDiagnosis(row)}
@@ -898,7 +924,7 @@ function fillForm(formSelector, values) {
   const form = $(formSelector);
   if (!form) return;
   for (const [key, value] of Object.entries(values)) {
-    const input = form.querySelector(`[name=${key}]`);
+    const input = form.elements.namedItem(key);
     if (!input || value === "***") continue;
     if (input.type === "checkbox") {
       input.checked = ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
@@ -915,13 +941,18 @@ function configEnabled(value, fallback = false) {
 
 function renderSystemToggle() {
   const button = $("#system-toggle");
-  if (!button) return;
-  const enabled = configEnabled(runtimeConfigState.bot_enabled, false);
-  button.textContent = enabled ? "停用系统" : "启用系统";
-  button.title = enabled
-    ? "停用机器人邮箱监听与自动处理"
-    : (startupReadinessState.ready ? "启用机器人邮箱监听与自动处理" : `启动前需补齐：${(startupReadinessState.missing || []).join("、")}`);
-  button.classList.toggle("is-paused", !enabled);
+  const runtimeStatusNode = $("#runtime-bot-enabled-status");
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
+  if (button) {
+    button.textContent = enabled ? "暂停机器人" : "启动机器人";
+    button.title = enabled
+      ? "暂停机器人邮箱监听、同步和自动发送"
+      : (startupReadinessState.ready ? "启动机器人邮箱监听、同步和自动发送" : `启动前需补齐：${(startupReadinessState.missing || []).join("、")}`);
+    button.classList.toggle("is-paused", !enabled);
+  }
+  if (runtimeStatusNode) {
+    runtimeStatusNode.textContent = enabled ? "已开启（随服务启动自动开启，可在顶部暂停）" : "已暂停（可在顶部启动）";
+  }
 }
 
 function reviewRuleId() {
@@ -1275,7 +1306,10 @@ function renderWorkflowRuleEditor() {
       .join("") || `<div class="empty-note">当前流程未配置必填字段。</div>`;
 
   const existingIds = new Set(reviewRules.map((rule) => String(rule.id || "")));
-  const selectableRules = (initialReviewState.rules || []).filter((rule) => !isReadonlyReviewRule(rule) && !existingIds.has(String(rule.id || "")));
+  const existingSignatures = new Set(reviewRules.map((rule) => reviewRuleSignature(rule)));
+  const selectableRules = (initialReviewState.rules || []).filter(
+    (rule) => !isReadonlyReviewRule(rule) && !existingIds.has(String(rule.id || "")) && !existingSignatures.has(reviewRuleSignature(rule))
+  );
   const selector = form.querySelector("[name=review_rule_source]");
   selector.innerHTML =
     `<option value="">选择初审面板中的自定义规则</option>` +
@@ -1653,7 +1687,11 @@ async function refreshMails() {
         <div class="row clickable-row" data-mail-id="${h(row.id)}" role="button" tabindex="0" title="查看邮件详情">
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.id)}</small><br /><small>${h(row.from_address)}</small></div>
           <div><small>分类</small><br />${h(row.classification)} (${h(row.classification_confidence)})</div>
-          <div><small>任务</small><br />${h(row.related_task_id || "未关联")}</div>
+          <div><small>任务</small><br />${
+            row.related_task_id
+              ? `<button class="link-button" type="button" data-action="jump-task" data-task-id="${h(row.related_task_id)}" data-task-no="${h(row.related_task_no || "")}">${h(row.related_task_no || row.related_task_id)}</button>`
+              : "未关联"
+          }</div>
           <div><small>收件时间</small><br />${h(formatTime(row.received_at || row.created_at))}</div>
         </div>`
       )
@@ -1671,7 +1709,11 @@ async function openMailDetail(mailId) {
     <div><small>收件人</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
     <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
     <div><small>分类</small><strong>${h(detail.classification || "未分类")} (${h(detail.classification_confidence ?? 0)})</strong></div>
-    <div><small>关联任务</small><strong>${h(detail.related_task_id || "未关联")}</strong></div>
+    <div><small>关联任务</small><strong>${
+      detail.related_task_id
+        ? `<button class="link-button" type="button" data-action="jump-task" data-task-id="${h(detail.related_task_id)}" data-task-no="${h(detail.related_task_no || "")}">${h(detail.related_task_no || detail.related_task_id)}</button>`
+        : "未关联"
+    }</strong></div>
     <div><small>附件</small><strong>${h((detail.attachments || []).map((item) => item.file_name).join(", ") || "无")}</strong></div>
   `;
   $("#mail-detail-body").textContent = detail.body_text || "无正文内容";
@@ -1681,13 +1723,15 @@ async function openMailDetail(mailId) {
 async function openOutboundDetail(outboundId) {
   const detail = await api(`/api/outbound-mails/${outboundId}`);
   $("#mail-detail-title").textContent = detail.subject || "外发邮件详情";
-  $("#mail-detail-meta").textContent = `外发队列 · ${detail.created_at || ""}`;
+  $("#mail-detail-meta").textContent = `外发队列 · 发送时间 ${detail.sent_at ? formatTime(detail.sent_at) : "未发送"}`;
   $("#mail-detail-fields").innerHTML = `
     <div><small>外发ID</small><strong>${h(detail.id || "未记录")}</strong></div>
     <div><small>邮件类型</small><strong>${h(detail.mail_type || "未记录")}</strong></div>
     <div><small>主送</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
     <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
     <div><small>状态</small><strong>${h(detail.status || "未记录")}</strong></div>
+    <div><small>排队时间</small><strong>${h(formatTime(detail.created_at) || "未记录")}</strong></div>
+    <div><small>发送时间</small><strong>${h(detail.sent_at ? formatTime(detail.sent_at) : "未发送")}</strong></div>
     <div><small>关联任务</small><strong>${h(detail.related_task_id || "未关联")}</strong></div>
     <div><small>关联版本</small><strong>${h(detail.related_version_id || "未关联")}</strong></div>
     <div><small>幂等键</small><strong>${h(detail.idempotency_key || "未记录")}</strong></div>
@@ -2422,7 +2466,10 @@ $("#workflow-rule-editor-form").addEventListener("click", async (event) => {
       toast("请选择要添加的初审规则");
       return;
     }
-    const exists = (workflowRulesState.editingRules.review_rules || []).some((rule) => String(rule.id || "") === sourceId);
+    const sourceSignature = reviewRuleSignature(sourceRule);
+    const exists = (workflowRulesState.editingRules.review_rules || []).some(
+      (rule) => String(rule.id || "") === sourceId || reviewRuleSignature(rule) === sourceSignature
+    );
     if (exists) {
       toast("该规则已在当前流程中");
       return;
@@ -2480,7 +2527,6 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
     toast("邮箱登录/发信间隔不能低于 60 秒");
     return;
   }
-  values.bot_enabled = $("#runtime-mail-form [name=bot_enabled]").checked;
   values.llm_fallback_enabled = $("#runtime-mail-form [name=llm_fallback_enabled]").checked;
   try {
     await api("/api/config/mail", {
@@ -2565,7 +2611,7 @@ $("#enqueue-weekly-report").addEventListener("click", async () => {
 });
 
 $("#system-toggle")?.addEventListener("click", async () => {
-  const enabled = configEnabled(runtimeConfigState.bot_enabled, false);
+  const enabled = configEnabled(runtimeConfigState.bot_enabled, true);
   const nextEnabled = !enabled;
   if (nextEnabled && startupReadinessState.ready === false) {
     toast(`系统启动前配置不完整：缺少 ${(startupReadinessState.missing || []).join("、")}`);
@@ -2577,13 +2623,11 @@ $("#system-toggle")?.addEventListener("click", async () => {
       body: JSON.stringify({ bot_enabled: nextEnabled }),
     });
     runtimeConfigState = { ...runtimeConfigState, bot_enabled: String(nextEnabled) };
-    const runtimeToggle = $("#runtime-mail-form [name=bot_enabled]");
-    if (runtimeToggle) runtimeToggle.checked = nextEnabled;
     await refreshConfig();
     renderSystemToggle();
-    toast(nextEnabled ? "系统已启用" : "系统已停用");
+    toast(nextEnabled ? "机器人已启动" : "机器人已暂停");
   } catch (error) {
-    notifyError(error, ["系统", nextEnabled ? "启动失败" : "停用失败"]);
+    notifyError(error, ["系统", nextEnabled ? "启动失败" : "暂停失败"]);
   }
 });
 
@@ -2811,13 +2855,28 @@ $("#task-pagination").addEventListener("change", async (event) => {
 });
 
 $("#mails-list")?.addEventListener("click", async (event) => {
+  const jumpButton = event.target.closest("[data-action='jump-task']");
+  if (jumpButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    await guardedAction(["邮件", "跳转任务"], async () => jumpToTask(jumpButton.dataset.taskId, jumpButton.dataset.taskNo));
+    return;
+  }
   const row = event.target.closest("[data-mail-id]");
   if (!row) return;
   await guardedAction(["邮件", "详情"], async () => openMailDetail(row.dataset.mailId));
 });
 
+$("#mail-detail-fields")?.addEventListener("click", async (event) => {
+  const jumpButton = event.target.closest("[data-action='jump-task']");
+  if (!jumpButton) return;
+  event.preventDefault();
+  await guardedAction(["邮件", "跳转任务"], async () => jumpToTask(jumpButton.dataset.taskId, jumpButton.dataset.taskNo));
+});
+
 $("#mails-list")?.addEventListener("keydown", async (event) => {
   if (event.key !== "Enter" && event.key !== " ") return;
+  if (event.target.closest("button,a")) return;
   const row = event.target.closest("[data-mail-id]");
   if (!row) return;
   event.preventDefault();

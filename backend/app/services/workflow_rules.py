@@ -309,6 +309,7 @@ def _normalize_review_rules(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     rules: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for index, item in enumerate(value, start=1):
         if not isinstance(item, dict):
             continue
@@ -320,6 +321,10 @@ def _normalize_review_rules(value: Any) -> list[dict[str, Any]]:
             operator = "contains"
         name = str(item.get("name") or f"流程规则-{index}").strip() or f"流程规则-{index}"
         message = str(item.get("message") or f"{FIELD_LABELS.get(field, field)} 未通过流程规则：{name}").strip()
+        signature = (field.lower(), operator.lower(), re.sub(r"\s+", "", str(item.get("value") or "")).strip())
+        if signature in seen:
+            continue
+        seen.add(signature)
         rules.append(
             {
                 "id": str(item.get("id") or f"workflow-rule-{index}"),

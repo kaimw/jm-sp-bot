@@ -229,6 +229,7 @@ async def startup() -> None:
     init_db()
     with SessionLocal() as session:
         seed_defaults(session)
+        set_config(session, "bot_enabled", "true", is_secret=False)
         backfill_mail_received_at(session)
         session.commit()
     # 加载动态生成的技能
@@ -266,7 +267,7 @@ def health(session: Session = Depends(get_session)) -> dict:
         "status": "ok",
         "ready": readiness["ready"],
         "missing": readiness["missing"],
-        "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "bot_enabled": system_config_bool(session, "bot_enabled", True),
         "database": database_health(session),
         "queues": queues,
     }
@@ -276,7 +277,7 @@ def health(session: Session = Depends(get_session)) -> dict:
 def system_health(session: Session = Depends(get_session)) -> dict:
     return {
         "readiness": runtime_startup_readiness(session),
-        "bot_enabled": system_config_bool(session, "bot_enabled", False),
+        "bot_enabled": system_config_bool(session, "bot_enabled", True),
         "database": database_health(session),
         "worker": get_mail_worker_status(configured_worker_interval_seconds(session)),
         "queues": system_queue_health(session),
@@ -1225,6 +1226,7 @@ def tasks(
         query = query.filter(
             or_(
                 ProductionTask.task_no.ilike(pattern),
+                ProductionTask.id.ilike(pattern),
                 ProductionTask.status.ilike(pattern),
                 OrderRequirement.customer_name.ilike(pattern),
                 OrderRequirement.salesperson_email.ilike(pattern),
@@ -2772,6 +2774,7 @@ def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None
         "subject": row.subject,
         "status": row.status,
         "created_at": row.created_at.isoformat(),
+        "sent_at": row.sent_at.isoformat() if row.sent_at else None,
         "pending_diagnosis": outbound_pending_diagnosis(session, row) if session is not None else None,
     }
     if include_body:
@@ -2903,6 +2906,11 @@ def serialize_requirement_summary(row: OrderRequirement) -> dict:
 
 
 def serialize_mail(row: MailMessage) -> dict:
+    related_task_no = None
+    if row.related_task_id:
+        with SessionLocal() as session:
+            task = session.get(ProductionTask, row.related_task_id)
+            related_task_no = task.task_no if task is not None else None
     return {
         "id": row.id,
         "direction": row.direction,
@@ -2913,6 +2921,7 @@ def serialize_mail(row: MailMessage) -> dict:
         "classification": row.classification,
         "classification_confidence": row.classification_confidence,
         "related_task_id": row.related_task_id,
+        "related_task_no": related_task_no,
         "received_at": (row.received_at or row.created_at).isoformat(),
         "created_at": row.created_at.isoformat(),
     }
