@@ -63,7 +63,11 @@
         <div id="system-health" class="health-panel"></div>
       </section>
 
-      <section class="page" data-page="products" data-title="物料管理" data-subtitle="管理物料 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
+      <section class="page product-page" data-page="products" data-title="物料管理" data-subtitle="管理物料 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
+        <div class="section-head product-section-head">
+          <h2>物料中心</h2>
+          <p>维护物料主数据、存货 SKU、渠道限价和促销规则。</p>
+        </div>
         <div class="tabs" id="products-tabs">
           <button type="button" class="active" data-tab="spu">物料 SPU</button>
           <button type="button" data-tab="sku">存货 SKU</button>
@@ -82,8 +86,8 @@
               <button class="button" data-action="new-spu">新增 SPU</button>
             </div>
           </div>
-          <div class="data-table">
-            <div class="head row">
+          <div class="data-table product-table product-spu-table">
+            <div class="head row product-row">
               <div>SPU代码 / 名称</div>
               <div>品牌 / 品类</div>
               <div>创建时间</div>
@@ -101,8 +105,8 @@
             </form>
             <button class="button" data-action="new-sku">新增 SKU</button>
           </div>
-          <div class="data-table">
-            <div class="head row">
+          <div class="data-table product-table product-sku-table">
+            <div class="head row product-row">
               <div>SKU代码</div>
               <div>所属 SPU</div>
               <div>状态</div>
@@ -121,8 +125,8 @@
             </form>
             <button class="button" data-action="new-pricing">配置价格</button>
           </div>
-          <div class="data-table">
-            <div class="head row">
+          <div class="data-table product-table product-pricing-table">
+            <div class="head row product-row">
               <div>渠道 / 币种</div>
               <div>阶梯价格 (分)</div>
               <div>底价 (MAP)</div>
@@ -137,8 +141,8 @@
           <div class="table-filter-bar">
             <button class="button" data-action="new-promotion">新增促销</button>
           </div>
-          <div class="data-table">
-            <div class="head row">
+          <div class="data-table product-table product-promotions-table">
+            <div class="head row product-row">
               <div>规则名称 / 渠道</div>
               <div>优惠内容</div>
               <div>有效期</div>
@@ -149,7 +153,7 @@
           <div id="products-promotions-pagination" class="pagination"></div>
         </div>
       </section>
-      <section class="page" data-page="skill-lab" data-title="技能实验室" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
+      <section class="page skill-page" data-page="skill-lab" data-title="技能实验室" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
         <div class="section-head">
           <h2 id="skill-lab">技能实验室 (Skill Lab)</h2>
           <p>生成的技能将立即热加载到后端引擎，无需重启服务。</p>

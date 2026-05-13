@@ -98,6 +98,13 @@ def ensure_runtime_schema() -> None:
                 "started_at": _datetime_type(),
             },
         )
+    if "mail_messages" in tables:
+        _ensure_columns(
+            "mail_messages",
+            {
+                "received_at": _datetime_type(),
+            },
+        )
 
 
 def _datetime_type() -> str:

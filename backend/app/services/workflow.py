@@ -67,6 +67,7 @@ SALES_ACK_CLASSIFICATIONS = {
     "OrderChangeRequest",
     "OrderCancelRequest",
 }
+OUTBOUND_PRIORITY_TASK = 30
 REPORT_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -329,6 +330,7 @@ def create_inbound_mail(
     from_address: str,
     subject: str,
     body_text: str,
+    received_at: datetime | None = None,
     dedupe_key: str | None = None,
 ) -> MailMessage:
     if dedupe_key is None:
@@ -336,6 +338,8 @@ def create_inbound_mail(
         dedupe_key = f"inbound:{digest}"
     existing = session.query(MailMessage).filter_by(dedupe_key=dedupe_key).one_or_none()
     if existing is not None:
+        if received_at is not None and existing.received_at is None:
+            existing.received_at = received_at
         return existing
 
     classification, confidence = classify_mail(subject, body_text, from_address)
@@ -347,6 +351,7 @@ def create_inbound_mail(
         classification=classification,
         classification_confidence=confidence,
         dedupe_key=dedupe_key,
+        received_at=received_at,
     )
     session.add(mail)
     session.flush()
@@ -1378,6 +1383,7 @@ def approve_task(session: Session, task_id: str, actor: str = "business-owner") 
         body=version.body,
         idempotency_key=idem,
         status="Pending",
+        priority=OUTBOUND_PRIORITY_TASK,
     )
     session.add(job)
     add_audit(session, "TaskApprovedForSend", "ProductionTask", task.id, {"actor": actor, "outbound_job": job.id}, actor)

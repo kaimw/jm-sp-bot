@@ -91,7 +91,7 @@ from backend.app.services.initial_review import (
 )
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.jobs import run_pending_jobs
-from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, send_pending_smtp, sync_imap_mailbox
+from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, backfill_mail_received_at, send_pending_smtp, sync_imap_mailbox
 from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, get_mail_worker_status, run_mail_auto_worker_once
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
@@ -229,6 +229,7 @@ async def startup() -> None:
     init_db()
     with SessionLocal() as session:
         seed_defaults(session)
+        backfill_mail_received_at(session)
         session.commit()
     # 加载动态生成的技能
     registry.load_dynamic_skills()
@@ -1171,8 +1172,9 @@ def mails(
         query = query.filter(MailMessage.direction == direction.strip())
     if from_address and from_address.strip():
         query = query.filter(MailMessage.from_address.ilike(f"%{from_address.strip()}%"))
+    mail_received_order = func.coalesce(MailMessage.received_at, MailMessage.created_at)
     return page_response(
-        query.order_by(MailMessage.created_at.desc()),
+        query.order_by(mail_received_order.desc(), MailMessage.created_at.desc()),
         serialize_mail,
         page,
         page_size,
@@ -2911,6 +2913,7 @@ def serialize_mail(row: MailMessage) -> dict:
         "classification": row.classification,
         "classification_confidence": row.classification_confidence,
         "related_task_id": row.related_task_id,
+        "received_at": (row.received_at or row.created_at).isoformat(),
         "created_at": row.created_at.isoformat(),
     }
 

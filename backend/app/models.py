@@ -130,6 +130,7 @@ class MailMessage(Base):
     classification_confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     related_task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("production_tasks.id"))
     dedupe_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 

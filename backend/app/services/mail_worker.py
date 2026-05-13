@@ -29,6 +29,7 @@ _WORKER_STATUS: dict = {
     "last_duration_seconds": None,
     "last_result": None,
     "last_error": None,
+    "last_mail_io": None,
 }
 
 
@@ -79,20 +80,42 @@ def run_mail_auto_worker_once() -> dict:
             high_priority_count = _pending_high_priority_count(session)
             if high_priority_count > 0:
                 result["high_priority_mails"] = _send_high_priority_mails(session, limit=settings.mail_auto_worker_limit)
+                _WORKER_STATUS["last_mail_io"] = "high_priority_send"
                 session.commit()
 
-            # 3. 低优先级通道技能
+            # 3. 收件同步技能
+            # 低优先级外发队列可能长期堆积。这里与收件交替执行，避免新订单邮件
+            # 被旧的自动通知 backlog 饿死；同一邮箱登录仍保持至少 60 秒间隔。
             low_priority_count = pending_auto_workflow_mail_count(session)
-            if low_priority_count > 0:
-                result["low_priority_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
-                session.commit()
-
-            # 4. 收件同步技能 (只有在没有待发邮件时才同步，避免 SMTP 风控)
-            if high_priority_count == 0 and low_priority_count == 0:
+            should_sync = high_priority_count == 0 and (
+                low_priority_count == 0 or _WORKER_STATUS.get("last_mail_io") != "sync"
+            )
+            if should_sync:
                 result["synced"] = sync_imap_mailbox(session, limit=settings.mail_auto_worker_limit)
+                _WORKER_STATUS["last_mail_io"] = "sync"
+                session.commit()
+                try:
+                    result["processed_after_sync"] = run_pending_jobs(session, limit=settings.mail_auto_worker_limit)
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    logger.exception("mail auto worker post-sync processing failed")
+                    result["processed_after_sync"] = {"completed": 0, "failed": 0, "total": 0, "error": str(exc)}
+            else:
+                result["synced"] = {"imported": 0, "queued": 0, "skipped": "mail IO alternates with outbound queue"}
+
+            # 4. 低优先级通道技能
+            if high_priority_count == 0 and low_priority_count > 0 and not should_sync:
+                result["low_priority_mails"] = send_pending_auto_workflow_mails_smtp(session, limit=settings.mail_auto_worker_limit)
+                _WORKER_STATUS["last_mail_io"] = "low_priority_send"
                 session.commit()
             else:
-                result["synced"] = {"imported": 0, "queued": 0, "skipped": "pending outbound mail has priority"}
+                result["low_priority_mails"] = {
+                    "sent": 0,
+                    "failed": 0,
+                    "total": 0,
+                    "skipped": "mail IO alternates with inbound sync" if low_priority_count > 0 else "no pending outbound mail",
+                }
 
             # 5. 健康检查
             _check_oldest_pending_age(session)
@@ -152,8 +175,8 @@ def configured_mail_worker_interval_seconds() -> int:
         return max(MAIL_WORKER_MIN_INTERVAL_SECONDS, value)
 
 
-# 高优先级通道：仅发 priority <= 30（收件回执、业务推进、任务单）
-_HIGH_PRIORITY_THRESHOLD = OUTBOUND_PRIORITY_NOTIFY  # 30 以下为高优先级
+# 高优先级通道：发送 priority < 40（收件回执、业务推进、任务单）
+_HIGH_PRIORITY_THRESHOLD = OUTBOUND_PRIORITY_NOTIFY
 
 # 最老 Pending 邮件超过此秒数时打告警
 _OLDEST_PENDING_ALERT_SECONDS = 600  # 10 分钟

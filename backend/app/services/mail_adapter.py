@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import Header, decode_header
 from email.message import EmailMessage
 from email.policy import default
-from email.utils import encode_rfc2231, formataddr, getaddresses
+from email.utils import encode_rfc2231, formataddr, getaddresses, parsedate_to_datetime
 from html import unescape
 import re
 
@@ -56,6 +56,7 @@ class IncomingEmail:
     cc_addresses: list[str]
     subject: str
     body_text: str
+    received_at: datetime | None = None
     attachments: list[IncomingAttachment] = field(default_factory=list)
     raw_bytes: bytes = b""
 
@@ -171,6 +172,51 @@ def normalize_bot_display_name(value: str) -> str:
     return (value or "").strip() or "商务部小J"
 
 
+def parse_email_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def backfill_mail_received_at(session: Session, *, limit: int = 1000) -> int:
+    rows = (
+        session.query(MailMessage, AttachmentAsset.storage_ref)
+        .outerjoin(
+            AttachmentAsset,
+            (AttachmentAsset.mail_id == MailMessage.id)
+            & (
+                (AttachmentAsset.content_type == "message/rfc822")
+                | (AttachmentAsset.file_name.ilike("%.eml"))
+            ),
+        )
+        .filter(MailMessage.received_at.is_(None))
+        .order_by(MailMessage.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    updated = 0
+    for mail, storage_ref in rows:
+        received_at = None
+        if storage_ref:
+            try:
+                with open(storage_ref, "rb") as file:
+                    msg = email.message_from_binary_file(file, policy=default)
+                received_at = parse_email_date(msg.get("Date"))
+            except OSError:
+                received_at = None
+        mail.received_at = received_at or mail.created_at
+        updated += 1
+    if updated:
+        session.flush()
+    return updated
+
+
 def parse_email_bytes(raw: bytes) -> IncomingEmail:
     msg = email.message_from_bytes(raw, policy=default)
     subject = decode_mime(msg.get("Subject"))
@@ -212,6 +258,7 @@ def parse_email_bytes(raw: bytes) -> IncomingEmail:
         cc_addresses=cc_addresses,
         subject=subject,
         body_text=body_text,
+        received_at=parse_email_date(msg.get("Date")),
         attachments=attachments,
         raw_bytes=raw,
     )
@@ -234,10 +281,17 @@ def sync_imap_mailbox(session: Session, *, limit: int = 20) -> dict:
     with imaplib.IMAP4_SSL(host, port, timeout=settings.mail_imap_timeout_seconds) as imap:
         imap.login(username, password)
         imap.select("INBOX")
-        _, search_data = imap.search(None, "UNSEEN")
-        message_nums = search_data[0].split()[:limit]
+        status, search_data = imap.search(None, "UNSEEN")
+        if status != "OK" or not search_data:
+            return {"imported": 0, "queued": 0, "searched": 0}
+        all_message_nums = search_data[0].split()
+        # IMAP returns message sequence numbers in ascending order. Use the newest
+        # unseen messages first so old unread mail cannot starve fresh orders.
+        message_nums = list(reversed(all_message_nums[-limit:]))
         for message_num in message_nums:
-            _, fetch_data = imap.fetch(message_num, "(RFC822)")
+            fetch_status, fetch_data = imap.fetch(message_num, "(RFC822)")
+            if fetch_status != "OK":
+                continue
             if not fetch_data or not isinstance(fetch_data[0], tuple):
                 continue
             incoming = parse_email_bytes(fetch_data[0][1])
@@ -246,7 +300,7 @@ def sync_imap_mailbox(session: Session, *, limit: int = 20) -> dict:
             enqueue_job(session, "process_inbound_mail", {"mail_id": mail.id})
             queued += 1
         imap.logout()
-    return {"imported": imported, "queued": queued}
+    return {"imported": imported, "queued": queued, "searched": len(all_message_nums)}
 
 
 def store_incoming_email(session: Session, incoming: IncomingEmail) -> MailMessage:
@@ -256,6 +310,7 @@ def store_incoming_email(session: Session, incoming: IncomingEmail) -> MailMessa
         from_address=incoming.from_address,
         subject=incoming.subject,
         body_text=incoming.body_text,
+        received_at=incoming.received_at,
         dedupe_key=f"imap:{dedupe_source}",
     )
     mail.to_json = dumps(incoming.to_addresses)

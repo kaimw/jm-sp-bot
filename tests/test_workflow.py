@@ -2517,6 +2517,46 @@ def test_mail_auto_worker_future_retry_does_not_block_imap_sync(monkeypatch):
     assert future_retry.status == "Pending"
 
 
+def test_mail_auto_worker_sends_auto_task_issue(monkeypatch):
+    session = make_session()
+    configure_department(session)
+    set_config(session, "bot_enabled", "true", is_secret=False)
+    set_config(session, "bot_email_password", "runtime-secret", is_secret=True)
+    task = create_valid_task(session)
+    job = session.query(OutboundMailJob).filter_by(related_task_id=task.id, mail_type="TaskIssue").one()
+
+    assert job.status == "Pending"
+    assert job.priority == 30
+
+    class FakeSMTP:
+        sent_subjects = []
+
+        def __init__(self, host, port, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def login(self, username, password):
+            assert password == "runtime-secret"
+
+        def send_message(self, msg, from_addr, to_addrs):
+            self.sent_subjects.append(msg["Subject"])
+
+    monkeypatch.setattr("backend.app.services.mail_worker.SessionLocal", lambda: nullcontext(session))
+    monkeypatch.setattr("backend.app.services.mail_adapter.smtplib.SMTP_SSL", FakeSMTP)
+
+    result = run_mail_auto_worker_once()
+    session.commit()
+
+    assert result["high_priority_mails"] == {"sent": 1, "failed": 0, "total": 1}
+    assert job.status == "Sent"
+    assert FakeSMTP.sent_subjects == [job.subject]
+
+
 def test_send_selected_smtp_only_sends_requested_jobs(monkeypatch):
     session = make_session()
     set_config(session, "bot_enabled", "true", is_secret=False)

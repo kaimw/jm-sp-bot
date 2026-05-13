@@ -1039,10 +1039,14 @@ sequenceDiagram
     Rule->>DB: 读取规则和路由
     Rule->>DB: 保存 review_results
     Rule->>WF: 触发 ReviewPassed 或 ReviewNeedSalesInfo
-    WF->>DB: 创建 production_tasks 和 V1 草稿
-    Admin->>DB: 查看草稿和证据
-    Admin->>WF: 人工确认发送
-    WF->>DB: 创建 outbound_mail_jobs
+    WF->>DB: 创建 production_tasks 和 V1 版本
+    alt 自动发送准入通过
+        WF->>DB: 创建 outbound_mail_jobs
+    else 需要人工确认
+        Admin->>DB: 查看未准入草稿和证据
+        Admin->>WF: 高风险场景人工确认发送
+        WF->>DB: 创建 outbound_mail_jobs
+    end
 ```
 
 ### 8.2 生产疑问和销售答复流程
@@ -1067,8 +1071,8 @@ sequenceDiagram
     Sales->>Gateway: 回复疑问
     AI->>DB: 分类为 SalesClarificationReply 并关联问答
     AI->>DB: 保存 answer_summary/completeness
-    WF->>DB: 答复充分则生成 V2 草稿
-    Admin->>WF: 人工确认重新下达
+    WF->>DB: 答复充分则生成 V2 版本
+    WF->>DB: 自动发送准入通过则重新下达
 ```
 
 ### 8.3 订单变更/取消流程
@@ -1132,15 +1136,16 @@ sequenceDiagram
 4. 写 `workflow_events`。
 5. 写 `audit_events`。
 
-### 10.3 人工确认发送
+### 10.3 自动发送准入与人工确认发送
 
 同一事务内：
 
 1. 检查版本状态为 `Draft` 或 `PendingApproval`。
-2. 更新版本确认人和状态。
-3. 创建 `outbound_mail_jobs`。
-4. 更新任务状态为 `TaskIssued` 或 `Reissued`。
-5. 写 `workflow_events` 和 `audit_events`。
+2. 判断自动发送准入条件；低风险任务由系统确认，高风险任务等待人工确认。
+3. 更新版本确认人和状态。
+4. 创建 `outbound_mail_jobs`。
+5. 更新任务状态为 `TaskIssued` 或 `Reissued`。
+6. 写 `workflow_events` 和 `audit_events`。
 
 事务外：
 

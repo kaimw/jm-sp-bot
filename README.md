@@ -80,12 +80,23 @@ python scripts/maintenance_runner.py review --action-id <maintenance_action_id> 
 
 `handoff` 会在 `data/maintenance` 下生成 Markdown 和 JSON 交接包，包含修复草案、上下文、安全边界、推荐执行流程和 runner 命令；管理台也可以对代码修复动作一键生成交接包，并直接展开查看交接包内容。`validate` 会执行固定白名单命令，管理台也提供同等的“运行验证”入口。`complete` 用于外部维护者回填补丁摘要、改动文件、测试结果和残余风险，管理台也提供同等的“回填执行”入口；`review` 用于记录人工接受、驳回或继续修改结论，形成代码补丁闭环。runner 仅允许执行固定验证命令：`python3 -m compileall backend scripts`、`python3 -m pytest` 和 `node --check backend/app/static/app.js`。执行结果会写回维护动作并记录审计事件。
 
+## Agent + Skill 架构演进
+
+下一阶段系统将从固定邮件工作流演进为“商务部数字分身”：商务人员通过技能实验室用自然语言创建、修改、停用和归档 Skill，Agent 在订单排产链路中按权限、证据和成本预算调用技能。详细方案见 [docs/agent-skill-architecture-design.md](docs/agent-skill-architecture-design.md)。
+
+关键原则：
+
+1. Skill 默认先生成草稿，经过静态校验、模拟测试和审批后才发布。
+2. 动态 Skill 不直接发送邮件，只能创建草稿或建议动作，由策略层和现有外发队列执行。
+3. 系统运行优先用规则、结构化查询、缓存和模板，只有必要时才调用 LLM。
+4. 每次 Agent 或 Skill 动作都记录证据、权限判断、模型调用和成本信息。
+
 ## 当前边界
 
 1. 不在代码或文档中保存邮箱密码、模型 API Key。
 2. 运行期可通过管理台/API 配置腾讯企业邮箱账号密码、IMAP/SMTP、模型 API Base/API Key、生产部门邮箱和任务单模板。
 3. 附件解析当前覆盖 `.docx`、`.xlsx`、`.pdf`、`.zip`、`.txt`、`.csv`；ZIP 默认最大 100MB、最多解压 1 层。
-4. MVP 保持“系统生成、商务确认发送”的边界；订单取消、已排产后变更、风险词命中、路由缺失、低质量答复均进入人工处理。
+4. MVP 支持低风险生产任务单自动下达：初审通过、字段完整、路由唯一且无风险命中时，系统自动生成并发送生产任务单；订单取消、已排产后变更、风险词命中、路由缺失、低质量答复均进入人工处理。
 
 ## 关键接口
 
@@ -95,7 +106,7 @@ python scripts/maintenance_runner.py review --action-id <maintenance_action_id> 
 - `POST /api/mailbox/sync`：从腾讯企业邮箱 IMAP 同步未读邮件并写入入库队列。
 - 销售订单、销售补充、订单变更和订单取消邮件入库后，会自动生成 `SalesReceiptAck` 回执外发任务，通知发件人邮件已收到并排队处理中。
 - 规则分类结果为 `NonTarget` 时，可启用当前模型配置进行 LLM 兜底分类和订单字段抽取；规则和 LLM 都判定为 `NonTarget` 时，邮件会进入异常队列，并尽量归类到当前订单沟通会话。
-- 系统启动后默认运行自动邮件 worker，每 60 秒同步 IMAP、处理入库队列，并自动发送销售收件回执、初审未通过/待补充回复、生产疑问转销售邮件、生产疑问收件回执、销售答复后的更新版任务单、更新版任务单发送成功回执和最大轮次关闭通知；不会自动发送首次生产任务单、周报或其它待发邮件。
+- 系统启动后默认运行自动邮件 worker，每 60 秒同步 IMAP、处理入库队列，并自动发送销售收件回执、初审未通过/待补充回复、低风险首次生产任务单、生产疑问转销售邮件、生产疑问收件回执、销售答复后的更新版任务单、更新版任务单发送成功回执和最大轮次关闭通知；周报仍需手动生成入队。
 - `POST /api/mailbox/auto-run-once`：立即运行一次自动邮件 worker，便于排查真实邮箱链路。
 - 后台运行期配置支持 `llm_fallback_enabled` 和 `conversation_max_rounds`，用于控制 LLM 兜底和单次订单沟通会话最大往返轮数。
 - `GET/PUT /api/initial-review/rules`：查看或更新销售订单初审规则，支持启停、必填字段和字段/全文自定义规则；未通过初审会回复销售并进入异常队列。

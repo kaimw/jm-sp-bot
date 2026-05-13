@@ -94,7 +94,7 @@ class SkillFactory:
         import ast
         try:
             tree = ast.parse(code)
-            
+
             # 简单的安全性检查：禁止执行危险模块
             forbidden_imports = {"os", "subprocess", "sys", "shutil"}
             for node in ast.walk(tree):
@@ -105,7 +105,7 @@ class SkillFactory:
                 if isinstance(node, ast.ImportFrom):
                     if node.module in forbidden_imports:
                         raise ValueError(f"Forbidden import detected: {node.module}")
-                
+
                 # 检查是否有 execute 方法
                 if isinstance(node, ast.ClassDef):
                     methods = {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
@@ -130,13 +130,62 @@ class SkillFactory:
         try:
             dynamic_path = os.path.join(os.path.dirname(__file__), "dynamic")
             file_path = os.path.join(dynamic_path, f"{skill_name}.py")
-            
+
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(code)
-            
+
             # 触发热加载
             registry.load_dynamic_skills()
             return True
         except Exception as e:
             logger.exception(f"Failed to save and load skill {skill_name}")
+            return False
+    @staticmethod
+    def delete_skill(skill_name: str) -> bool:
+        """
+        Deletes the skill file (both .py and .py.disabled).
+        """
+        try:
+            dynamic_path = os.path.join(os.path.dirname(__file__), "dynamic")
+            paths = [
+                os.path.join(dynamic_path, f"{skill_name}.py"),
+                os.path.join(dynamic_path, f"{skill_name}.py.disabled")
+            ]
+            for p in paths:
+                if os.path.exists(p):
+                    os.remove(p)
+
+            registry.load_dynamic_skills()
+            return True
+        except Exception as e:
+            logger.exception(f"Failed to delete skill {skill_name}")
+            return False
+
+    @staticmethod
+    def toggle_skill(skill_name: str, active: bool) -> bool:
+        """
+        Enables or disables a skill by renaming the file.
+        """
+        try:
+            dynamic_path = os.path.join(os.path.dirname(__file__), "dynamic")
+            py_path = os.path.join(dynamic_path, f"{skill_name}.py")
+            disabled_path = os.path.join(dynamic_path, f"{skill_name}.py.disabled")
+
+            if active:
+                # Enable: rename .py.disabled -> .py
+                if os.path.exists(disabled_path):
+                    if os.path.exists(py_path):
+                        os.remove(py_path) # Overwrite existing if any
+                    os.rename(disabled_path, py_path)
+            else:
+                # Disable: rename .py -> .py.disabled
+                if os.path.exists(py_path):
+                    if os.path.exists(disabled_path):
+                        os.remove(disabled_path)
+                    os.rename(py_path, disabled_path)
+
+            registry.load_dynamic_skills()
+            return True
+        except Exception as e:
+            logger.exception(f"Failed to toggle skill {skill_name}")
             return False

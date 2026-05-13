@@ -1654,7 +1654,7 @@ async function refreshMails() {
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.id)}</small><br /><small>${h(row.from_address)}</small></div>
           <div><small>分类</small><br />${h(row.classification)} (${h(row.classification_confidence)})</div>
           <div><small>任务</small><br />${h(row.related_task_id || "未关联")}</div>
-          <div><small>${h(row.created_at)}</small></div>
+          <div><small>收件时间</small><br />${h(formatTime(row.received_at || row.created_at))}</div>
         </div>`
       )
       .join("") || `<div class="row"><div>暂无入库邮件</div></div>`;
@@ -1664,7 +1664,7 @@ async function refreshMails() {
 async function openMailDetail(mailId) {
   const detail = await api(`/api/mails/${mailId}`);
   $("#mail-detail-title").textContent = detail.subject || "邮件详情";
-  $("#mail-detail-meta").textContent = `${detail.direction || "邮件"} · ${detail.created_at || ""}`;
+  $("#mail-detail-meta").textContent = `${detail.direction || "邮件"} · 收件时间 ${formatTime(detail.received_at || detail.created_at)}`;
   $("#mail-detail-fields").innerHTML = `
     <div><small>邮件ID</small><strong>${h(detail.id || "未记录")}</strong></div>
     <div><small>发件人</small><strong>${h(detail.from_address || "未记录")}</strong></div>
@@ -2939,12 +2939,12 @@ async function refreshProductsSpu() {
   const data = await api(`/api/products/spu?${queryFromState(tableStates.productsSpu)}`);
   const rows = data.items || [];
   $("#products-spu-list").innerHTML = rows.map(row => `
-    <div class="row">
+    <div class="row product-row">
       <div><strong>${h(row.spu_id)}</strong><br /><small>${h(row.name)}</small></div>
       <div><small>${h(row.brand || "-")}</small><br /><small>${h(row.category || "-")}</small></div>
       <div><small>${h(formatTime(row.created_at))}</small></div>
     </div>
-  `).join("") || `<div class="row"><div>暂无 SPU 数据</div></div>`;
+  `).join("") || `<div class="row product-row product-empty-row"><div>暂无 SPU 数据</div></div>`;
   renderListPagination("#products-spu-pagination", "productsSpu", data);
 }
 
@@ -2952,13 +2952,13 @@ async function refreshProductsSku() {
   const data = await api(`/api/products/sku?${queryFromState(tableStates.productsSku)}`);
   const rows = data.items || [];
   $("#products-sku-list").innerHTML = rows.map(row => `
-    <div class="row">
+    <div class="row product-row">
       <div><strong>${h(row.sku_id)}</strong><br /><small>${h(JSON.stringify(row.attributes))}</small></div>
       <div><a href="#" class="link" data-action="goto-spu" data-spu="${h(row.spu_id)}">${h(row.spu_id)}</a></div>
       <div><small>${h(row.status)}</small><br /><a href="#" class="link" data-action="quick-new-pricing" data-sku-uuid="${h(row.id)}" data-sku-id="${h(row.sku_id)}">配置价格</a></div>
       <div><small>${h(formatTime(row.created_at))}</small></div>
     </div>
-  `).join("") || `<div class="row"><div>暂无 SKU 数据</div></div>`;
+  `).join("") || `<div class="row product-row product-empty-row"><div>暂无 SKU 数据</div></div>`;
   renderListPagination("#products-sku-pagination", "productsSku", data);
 }
 
@@ -2966,7 +2966,7 @@ async function refreshProductsPricing() {
   const data = await api(`/api/pricing?${queryFromState(tableStates.productsPricing)}`);
   const rows = data.items || [];
   $("#products-pricing-list").innerHTML = rows.map(row => `
-    <div class="row">
+    <div class="row product-row">
       <div><strong>${h(row.channel)}</strong> / <a href="#" class="link" data-action="goto-sku" data-sku="${h(row.sku_id)}">${h(row.sku_id)}</a><br /><small>${h(row.currency)}</small></div>
       <div>
         <small>A: ${h(row.tier_a_price || "-")} | B: ${h(row.tier_b_price || "-")} | C: ${h(row.tier_c_price || "-")}</small>
@@ -2975,7 +2975,7 @@ async function refreshProductsPricing() {
       <div><strong>${h(row.map_price)}</strong></div>
       <div><small>${h(formatTime(row.updated_at))}</small></div>
     </div>
-  `).join("") || `<div class="row"><div>暂无定价数据</div></div>`;
+  `).join("") || `<div class="row product-row product-empty-row"><div>暂无定价数据</div></div>`;
   renderListPagination("#products-pricing-pagination", "productsPricing", data);
 }
 
@@ -2983,7 +2983,7 @@ async function refreshProductsPromotions() {
   const data = await api(`/api/promotions?${queryFromState(tableStates.productsPromotions)}`);
   const rows = data.items || [];
   $("#products-promotions-list").innerHTML = rows.map(row => `
-    <div class="row">
+    <div class="row product-row">
       <div><strong>${h(row.name)}</strong><br /><small>${h(row.channel || "通用")}</small></div>
       <div><small>${h(row.discount_type === 'percentage' ? '比例' : '固定减免')}</small><br /><strong>${h(row.discount_value)}</strong></div>
       <div><small>${h(row.start_time ? formatTime(row.start_time) : "不限")} - ${h(row.end_time ? formatTime(row.end_time) : "不限")}</small></div>
@@ -2998,7 +2998,7 @@ async function refreshProductsPromotions() {
         </div>
       </div>
     </div>
-  `).join("") || `<div class="row"><div>暂无促销数据</div></div>`;
+  `).join("") || `<div class="row product-row product-empty-row"><div>暂无促销数据</div></div>`;
   
   // Store rule data in a global map to avoid escaping issues in HTML attributes
   window._promotionRules = window._promotionRules || {};
