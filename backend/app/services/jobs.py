@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.models import MailMessage, ProcessingJob, now_utc
+from backend.app.services.crm_sync import run_crm_sales_order_sync
+from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.jsonutil import loads
 from backend.app.services.workflow import process_inbound_mail
 
@@ -80,6 +82,11 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 if mail is None:
                     raise RuntimeError("mail not found")
                 process_inbound_mail(session, mail)
+            elif job.job_type == "sync_erp_materials":
+                sync_erp_materials(session)
+            elif job.job_type == "sync_crm_sales_orders":
+                payload = loads(job.payload_json, {})
+                run_crm_sales_order_sync(session, trigger=str(payload.get("source") or "job"))
             else:
                 raise RuntimeError(f"unknown job type: {job.job_type}")
             job.status = "Completed"

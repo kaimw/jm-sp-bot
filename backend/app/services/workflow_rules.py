@@ -72,16 +72,41 @@ TASK_TEMPLATE_BODY_REQUIRED_TOKENS = (
 )
 FIELD_HINTS = {
     "material_details": {"label": "物料详情描述", "keywords": ["物料详情描述", "物料详情", "物料编码", "规格型号"]},
-    "logistics_method": {"label": "物流发货方式", "keywords": ["物流发货方式", "物流方式"]},
-    "shipping_time_requirement": {"label": "出货时间要求", "keywords": ["出货时间要求", "发货时间要求"]},
-    "customer_receiver_info": {"label": "客户收件信息", "keywords": ["客户收件信息", "收件信息"]},
-    "delivery_requirement": {"label": "交付要求", "keywords": ["交付要求"]},
+    "material_code": {"label": "物料编码", "keywords": ["物料编码", "产品编码", "商品编码", "物料编号", "编码"]},
+    "material_name": {"label": "物料名称", "keywords": ["物料名称", "产品名称", "商品名称", "品名"]},
+    "material_spec": {"label": "物料规格", "keywords": ["物料规格", "产品规格", "商品规格", "规格型号", "规格", "型号"]},
+    "material_quantity": {"label": "数量", "keywords": ["物料数量", "需求数量", "数量"]},
+    "logistics_method": {"label": "物流发货方式", "keywords": ["物流发货方式", "物流方式", "发货方式", "发运方式"]},
+    "shipping_time_requirement": {"label": "出货时间要求", "keywords": ["出货时间要求", "发货时间要求", "出货时间", "发货时间"]},
+    "customer_receiver_info": {"label": "客户收件信息", "keywords": ["客户收件信息", "收件信息", "收件人信息", "收货信息", "收货地址"]},
+    "delivery_requirement": {"label": "交付要求", "keywords": ["交付要求", "配送要求", "发货要求"]},
     "shipping_warehouse": {"label": "出货仓", "keywords": ["出货仓", "借货仓"]},
     "borrow_time": {"label": "借用时间", "keywords": ["借用时间"]},
     "return_time": {"label": "归还时间", "keywords": ["归还时间"]},
     "sample_approval_screenshot": {"label": "样机借用审批截图", "keywords": ["样机借用审批截图"]},
 }
-MATERIAL_DETAIL_CHILD_LABELS = {"物料编码", "产品编码", "商品编码", "物料名称", "产品名称", "商品名称", "数量", "需求数量", "规格型号", "型号"}
+MATERIAL_FIELD_KEYS = {"material_code", "material_name", "material_spec", "material_quantity"}
+LOGISTICS_FIELD_KEYS = {"logistics_method", "shipping_time_requirement", "customer_receiver_info", "delivery_requirement"}
+MATERIAL_DETAIL_CHILD_LABELS = {
+    "物料编码",
+    "产品编码",
+    "商品编码",
+    "物料编号",
+    "编码",
+    "物料名称",
+    "产品名称",
+    "商品名称",
+    "品名",
+    "物料数量",
+    "需求数量",
+    "数量",
+    "物料规格",
+    "产品规格",
+    "商品规格",
+    "规格型号",
+    "规格",
+    "型号",
+}
 ALLOWED_REVIEW_FIELDS = set(FIELD_LABELS)
 ALLOWED_REVIEW_OPERATORS = {item["key"] for item in OPERATOR_OPTIONS}
 WORKFLOW_CHAT_SYSTEM_PROMPT = (
@@ -594,15 +619,17 @@ def _extract_template_block(text: str) -> str:
 
 def _required_fields_from_text(name: str, section_text: str) -> list[str]:
     fields = ["customer_name", "product_summary", "quantity_text", "expected_delivery_date"]
-    if any(keyword in section_text for keyword in ["物料详情描述", "物料编码", "规格型号"]):
+    if any(keyword in section_text for keyword in ["物料详情描述", "物料详情", "物料编码", "产品编码", "商品编码", "编码"]):
         fields.append("material_details")
-    if "物流发货方式" in section_text:
+    if "物流详情" in section_text and any(keyword in section_text for keyword in ["发货方式", "物流方式", "物流发货方式", "发运方式"]):
         fields.append("logistics_method")
-    if any(keyword in section_text for keyword in ["出货时间要求", "发货时间要求"]):
+    if any(keyword in section_text for keyword in ["物流发货方式", "物流方式", "发货方式", "发运方式"]):
+        fields.append("logistics_method")
+    if any(keyword in section_text for keyword in ["出货时间要求", "发货时间要求", "出货时间", "发货时间"]):
         fields.append("shipping_time_requirement")
-    if "客户收件信息" in section_text:
+    if any(keyword in section_text for keyword in ["客户收件信息", "收件信息", "收件人信息", "收货信息", "收货地址"]):
         fields.append("customer_receiver_info")
-    if "交付要求" in section_text:
+    if any(keyword in section_text for keyword in ["交付要求", "配送要求", "发货要求"]):
         fields.append("delivery_requirement")
     if any(keyword in section_text for keyword in ["出货仓", "借货仓"]):
         fields.append("shipping_warehouse")
@@ -617,6 +644,23 @@ def _required_fields_from_text(name: str, section_text: str) -> list[str]:
     unique: list[str] = []
     for field in fields:
         if field not in unique:
+            unique.append(field)
+    return unique
+
+
+def _normalize_required_fields(fields: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for raw_field in fields:
+        field = str(raw_field or "").strip()
+        if not field:
+            continue
+        if field == "material_quantity":
+            normalized.append("quantity_text")
+        else:
+            normalized.append(field)
+    unique: list[str] = []
+    for field in normalized:
+        if field and field not in unique:
             unique.append(field)
     return unique
 
@@ -751,7 +795,8 @@ def parse_workflows_by_llm(session: Session, source_text: str) -> list[dict[str,
                             "每个对象字段必须包含：workflow_code, workflow_name, match, routing, subject_template, body_template, required_fields, required_attachments, review_rules。"
                             "routing 包含 to_names/cc_names。"
                             "required_fields 仅允许核心字段 customer_name/product_summary/quantity_text/expected_delivery_date/external_order_no "
-                            "和扩展字段 material_details/logistics_method/shipping_time_requirement/customer_receiver_info/delivery_requirement/"
+                            "和扩展字段 material_details/material_code/material_name/material_spec/"
+                            "logistics_method/shipping_time_requirement/customer_receiver_info/delivery_requirement/"
                             "shipping_warehouse/borrow_time/return_time/sample_approval_screenshot。"
                             "review_rules 是流程专属初审规则数组，每条包含 id/name/field/operator/value/message/enabled。"
                             "field 仅允许 customer_name/product_summary/quantity_text/expected_delivery_date/external_order_no/salesperson_email/source_text。"
@@ -792,6 +837,7 @@ def _normalize_rule(rule: dict[str, Any], fallback_index: int, *, email_only_rou
     required_fields = _normalize_list(rule.get("required_fields"))
     if not required_fields:
         required_fields = _required_fields_from_text(name, body_template)
+    required_fields = _normalize_required_fields(required_fields)
     subject_template, body_template = _ensure_task_template_variables(subject_template, body_template, required_fields)
     required_attachments = _normalize_list(rule.get("required_attachments"))
     review_rules = _normalize_review_rules(rule.get("review_rules"))
@@ -1672,16 +1718,92 @@ def upsert_mail_workflow_match(session: Session, mail: MailMessage, match: Workf
 
 def extract_workflow_fields(source_text: str, required_fields: list[str]) -> dict[str, str]:
     extracted: dict[str, str] = {}
-    for field in required_fields:
+    for field in _normalize_required_fields(required_fields):
+        if field == "quantity_text":
+            value = _extract_material_child_value(source_text, "material_quantity")
+            if value:
+                extracted[field] = value
+            continue
         if field in CORE_FIELD_LABELS:
             continue
         hints = FIELD_HINTS.get(field)
         if hints is None:
             continue
-        value = _extract_workflow_field_value(source_text, field, [str(item) for item in hints["keywords"]])
+        if field == "material_details":
+            value = _extract_workflow_field_value(source_text, field, [str(item) for item in hints["keywords"]])
+        elif field in MATERIAL_FIELD_KEYS:
+            value = _extract_material_child_value(source_text, field)
+        elif field in LOGISTICS_FIELD_KEYS:
+            value = _extract_logistics_child_value(source_text, field)
+        else:
+            value = _extract_workflow_field_value(source_text, field, [str(item) for item in hints["keywords"]])
         if value:
             extracted[field] = value
     return extracted
+
+
+def _clean_workflow_field_value(value: str) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    return clean.strip("【】[]（）()，,；;。 ")
+
+
+def _field_value_until_next_label(value: str, labels: list[str]) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        return ""
+    label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True) if label)
+    if label_pattern:
+        clean = re.split(rf"\s*[，,；;]\s*(?:{label_pattern})\s*[:：]?", clean, maxsplit=1)[0]
+        clean = re.split(rf"\s+(?:{label_pattern})\s*[:：]", clean, maxsplit=1)[0]
+    return _clean_workflow_field_value(clean)
+
+
+def _extract_labeled_value(source_text: str, labels: list[str], *, optional_colon: bool = False) -> str:
+    all_labels = [
+        str(keyword)
+        for hints in FIELD_HINTS.values()
+        for keyword in [hints.get("label"), *hints.get("keywords", [])]
+        if keyword
+    ]
+    label_group = sorted({label for label in labels if label}, key=len, reverse=True)
+    for label in label_group:
+        separator = r"[:：]?" if optional_colon else r"[:：]"
+        for line in source_text.splitlines():
+            stripped = line.strip()
+            if not stripped or label not in stripped:
+                continue
+            match = re.search(rf"{re.escape(label)}\s*{separator}\s*([^\n]+)", stripped)
+            if not match:
+                continue
+            value = _field_value_until_next_label(match.group(1), all_labels)
+            if value and value != label:
+                return value[:500]
+    return ""
+
+
+def _material_detail_block(source_text: str) -> str:
+    value = _extract_workflow_field_value(source_text, "material_details", [str(item) for item in FIELD_HINTS["material_details"]["keywords"]])
+    return value or source_text
+
+
+def _extract_material_child_value(source_text: str, field: str) -> str:
+    hints = FIELD_HINTS.get(field) or {}
+    labels = [str(item) for item in hints.get("keywords", []) if str(item)]
+    block = _material_detail_block(source_text)
+    value = _extract_labeled_value(block, labels, optional_colon=field in {"material_code", "material_spec"})
+    if value:
+        return value
+    if field == "material_quantity":
+        match = re.search(r"\d+(?:\.\d+)?\s*(?:套|台|件|个|箱|pcs|PCS|Pcs)", block)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def _extract_logistics_child_value(source_text: str, field: str) -> str:
+    hints = FIELD_HINTS.get(field) or {}
+    labels = [str(item) for item in hints.get("keywords", []) if str(item)]
+    return _extract_labeled_value(source_text, labels, optional_colon=False)
 
 
 def _field_line_label(line: str) -> str | None:

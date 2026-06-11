@@ -105,6 +105,13 @@ def ensure_runtime_schema() -> None:
                 "received_at": _datetime_type(),
             },
         )
+    if "promotion_rules" in tables:
+        _ensure_columns(
+            "promotion_rules",
+            {
+                "sku_uuid": "VARCHAR(36)",
+            },
+        )
 
 
 def _datetime_type() -> str:

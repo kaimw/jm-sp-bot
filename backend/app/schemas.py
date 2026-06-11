@@ -113,6 +113,39 @@ class MailRuntimeConfigUpdate(BaseModel):
     e2e_production_password: str | None = None
 
 
+class ErpRuntimeConfigUpdate(BaseModel):
+    erp_enabled: bool | None = None
+    erp_server_url: str | None = None
+    erp_acct_id: str | None = None
+    erp_username: str | None = None
+    erp_app_id: str | None = None
+    erp_app_sec: str | None = None
+    erp_lcid: int | None = None
+    erp_material_sync_enabled: bool | None = None
+    erp_material_sync_interval_seconds: int | None = None
+    erp_material_form_id: str | None = None
+    erp_material_field_keys: str | None = None
+
+
+class CrmRuntimeConfigUpdate(BaseModel):
+    crm_sync_enabled: bool | None = None
+    crm_sync_interval_seconds: int | None = None
+    crm_cdp_url: str | None = None
+    crm_fxiaoke_request_file: str | None = None
+    crm_fxiaoke_request_json: str | None = None
+    crm_sync_page_size: int | None = None
+    crm_sync_timeout_seconds: int | None = None
+
+
+class ErpBillQueryRequest(BaseModel):
+    form_id: str
+    field_keys: str
+    filter_string: str = ""
+    order_string: str = ""
+    limit: int = Field(default=20, ge=1, le=200)
+    start_row: int = Field(default=0, ge=0)
+
+
 class InitialReviewRuleUpdate(BaseModel):
     id: str | None = None
     name: str
@@ -218,6 +251,7 @@ class ChannelPricingUpdate(BaseModel):
 
 class PromotionRuleCreate(BaseModel):
     name: str
+    sku_uuid: str
     channel: str | None = None
     discount_type: str = Field(pattern="^(percentage|fixed_amount|PERCENTAGE|FIXED_AMOUNT)$")
     discount_value: int
@@ -227,6 +261,7 @@ class PromotionRuleCreate(BaseModel):
 
 class PromotionRuleUpdate(BaseModel):
     name: str | None = None
+    sku_uuid: str | None = None
     channel: str | None = None
     discount_type: str | None = Field(None, pattern="^(percentage|fixed_amount|PERCENTAGE|FIXED_AMOUNT)$")
     discount_value: int | None = None

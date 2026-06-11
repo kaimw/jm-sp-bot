@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.models import MailTemplate, ModelProviderConfig, ProductionDepartment, SystemConfig, now_utc
+from backend.app.models import LogisticsDepartment, MailTemplate, ModelProviderConfig, ProductionDepartment, SystemConfig, now_utc
 from backend.app.services.jsonutil import dumps
 
 
@@ -24,6 +24,32 @@ DEFAULT_TASK_BODY = """生产部同事好：
 期望交期：{{expected_delivery_date}}
 
 请确认是否可以安排生产。如信息不足，请直接回复本邮件说明疑问点。
+
+{{bot_signature}}
+"""
+
+DEFAULT_LOGISTICS_SUBJECT = "[物流核查单][{{logistics_task_no}}][{{customer_name}}][{{external_order_no}}][V{{version_no}}]"
+DEFAULT_LOGISTICS_BODY = """物流部同事好：
+
+请核查以下订单是否可由现有仓储库存直接发货。
+
+物流核查单编号：{{logistics_task_no}}
+版本：V{{version_no}}
+客户名称：{{customer_name}}
+销售人员：{{salesperson_name}} <{{salesperson_email}}>
+订单号：{{external_order_no}}
+
+物料/规格：{{product_summary}}
+数量：{{quantity_text}}
+期望交期：{{expected_delivery_date}}
+
+请按以下格式回复：
+库存满足：是/否
+可发物料：
+缺失物料：
+发货单号：
+预计/实际发货时间：
+备注：
 
 {{bot_signature}}
 """
@@ -93,6 +119,30 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "product_price_review_require_unit_price", "false", is_secret=False)
     ensure_config(session, "product_price_review_llm_enabled", "false", is_secret=False)
     ensure_config(session, "workflow_contact_map_json", "{}", is_secret=False)
+    ensure_config(session, "erp_enabled", "false", is_secret=False)
+    ensure_config(session, "erp_readonly", "true", is_secret=False)
+    ensure_config(session, "erp_write_enabled", "false", is_secret=False)
+    ensure_config(session, "erp_server_url", "", is_secret=False)
+    ensure_config(session, "erp_acct_id", "", is_secret=False)
+    ensure_config(session, "erp_username", "", is_secret=False)
+    ensure_config(session, "erp_app_id", "", is_secret=False)
+    ensure_config(session, "erp_app_sec", "", is_secret=True)
+    ensure_config(session, "erp_lcid", "2052", is_secret=False)
+    ensure_config(session, "erp_material_sync_enabled", "true", is_secret=False)
+    ensure_config(session, "erp_material_sync_interval_seconds", "86400", is_secret=False)
+    ensure_config(session, "erp_material_form_id", "BD_MATERIAL", is_secret=False)
+    ensure_config(session, "erp_material_field_keys", "FNumber,FName,FSpecification,FMaterialGroup.FName,FForbidStatus", is_secret=False)
+    ensure_config(session, "erp_material_last_sync_at", "", is_secret=False)
+    ensure_config(session, "erp_inventory_alert_threshold", "1", is_secret=False)
+    ensure_config(session, "erp_inventory_last_sync_at", "", is_secret=False)
+    ensure_config(session, "crm_sync_enabled", "false", is_secret=False)
+    ensure_config(session, "crm_sync_interval_seconds", "3600", is_secret=False)
+    ensure_config(session, "crm_cdp_url", "http://127.0.0.1:9333", is_secret=False)
+    ensure_config(session, "crm_fxiaoke_request_file", "", is_secret=False)
+    ensure_config(session, "crm_fxiaoke_request_json", "", is_secret=True)
+    ensure_config(session, "crm_sync_page_size", "20", is_secret=False)
+    ensure_config(session, "crm_sync_timeout_seconds", "120", is_secret=False)
+    ensure_config(session, "crm_sales_orders_last_sync_at", "", is_secret=False)
     if settings.baidu_map_ak:
         map_config = session.get(SystemConfig, "baidu_map_ak")
         if map_config is None or not (map_config.value or "").strip() or map_config.value == LEGACY_DEFAULT_BAIDU_MAP_AK:
@@ -119,6 +169,23 @@ def seed_defaults(session: Session) -> None:
             )
         )
 
+    logistics_template = (
+        session.query(MailTemplate)
+        .filter(MailTemplate.template_code == "logistics_task", MailTemplate.version == "v1")
+        .one_or_none()
+    )
+    if logistics_template is None:
+        session.add(
+            MailTemplate(
+                template_code="logistics_task",
+                template_name="物流核查单默认模板",
+                template_type="LogisticsTaskIssue",
+                subject_template=DEFAULT_LOGISTICS_SUBJECT,
+                body_template=DEFAULT_LOGISTICS_BODY,
+                version="v1",
+            )
+        )
+
     model_config = session.query(ModelProviderConfig).filter(ModelProviderConfig.title == settings.model_title).one_or_none()
     if model_config is None:
         session.add(
@@ -138,6 +205,18 @@ def seed_defaults(session: Session) -> None:
             ProductionDepartment(
                 department_code="default",
                 department_name="默认生产部门",
+                mail_to_json=dumps([]),
+                mail_cc_json=dumps([]),
+                status="Active",
+            )
+        )
+
+    default_logistics_department = session.query(LogisticsDepartment).filter_by(department_code="default").one_or_none()
+    if default_logistics_department is None:
+        session.add(
+            LogisticsDepartment(
+                department_code="default",
+                department_name="默认物流部门",
                 mail_to_json=dumps([]),
                 mail_cc_json=dumps([]),
                 status="Active",

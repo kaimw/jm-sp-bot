@@ -3,9 +3,17 @@ const hiddenPages = new Set(["orders", "templates"]);
 let initialReviewState = { enabled: true, required_fields: [], rules: [], field_options: [], operator_options: [] };
 let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, readonly: false };
 let productionDepartmentState = { items: [] };
+let logisticsDepartmentState = { items: [] };
 let workflowChatState = { messages: [], compiledRule: null, validationErrors: [], ready: false, editVersionId: "", editWorkflowName: "" };
 let runtimeConfigState = {};
 let startupReadinessState = { ready: false, missing: [] };
+let inventoryDetailState = null;
+let inventoryWarehouseSuggestTimer = null;
+let inventoryWarehouseSuggestSeq = 0;
+let productSpuSuggestTimer = null;
+let productSpuSuggestSeq = 0;
+let productSkuSuggestTimer = null;
+let productSkuSuggestSeq = 0;
 let dashboardViewState = { period: "year" };
 let baiduMapLoadPromise = null;
 let baiduDemandMap = null;
@@ -13,6 +21,8 @@ let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson
 const tableStates = {
   workflows: { q: "", status: "", page: 1, page_size: 10 },
   departments: { q: "", status: "", page: 1, page_size: 10 },
+  logisticsDepartments: { q: "", status: "", page: 1, page_size: 10 },
+  logisticsTasks: { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", page: 1, page_size: 10 },
   mails: { q: "", classification: "", direction: "", from_address: "", page: 1, page_size: 10 },
   outbound: { q: "", status: "", mail_type: "", recipient: "", page: 1, page_size: 10 },
   exceptions: { q: "", status: "Open", severity: "", exception_type: "", page: 1, page_size: 10 },
@@ -22,9 +32,12 @@ const tableStates = {
   backups: { q: "", status: "", backup_type: "", page: 1, page_size: 10 },
   reviewRules: { q: "", status: "", page: 1, page_size: 10 },
   productsSpu: { q: "", page: 1, page_size: 10 },
-  productsSku: { spu_id: "", page: 1, page_size: 10 },
-  productsPricing: { sku_id: "", page: 1, page_size: 10 },
-  productsPromotions: { page: 1, page_size: 10 },
+  productsSku: { q: "", page: 1, page_size: 10 },
+  productsInventory: { q: "", warehouse_code: "", low_stock_only: "", measure_type: "countable", inventory_scope: "non_finished", threshold: "1", page: 1, page_size: 20 },
+  productsFinishedInventory: { q: "", warehouse_code: "", low_stock_only: "", countable_only: "false", measure_type: "", inventory_scope: "finished", threshold: "1", page: 1, page_size: 20 },
+  productsPricing: { q: "", page: 1, page_size: 10 },
+  productsPromotions: { q: "", page: 1, page_size: 10 },
+  crmOrders: { q: "", status: "", customer: "", page: 1, page_size: 20 },
 };
 
 async function api(path, options = {}) {
@@ -631,6 +644,32 @@ async function refreshDepartments() {
   renderListPagination("#departments-pagination", "departments", data);
 }
 
+async function refreshLogisticsDepartments() {
+  const data = normalizeListPayload(await api(`/api/logistics-departments?${queryFromState(tableStates.logisticsDepartments)}`), tableStates.logisticsDepartments);
+  const rows = data.items || [];
+  logisticsDepartmentState.items = rows;
+  setSelectOptions("#logistics-departments-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.logisticsDepartments.status);
+  $("#logistics-departments-list").innerHTML = rows
+    .map(
+      (row) => `
+        <div class="row task-row">
+          <div><strong>${h(row.department_name)}</strong><br /><small>${h(row.department_code)}</small></div>
+          <div><small>主送</small><br />${h(row.mail_to.join(", ") || "未配置")}</div>
+          <div><small>抄送</small><br />${h(row.mail_cc.join(", ") || "无")}</div>
+          <div>
+            <small>${h(row.status)}</small>
+            <div class="actions row-actions">
+              <button class="button ghost" type="button" data-action="edit-logistics-department" data-id="${h(row.id)}">编辑</button>
+              <button class="button warn" type="button" data-action="delete-logistics-department" data-id="${h(row.id)}">删除</button>
+            </div>
+          </div>
+        </div>`
+    )
+    .join("");
+  if (!rows.length) $("#logistics-departments-list").innerHTML = `<div class="row"><div>暂无物流邮箱</div></div>`;
+  renderListPagination("#logistics-departments-pagination", "logisticsDepartments", data);
+}
+
 async function refreshTasks() {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(taskQueryState)) {
@@ -662,6 +701,43 @@ async function refreshTasks() {
       )
       .join("") || `<div class="row"><div>暂无任务</div></div>`;
   renderTaskPagination(data);
+}
+
+function renderRelatedTaskLink(row) {
+  if (!row || !row.related_task_id) return "未关联";
+  const label = row.related_task_no || row.related_task_id;
+  const action = row.related_task_type === "logistics" ? "jump-logistics-task" : "jump-task";
+  return `<button class="link-button" type="button" data-action="${action}" data-task-id="${h(row.related_task_id)}" data-task-no="${h(row.related_task_no || "")}">${h(label)}</button>`;
+}
+
+async function refreshLogisticsTasks() {
+  const data = normalizeListPayload(await api(`/api/logistics-tasks?${queryFromState(tableStates.logisticsTasks)}`), tableStates.logisticsTasks);
+  const rows = data.items || [];
+  setSelectOptions("#logistics-tasks-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.logisticsTasks.status);
+  $("#logistics-tasks-list").innerHTML =
+    rows
+      .map(
+        (row) => `
+        <div class="row task-row">
+          <div>
+            <strong>${h(row.task_no)}</strong><br />
+            <small>${h(row.customer_name || "未识别客户")} · ${h(row.salesperson_email || "未知销售")}</small><br />
+            <small>${h(row.external_order_no || "无订单号")}</small>
+          </div>
+          <div>${h(row.product_summary || "未识别物料")}<br /><small>${h(row.quantity_text || "")} ${h(row.expected_delivery_date || "")}</small></div>
+          <div><small>${h(row.status)}</small><br /><small>${h(row.closed_reason || "")}</small></div>
+          <div><small>物流邮箱</small><br />${h((row.target_mail_to || []).join(", ") || "未配置")}</div>
+          <div>
+            ${row.production_task_id ? `<small>关联生产</small><br />${h(row.production_task_id)}` : ""}
+            <div class="actions row-actions">
+              <button class="button" data-action="workflow" data-id="${h(row.id)}">查看工作流</button>
+              <button class="button ghost" data-action="manual-close-logistics-task" data-id="${h(row.id)}" ${row.status === "Closed" ? "disabled" : ""}>手动关闭</button>
+            </div>
+          </div>
+        </div>`
+      )
+      .join("") || `<div class="row"><div>暂无物流任务</div></div>`;
+  renderListPagination("#logistics-tasks-pagination", "logisticsTasks", data);
 }
 
 function updateTaskStatusOptions(options) {
@@ -718,6 +794,30 @@ async function jumpToTask(taskId, taskNo = "") {
   toast(`已定位任务：${taskNo || taskId}`);
 }
 
+async function jumpToLogisticsTask(taskId, taskNo = "") {
+  const query = String(taskNo || taskId || "").trim();
+  if (!query) return;
+  tableStates.logisticsTasks = {
+    ...tableStates.logisticsTasks,
+    q: query,
+    status: "",
+    customer: "",
+    product: "",
+    salesperson: "",
+    order_no: "",
+    page: 1,
+  };
+  const form = $("#logistics-tasks-filter-form");
+  if (form) {
+    form.reset();
+    form.querySelector("[name=q]").value = query;
+  }
+  window.location.hash = "logistics-tasks";
+  setActivePage("logistics-tasks");
+  await refreshLogisticsTasks();
+  toast(`已定位物流任务：${taskNo || taskId}`);
+}
+
 function mailStatusClass(status) {
   return {
     Sent: "status-sent",
@@ -756,7 +856,7 @@ async function refreshOutbound() {
       .map(
         (row) => `
         <div class="row outbound-row clickable-row" data-outbound-id="${h(row.id)}" role="button" tabindex="0" title="查看外发邮件详情">
-          <div><strong>${h(row.subject)}</strong><br /><small>${h(row.mail_type)}</small></div>
+          <div><strong>${h(row.subject)}</strong><br /><small>${h(row.mail_type)}</small><br /><small>任务：${renderRelatedTaskLink(row)}</small></div>
           <div><small>主送</small><br />${h(row.to.join(", ") || "无")}</div>
           <div><small>抄送</small><br />${h(row.cc.join(", ") || "无")}</div>
           <div><small>发送时间</small><br />${h(row.sent_at ? formatTime(row.sent_at) : "未发送")}</div>
@@ -1092,6 +1192,10 @@ function workflowFieldLabel(field) {
   if (fromInitial && fromInitial !== field) return fromInitial;
   const extra = {
     material_details: "物料详情描述",
+    material_code: "物料编码",
+    material_name: "物料名称",
+    material_spec: "物料规格",
+    material_quantity: "数量",
     logistics_method: "物流发货方式",
     shipping_time_requirement: "出货时间要求",
     customer_receiver_info: "客户收件信息",
@@ -1106,17 +1210,242 @@ function workflowFieldLabel(field) {
   return extra[field] || field;
 }
 
-function ensureWorkflowRequiredFieldsInBody(bodyTemplate, requiredFields) {
-  const body = String(bodyTemplate || "").trim();
-  const extraFields = (requiredFields || []).filter((field) => {
-    const key = String(field || "").trim();
-    if (!key) return false;
-    if (["customer_name", "product_summary", "quantity_text", "expected_delivery_date", "external_order_no"].includes(key)) return false;
-    return !workflowTemplateHasVariable(body, key);
+function workflowFieldKeys() {
+  return Array.from(new Set([
+    ...(initialReviewState.field_options || []).map((item) => item.key).filter(Boolean),
+    "customer_name",
+    "product_summary",
+    "quantity_text",
+    "expected_delivery_date",
+    "external_order_no",
+    "material_details",
+    "material_code",
+    "material_name",
+    "material_spec",
+    "material_quantity",
+    "logistics_method",
+    "shipping_time_requirement",
+    "customer_receiver_info",
+    "delivery_requirement",
+    "shipping_warehouse",
+    "borrow_time",
+    "return_time",
+    "sample_approval_screenshot",
+    "initiator",
+    "expected_time",
+  ]));
+}
+
+function stripWorkflowGeneratedRequiredFieldBlock(bodyTemplate) {
+  const lines = String(bodyTemplate || "").split("\n");
+  const result = [];
+  const generatedLabels = new Set(workflowFieldKeys().map((field) => workflowFieldLabel(field)));
+  let inGeneratedBlock = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "流程必填信息：") {
+      inGeneratedBlock = true;
+      continue;
+    }
+    if (inGeneratedBlock) {
+      const match = trimmed.match(/^([^:：]+)[:：]\s*\{\{\s*([a-zA-Z0-9_]+)\s*\}\}\s*$/);
+      if (match && generatedLabels.has(match[1])) continue;
+      inGeneratedBlock = false;
+    }
+    result.push(line);
+  }
+  return result.join("\n").trim();
+}
+
+const WORKFLOW_MATERIAL_FIELDS = new Set([
+  "external_order_no",
+  "product_summary",
+  "quantity_text",
+  "material_code",
+  "material_name",
+  "material_spec",
+]);
+
+const WORKFLOW_LOGISTICS_FIELDS = new Set([
+  "customer_name",
+  "expected_delivery_date",
+  "logistics_method",
+  "shipping_time_requirement",
+  "customer_receiver_info",
+  "delivery_requirement",
+  "shipping_warehouse",
+  "borrow_time",
+  "return_time",
+  "sample_approval_screenshot",
+]);
+
+function workflowManagedPreviewLabels() {
+  return new Set([
+    ...workflowFieldKeys().map((field) => workflowFieldLabel(field)),
+    "任务单编号",
+    "版本",
+    "销售人员",
+    "流程类型",
+  ]);
+}
+
+function stripWorkflowManagedPreviewLines(bodyTemplate) {
+  const labels = workflowManagedPreviewLabels();
+  const result = [];
+  for (const line of String(bodyTemplate || "").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.includes("原流程邮件模板")) {
+      break;
+    }
+    const label = trimmed.split(/[:：]/, 1)[0]?.trim();
+    if (label && labels.has(label)) continue;
+    if (labels.has(trimmed)) continue;
+    result.push(line);
+  }
+  return result.join("\n").trim();
+}
+
+function workflowPreviewFieldLine(field) {
+  return `${workflowFieldLabel(field)}：{{${field}}}`;
+}
+
+function normalizeWorkflowRequiredFields(requiredFields) {
+  const expanded = [];
+  for (const rawField of requiredFields || []) {
+    const field = String(rawField || "").trim();
+    if (!field) continue;
+    if (field === "material_details") {
+      expanded.push("quantity_text", "material_name", "material_code");
+      continue;
+    }
+    if (field === "material_quantity") {
+      expanded.push("quantity_text");
+      continue;
+    }
+    expanded.push(field);
+  }
+  const seen = new Set();
+  return expanded.filter((field) => {
+    if (seen.has(field)) return false;
+    seen.add(field);
+    return true;
   });
-  if (!extraFields.length) return body;
-  const lines = ["流程必填信息：", ...extraFields.map((field) => `${workflowFieldLabel(field)}：{{${field}}}`)];
-  return [body, lines.join("\n")].filter(Boolean).join("\n\n");
+}
+
+function stripWorkflowBoilerplate(bodyTemplate) {
+  const boilerplate = new Set([
+    "请根据以下信息安排生产评估和排产。",
+    "请确认是否可以安排生产。如信息不足，请直接回复本邮件说明疑问点。",
+    "{{bot_signature}}",
+  ]);
+  return String(bodyTemplate || "")
+    .split("\n")
+    .filter((line) => !boilerplate.has(line.trim()))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function ensureWorkflowRequiredFieldsInBody(bodyTemplate, requiredFields) {
+  const body = stripWorkflowManagedPreviewLines(stripWorkflowGeneratedRequiredFieldBlock(bodyTemplate));
+  const groups = workflowRequiredFieldGroups(normalizeWorkflowRequiredFields(requiredFields));
+  const materialFields = groups.find((group) => group.title === "物料信息组")?.fields || [];
+  const logisticsFields = groups.find((group) => group.title === "物流信息组")?.fields || [];
+  const lines = ["请根据以下信息安排生产评估和排产。"];
+  if (materialFields.length) {
+    lines.push("");
+    lines.push("物料信息：", ...materialFields.map(workflowPreviewFieldLine));
+  }
+  if (materialFields.length && logisticsFields.length) {
+    lines.push("----------");
+  }
+  if (logisticsFields.length) {
+    if (!materialFields.length) lines.push("");
+    lines.push("物流信息：", ...logisticsFields.map(workflowPreviewFieldLine));
+  }
+  const closing = [
+    "请确认是否可以安排生产。如信息不足，请直接回复本邮件说明疑问点。",
+    "{{bot_signature}}",
+  ].join("\n\n");
+  return [stripWorkflowBoilerplate(body), lines.join("\n"), closing].filter(Boolean).join("\n\n");
+}
+
+function workflowRequiredFieldGroups(requiredFields) {
+  const fields = normalizeWorkflowRequiredFields(requiredFields);
+  const material = fields.filter((field) => WORKFLOW_MATERIAL_FIELDS.has(field));
+  const logistics = fields.filter((field) => WORKFLOW_LOGISTICS_FIELDS.has(field));
+  const grouped = new Set([...material, ...logistics]);
+  const remaining = fields.filter((field) => !grouped.has(field));
+  if (remaining.length) material.push(...remaining);
+  return [
+    { title: "物料信息组", fields: material },
+    { title: "物流信息组", fields: logistics },
+  ];
+}
+
+function renderWorkflowRequiredFieldGroups(requiredFields, readonly) {
+  return workflowRequiredFieldGroups(requiredFields)
+    .filter((group) => group.fields.length)
+    .map(
+      (group) => `
+        <div class="workflow-required-group">
+          <div class="workflow-required-group-title">${h(group.title)}</div>
+          <div class="workflow-required-group-grid">
+            ${group.fields
+              .map(
+                (field) => `
+                  <label class="check-item">
+                    <input type="checkbox" name="workflow_required_field" value="${h(field)}" checked ${readonly ? "disabled" : ""} />
+                    <span>${h(workflowFieldLabel(field))}</span>
+                  </label>`
+              )
+              .join("")}
+          </div>
+        </div>`
+    )
+    .join("") || `<div class="empty-note">当前流程未配置必填字段。</div>`;
+}
+
+function renderWorkflowPreviewBody(text) {
+  const body = String(text || "");
+  if (!body) return "";
+  const labelPattern = new RegExp(`^(${[
+    "任务单编号",
+    "版本",
+    "客户名称",
+    "销售人员",
+    "物料/规格",
+    "数量",
+    "期望交期",
+    "订单号",
+    "物料详情描述",
+    "物料编码",
+    "物料名称",
+    "物料规格",
+    "物料数量",
+    "物流发货方式",
+    "出货时间要求",
+    "客户收件信息",
+    "交付要求",
+    "出货仓",
+    "借用时间",
+    "归还时间",
+    "样机借用审批截图",
+    "物料信息",
+    "物流信息",
+  ].map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})[:：]`);
+  return body
+    .split("\n")
+    .map((line) => {
+      const escaped = h(line || " ");
+      const matched = line.match(labelPattern);
+      if (!matched) return `<div class="workflow-preview-line">${escaped}</div>`;
+      const label = matched[1];
+      const rest = line.slice(matched[0].length);
+      const delimiter = line.slice(label.length, matched[0].length);
+      return `<div class="workflow-preview-line"><span class="workflow-preview-label">${h(label)}</span>${h(delimiter)}${h(rest)}</div>`;
+    })
+    .join("");
 }
 
 function workflowPreviewContext(rule) {
@@ -1133,6 +1462,10 @@ function workflowPreviewContext(rule) {
     external_order_no: "SO-DEMO-2026001",
     workflow_name: workflowName,
     material_details: "物料编码：MAT-A001\n物料名称：示例物料A\n数量：120套",
+    material_code: "MAT-A001",
+    material_name: "示例物料A",
+    material_spec: "标准版",
+    material_quantity: "120套",
     logistics_method: "顺丰",
     shipping_time_requirement: "2026-05-18 前出货",
     customer_receiver_info: "示例省示例市示例路 88 号，张三 13800000000",
@@ -1173,7 +1506,6 @@ function productionMainEmailOptions() {
 function updateWorkflowMailPreview(ruleOrRaw = "") {
   const subjectNode = $("#workflow-mail-preview-subject");
   const bodyNode = $("#workflow-mail-preview-body");
-  const requiredNode = $("#workflow-mail-preview-required-fields");
   if (!subjectNode || !bodyNode) return;
   let rule;
   if (typeof ruleOrRaw === "string") {
@@ -1181,7 +1513,6 @@ function updateWorkflowMailPreview(ruleOrRaw = "") {
     if (!source) {
       subjectNode.textContent = "请先选择流程规则";
       bodyNode.textContent = "请先选择流程规则";
-      if (requiredNode) requiredNode.innerHTML = `<span class="empty-note">请先选择流程规则</span>`;
       return;
     }
     try {
@@ -1189,14 +1520,15 @@ function updateWorkflowMailPreview(ruleOrRaw = "") {
     } catch (error) {
       subjectNode.textContent = "JSON 解析失败";
       bodyNode.textContent = error?.message || "请检查 JSON 格式";
-      if (requiredNode) requiredNode.innerHTML = `<span class="empty-note">JSON 解析失败</span>`;
       return;
     }
   } else {
     rule = ruleOrRaw || {};
   }
   const context = workflowPreviewContext(rule);
-  const requiredFields = Array.isArray(rule?.required_fields) ? rule.required_fields.map((item) => String(item || "").trim()).filter(Boolean) : [];
+  const requiredFields = normalizeWorkflowRequiredFields(
+    Array.isArray(rule?.required_fields) ? rule.required_fields.map((item) => String(item || "").trim()).filter(Boolean) : []
+  );
   const subjectTemplate = String(rule?.subject_template || "").trim();
   const bodyTemplate = ensureWorkflowRequiredFieldsInBody(String(rule?.body_template || "").trim(), requiredFields);
   subjectNode.textContent = subjectTemplate
@@ -1205,19 +1537,16 @@ function updateWorkflowMailPreview(ruleOrRaw = "") {
   bodyNode.textContent = bodyTemplate
     ? renderTemplateWithContext(bodyTemplate, context)
     : "（未配置 body_template，保存后将使用系统默认正文模板）";
-  if (requiredNode) {
-    requiredNode.innerHTML =
-      requiredFields
-        .map((field) => `<span class="workflow-preview-field"><strong>${h(workflowFieldLabel(field))}</strong><small>${h(context[field] || "示例值")}</small></span>`)
-        .join("") || `<span class="empty-note">当前流程未勾选必填字段。</span>`;
-  }
+  bodyNode.innerHTML = renderWorkflowPreviewBody(bodyNode.textContent);
 }
 
 function syncWorkflowRuleEditorState() {
   const form = $("#workflow-rule-editor-form");
   if (!form || !workflowRulesState.editingRules) return null;
   if (workflowRulesState.readonly) return workflowRulesState.editingRules;
-  const requiredFields = [...form.querySelectorAll("#workflow-required-fields [name=workflow_required_field]:checked")].map((input) => input.value);
+  const requiredFields = normalizeWorkflowRequiredFields(
+    [...form.querySelectorAll("#workflow-required-fields [name=workflow_required_field]:checked")].map((input) => input.value)
+  );
   const toField = form.querySelector("[name=routing_to_names]");
   const toNames = toField?.tagName === "SELECT"
     ? [toField.value].filter(Boolean)
@@ -1260,7 +1589,7 @@ function renderWorkflowRuleEditor() {
   const rules = workflowRulesState.editingRules || {};
   if (!form) return;
   const readonly = Boolean(workflowRulesState.readonly);
-  const requiredFields = Array.isArray(rules.required_fields) ? rules.required_fields : [];
+  const requiredFields = normalizeWorkflowRequiredFields(Array.isArray(rules.required_fields) ? rules.required_fields : []);
   const reviewRules = Array.isArray(rules.review_rules) ? rules.review_rules : [];
   const conversationPolicy = rules.conversation_policy && typeof rules.conversation_policy === "object" ? rules.conversation_policy : {};
   const routing = rules.routing && typeof rules.routing === "object" ? rules.routing : {};
@@ -1294,16 +1623,7 @@ function renderWorkflowRuleEditor() {
   form.querySelector("[name=max_question_rounds]").disabled = readonly;
   form.querySelector("[name=conversation_exceeded_message]").value = conversationPolicy.message || "";
   form.querySelector("[name=conversation_exceeded_message]").disabled = readonly;
-  $("#workflow-required-fields").innerHTML =
-    requiredFields
-      .map(
-        (field) => `
-          <label class="check-item">
-            <input type="checkbox" name="workflow_required_field" value="${h(field)}" checked ${readonly ? "disabled" : ""} />
-            <span>${h(workflowFieldLabel(field))}</span>
-          </label>`
-      )
-      .join("") || `<div class="empty-note">当前流程未配置必填字段。</div>`;
+  $("#workflow-required-fields").innerHTML = renderWorkflowRequiredFieldGroups(requiredFields, readonly);
 
   const existingIds = new Set(reviewRules.map((rule) => String(rule.id || "")));
   const existingSignatures = new Set(reviewRules.map((rule) => reviewRuleSignature(rule)));
@@ -1613,6 +1933,8 @@ async function refreshConfig() {
   runtimeConfigState = data.configs || {};
   startupReadinessState = data.startup_readiness || { ready: false, missing: [] };
   fillForm("#runtime-mail-form", data.configs || {});
+  fillForm("#erp-config-form", data.configs || {});
+  fillForm("#crm-sync-config-form", data.configs || {});
   fillForm("#e2e-mail-form", data.configs || {});
   if (data.model) {
     fillForm("#model-form", data.model);
@@ -1621,6 +1943,12 @@ async function refreshConfig() {
   if (password) password.value = "";
   const baiduMapAk = $("#runtime-mail-form [name=baidu_map_ak]");
   if (baiduMapAk) baiduMapAk.value = "";
+  const erpAppSec = $("#erp-config-form [name=erp_app_sec]");
+  if (erpAppSec) erpAppSec.value = "";
+  const crmRequestFile = $("#crm-sync-config-form [name=crm_fxiaoke_request_file]");
+  if (crmRequestFile && !crmRequestFile.value) crmRequestFile.value = "/private/tmp/fxiaoke-sales-order-list-request.json";
+  const crmRequestJson = $("#crm-sync-config-form [name=crm_fxiaoke_request_json]");
+  if (crmRequestJson) crmRequestJson.value = "";
   document.querySelectorAll("#e2e-mail-form input[type=password]").forEach((input) => {
     input.value = "";
   });
@@ -1687,11 +2015,7 @@ async function refreshMails() {
         <div class="row clickable-row" data-mail-id="${h(row.id)}" role="button" tabindex="0" title="查看邮件详情">
           <div><strong>${h(row.subject)}</strong><br /><small>${h(row.id)}</small><br /><small>${h(row.from_address)}</small></div>
           <div><small>分类</small><br />${h(row.classification)} (${h(row.classification_confidence)})</div>
-          <div><small>任务</small><br />${
-            row.related_task_id
-              ? `<button class="link-button" type="button" data-action="jump-task" data-task-id="${h(row.related_task_id)}" data-task-no="${h(row.related_task_no || "")}">${h(row.related_task_no || row.related_task_id)}</button>`
-              : "未关联"
-          }</div>
+          <div><small>任务</small><br />${renderRelatedTaskLink(row)}</div>
           <div><small>收件时间</small><br />${h(formatTime(row.received_at || row.created_at))}</div>
         </div>`
       )
@@ -1709,11 +2033,7 @@ async function openMailDetail(mailId) {
     <div><small>收件人</small><strong>${h((detail.to || []).join(", ") || "未记录")}</strong></div>
     <div><small>抄送人</small><strong>${h((detail.cc || []).join(", ") || "无")}</strong></div>
     <div><small>分类</small><strong>${h(detail.classification || "未分类")} (${h(detail.classification_confidence ?? 0)})</strong></div>
-    <div><small>关联任务</small><strong>${
-      detail.related_task_id
-        ? `<button class="link-button" type="button" data-action="jump-task" data-task-id="${h(detail.related_task_id)}" data-task-no="${h(detail.related_task_no || "")}">${h(detail.related_task_no || detail.related_task_id)}</button>`
-        : "未关联"
-    }</strong></div>
+    <div><small>关联任务</small><strong>${renderRelatedTaskLink(detail)}</strong></div>
     <div><small>附件</small><strong>${h((detail.attachments || []).map((item) => item.file_name).join(", ") || "无")}</strong></div>
   `;
   $("#mail-detail-body").textContent = detail.body_text || "无正文内容";
@@ -1732,7 +2052,7 @@ async function openOutboundDetail(outboundId) {
     <div><small>状态</small><strong>${h(detail.status || "未记录")}</strong></div>
     <div><small>排队时间</small><strong>${h(formatTime(detail.created_at) || "未记录")}</strong></div>
     <div><small>发送时间</small><strong>${h(detail.sent_at ? formatTime(detail.sent_at) : "未发送")}</strong></div>
-    <div><small>关联任务</small><strong>${h(detail.related_task_id || "未关联")}</strong></div>
+    <div><small>关联任务</small><strong>${renderRelatedTaskLink(detail)}</strong></div>
     <div><small>关联版本</small><strong>${h(detail.related_version_id || "未关联")}</strong></div>
     <div><small>幂等键</small><strong>${h(detail.idempotency_key || "未记录")}</strong></div>
   `;
@@ -1742,6 +2062,80 @@ async function openOutboundDetail(outboundId) {
 
 function closeMailDetail() {
   $("#mail-detail-modal").hidden = true;
+}
+
+function detailField(label, value) {
+  const text = value === null || value === undefined || value === "" ? "未记录" : value;
+  return `<div><small>${h(label)}</small><strong>${h(text)}</strong></div>`;
+}
+
+function renderCrmAttachments(files = []) {
+  if (!Array.isArray(files) || !files.length) return "无";
+  return files
+    .map((item) => {
+      if (typeof item === "string") return item;
+      return item.file_name || item.name || item.filename || item.url || JSON.stringify(item);
+    })
+    .filter(Boolean)
+    .join("、") || "无";
+}
+
+async function openCrmOrderDetail(orderId) {
+  const modal = $("#crm-order-detail-modal");
+  modal.hidden = false;
+  $("#crm-order-detail-title").textContent = "订单详情";
+  $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 正在加载";
+  $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">正在读取订单详情...</div>`;
+  $("#crm-order-detail-fields").innerHTML = "";
+  $("#crm-order-detail-delivery").innerHTML = "";
+  $("#crm-order-detail-raw").textContent = "";
+
+  try {
+    const row = await api(`/api/crm/orders/${orderId}`);
+    $("#crm-order-detail-title").textContent = row.crm_order_no || row.crm_order_id || "订单详情";
+    $("#crm-order-detail-meta").textContent = `${row.source_system || "CRM"} · 同步时间 ${row.synced_at ? formatTime(row.synced_at) : "未同步"}`;
+    $("#crm-order-detail-summary").innerHTML = [
+      ["订单金额", formatAmountHtml(row.order_amount, row.currency), row.currency || "CNY"],
+      ["已回款", formatAmountHtml(row.received_amount, row.currency), "CRM 回款金额"],
+      ["待回款", formatAmountHtml(row.receivable_amount, row.currency), "订单金额 - 已回款"],
+      ["生命周期", h(row.life_status || "-"), row.approval_status || "审批状态未记录"],
+    ]
+      .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${value}</strong><small>${h(hint)}</small></div>`)
+      .join("");
+    $("#crm-order-detail-fields").innerHTML = [
+      detailField("CRM 订单 ID", row.crm_order_id),
+      detailField("销售订单编号", row.crm_order_no),
+      detailField("客户名称", row.customer_name),
+      detailField("客户 ID", row.customer_id),
+      detailField("商机", row.opportunity_name),
+      detailField("销售", row.sales_user_name),
+      detailField("部门", row.owner_department),
+      detailField("下单日期", row.order_date),
+      detailField("结算方式", row.settlement_method),
+      detailField("币种", row.currency),
+      detailField("开票金额", formatAmount(row.invoice_amount, row.currency)),
+      detailField("商品金额", formatAmount(row.product_amount, row.currency)),
+    ].join("");
+    $("#crm-order-detail-delivery").innerHTML = [
+      detailField("物流状态", row.logistics_status),
+      detailField("发货状态", row.shipment_status),
+      detailField("开票状态", row.invoice_status),
+      detailField("收货联系人", row.receipt_contact),
+      detailField("收货地址", row.receipt_address),
+      detailField("交付日期", row.delivery_date),
+      detailField("附件", renderCrmAttachments(row.attachment_files)),
+      detailField("备注", row.remark),
+    ].join("");
+    $("#crm-order-detail-raw").textContent = JSON.stringify(row.raw || row, null, 2);
+  } catch (error) {
+    $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 读取失败";
+    $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">读取失败：${h(error.message || "未知错误")}</div>`;
+    $("#crm-order-detail-raw").textContent = "";
+  }
+}
+
+function closeCrmOrderDetail() {
+  $("#crm-order-detail-modal").hidden = true;
 }
 
 async function refreshOps() {
@@ -1825,6 +2219,21 @@ function formatTime(value) {
   return date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function formatAmount(value, currency = "") {
+  if (value === null || value === undefined || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return `${value}${currency ? ` ${currency}` : ""}`;
+  return `${number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${currency ? ` ${currency}` : ""}`;
+}
+
+function formatAmountHtml(value, currency = "") {
+  const text = formatAmount(value, currency);
+  if (!currency || text === "-") return h(text);
+  const suffix = ` ${currency}`;
+  if (!text.endsWith(suffix)) return h(text);
+  return `${h(text.slice(0, -suffix.length))}<span class="metric-unit">${h(currency)}</span>`;
+}
+
 function workflowStatusLabel(status) {
   return {
     done: "已完成",
@@ -1844,10 +2253,11 @@ function compactDetail(detail) {
   return JSON.stringify(detail);
 }
 
-async function openWorkflow(id) {
-  const data = await api(`/api/tasks/${id}/workflow`);
+async function openWorkflow(id, taskType = "production") {
+  const endpoint = taskType === "logistics" ? `/api/logistics-tasks/${id}/workflow` : `/api/tasks/${id}/workflow`;
+  const data = await api(endpoint);
   const task = data.task || {};
-  $("#workflow-task-no").textContent = task.task_no || "生产任务";
+  $("#workflow-task-no").textContent = task.task_no || (taskType === "logistics" ? "物流任务" : "生产任务");
   $("#workflow-title").textContent = `${task.customer_name || "未识别客户"} · ${task.product_summary || "未识别物料"}`;
   $("#workflow-steps").innerHTML = (data.steps || [])
     .map(
@@ -1934,12 +2344,91 @@ async function loadTemplate() {
   $("#template-form [name=body_template]").value = template.body_template;
 }
 
+function renderCrmOrderSummary(summary = {}) {
+  const node = $("#crm-orders-summary");
+  if (!node) return;
+  const lastRun = summary.last_run || {};
+  const labels = [
+    ["订单总数", h(summary.total_orders || 0), "已去重入库的 CRM 销售订单"],
+    ["订单金额", formatAmountHtml(summary.total_order_amount, "CNY"), "当前库内销售订单金额合计"],
+    ["已回款", formatAmountHtml(summary.total_received_amount, "CNY"), "CRM 已回款金额合计"],
+    ["待回款", formatAmountHtml(summary.total_receivable_amount, "CNY"), "订单金额减已回款的估算值"],
+    ["最近同步", h(lastRun.status || "-"), lastRun.finished_at ? formatTime(lastRun.finished_at) : "尚无同步记录"],
+  ];
+  node.innerHTML = labels
+    .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${value}</strong><small>${h(hint)}</small></div>`)
+    .join("");
+}
+
+function renderCrmSyncRuns(runs = []) {
+  const node = $("#crm-sync-runs-list");
+  if (!node) return;
+  node.innerHTML = runs.length
+    ? runs
+        .map(
+          (run) => `
+            <div class="row crm-sync-run-row">
+              <div><strong>${h(run.status || "")}</strong><br /><small>${h(run.trigger || "")} · ${h(formatTime(run.started_at))}</small></div>
+              <div><small>合计 ${h(run.total_count || 0)} / 新增 ${h(run.created_count || 0)} / 更新 ${h(run.updated_count || 0)}</small><br /><small>未变 ${h(run.unchanged_count || 0)}</small></div>
+              <div><small>${h(run.error_message || "")}</small></div>
+            </div>
+          `
+        )
+        .join("")
+    : `<div class="row"><div>暂无同步记录</div></div>`;
+}
+
+async function refreshCrmOrders() {
+  const [listPayload, summary] = await Promise.all([
+    api(`/api/crm/orders?${queryFromState(tableStates.crmOrders)}`),
+    api("/api/crm/sync/summary"),
+  ]);
+  const data = normalizeListPayload(listPayload, tableStates.crmOrders);
+  renderCrmOrderSummary(data.summary || summary || {});
+  renderCrmSyncRuns((summary && summary.runs) || []);
+  setSelectOptions("#crm-orders-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.crmOrders.status);
+  const rows = data.items || [];
+  $("#crm-orders-list").innerHTML = rows.length
+    ? rows
+        .map(
+          (row) => `
+            <div class="row crm-order-row">
+              <div>
+                <strong>${h(row.crm_order_no || row.crm_order_id || "未编号")}</strong><br />
+                <small>${h(row.customer_name || "未识别客户")}</small>
+              </div>
+              <div>
+                <strong>${h(row.opportunity_name || "-")}</strong><br />
+                <small>${h(row.sales_user_name || "")}${row.owner_department ? ` · ${h(row.owner_department)}` : ""}</small>
+              </div>
+              <div>
+                <strong>${h(formatAmount(row.order_amount, row.currency))}</strong><br />
+                <small>回款 ${h(formatAmount(row.received_amount, row.currency))}</small>
+              </div>
+              <div>
+                <strong>${h(row.order_date || "-")}</strong><br />
+                <small>${h(row.life_status || "")}${row.approval_status ? ` · ${h(row.approval_status)}` : ""}</small>
+              </div>
+              <div>
+                <small>${h(row.synced_at ? formatTime(row.synced_at) : "")}</small><br />
+                <button class="button ghost compact-action" type="button" data-action="view-crm-order" data-id="${h(row.id)}">详情</button>
+              </div>
+            </div>
+          `
+        )
+        .join("")
+    : `<div class="row"><div>暂无 CRM 订单</div></div>`;
+  renderListPagination("#crm-orders-pagination", "crmOrders", data);
+}
+
 async function refreshAll() {
   await Promise.all([
     refreshDashboard(),
     refreshSkills(),
     refreshDepartments(),
+    refreshLogisticsDepartments(),
     refreshTasks(),
+    refreshLogisticsTasks(),
     refreshOutbound(),
     refreshExceptions(),
     refreshInitialReviewRules(),
@@ -1953,8 +2442,11 @@ async function refreshAll() {
     loadTemplate(),
     refreshProductsSpu(),
     refreshProductsSku(),
+    refreshProductsInventory(),
     refreshProductsPricing(),
     refreshProductsPromotions(),
+    refreshProductReviewReadiness(),
+    refreshCrmOrders(),
   ]);
 }
 
@@ -1962,6 +2454,8 @@ const defaultTableStates = JSON.parse(JSON.stringify(tableStates));
 const tableRefreshers = {
   workflows: refreshWorkflowRules,
   departments: refreshDepartments,
+  logisticsDepartments: refreshLogisticsDepartments,
+  logisticsTasks: refreshLogisticsTasks,
   mails: refreshMails,
   outbound: refreshOutbound,
   exceptions: refreshExceptions,
@@ -1970,6 +2464,14 @@ const tableRefreshers = {
   audit: refreshOps,
   backups: refreshOps,
   reviewRules: async () => renderInitialReviewRules(),
+  productsSpu: refreshProductsSpu,
+  productsSku: refreshProductsSku,
+  productsPricing: refreshProductsPricing,
+  productsInventory: refreshProductsInventory,
+  productsFinishedInventory: refreshProductsFinishedInventory,
+  productsPromotions: refreshProductsPromotions,
+  productsReview: refreshProductReviewReadiness,
+  crmOrders: refreshCrmOrders,
 };
 
 const clearListConfigs = {
@@ -2021,6 +2523,7 @@ document.querySelectorAll("[data-table-filter]").forEach((form) => {
       state[field.name] = String(data.get(field.name) || "").trim();
     }
     state.page = 1;
+    if (key === "productsInventory") syncFinishedInventoryFilters(true);
     await refreshTable(key);
   });
   const reset = form.querySelector("[data-filter-reset]");
@@ -2030,6 +2533,7 @@ document.querySelectorAll("[data-table-filter]").forEach((form) => {
       if (!state) return;
       const pageSize = state.page_size;
       Object.assign(state, defaultTableStates[key] || {}, { page: 1, page_size: pageSize });
+      if (key === "productsInventory") Object.assign(tableStates.productsFinishedInventory, defaultTableStates.productsFinishedInventory || {}, { page: 1 });
       form.reset();
       await refreshTable(key);
     });
@@ -2130,6 +2634,48 @@ $("#departments-list").addEventListener("click", async (event) => {
   }
   if (target.dataset.action !== "edit-department") return;
   const form = $("#department-form");
+  form.querySelector("[name=department_code]").value = row.department_code || "";
+  form.querySelector("[name=department_name]").value = row.department_name || "";
+  form.querySelector("[name=mail_to]").value = (row.mail_to || []).join(", ");
+  form.querySelector("[name=mail_cc]").value = (row.mail_cc || []).join(", ");
+  form.querySelector("[name=department_name]")?.focus();
+});
+
+$("#logistics-department-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  await api("/api/logistics-departments", {
+    method: "POST",
+    body: JSON.stringify({
+      department_code: form.get("department_code"),
+      department_name: form.get("department_name"),
+      mail_to: splitEmails(form.get("mail_to")),
+      mail_cc: splitEmails(form.get("mail_cc")),
+    }),
+  });
+  toast("物流部门邮箱已保存");
+  await refreshAll();
+});
+
+$("#logistics-departments-list").addEventListener("click", async (event) => {
+  const target = event.target.closest("button[data-action]");
+  if (!target) return;
+  const row = (logisticsDepartmentState.items || []).find((item) => item.id === target.dataset.id);
+  if (!row) return;
+  if (target.dataset.action === "delete-logistics-department") {
+    const ok = window.confirm(`确认删除物流部门“${row.department_name || row.department_code}”？`);
+    if (!ok) return;
+    try {
+      await api(`/api/logistics-departments/${target.dataset.id}`, { method: "DELETE" });
+      toast("物流部门已删除");
+      await refreshAll();
+    } catch (error) {
+      notifyError(error, ["物流邮箱", "删除失败"]);
+    }
+    return;
+  }
+  if (target.dataset.action !== "edit-logistics-department") return;
+  const form = $("#logistics-department-form");
   form.querySelector("[name=department_code]").value = row.department_code || "";
   form.querySelector("[name=department_name]").value = row.department_name || "";
   form.querySelector("[name=mail_to]").value = (row.mail_to || []).join(", ");
@@ -2507,11 +3053,14 @@ $("#workflow-rule-editor-form").addEventListener("click", async (event) => {
   }
 });
 
-$("#workflow-rule-editor-form")?.addEventListener("change", (event) => {
+function handleWorkflowRuleEditorLiveChange(event) {
   if (event.target.matches("[name=workflow_required_field], [name=routing_to_names], [name=routing_cc_names], [name=max_question_rounds], [name=conversation_exceeded_message]")) {
     syncWorkflowRuleEditorState();
   }
-});
+}
+
+$("#workflow-rule-editor-form")?.addEventListener("change", handleWorkflowRuleEditorLiveChange);
+$("#workflow-rule-editor-form")?.addEventListener("input", handleWorkflowRuleEditorLiveChange);
 
 $("#runtime-mail-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -2537,6 +3086,203 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
     await refreshAll();
   } catch (error) {
     notifyError(error, ["接入配置", "保存失败"]);
+  }
+});
+
+async function saveErpConfig() {
+  const form = new FormData($("#erp-config-form"));
+  const values = Object.fromEntries(form.entries());
+  if (!values.erp_app_sec) delete values.erp_app_sec;
+  values.erp_enabled = $("#erp-config-form [name=erp_enabled]").checked;
+  values.erp_material_sync_enabled = $("#erp-config-form [name=erp_material_sync_enabled]").checked;
+  await api("/api/config/erp", {
+    method: "PUT",
+    body: JSON.stringify(values),
+  });
+}
+
+$("#erp-config-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await saveErpConfig();
+    toast("ERP 配置已保存");
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["接入配置", "ERP 配置保存失败"]);
+  }
+});
+
+async function saveCrmConfig() {
+  const formNode = $("#crm-sync-config-form");
+  const form = new FormData(formNode);
+  const values = Object.fromEntries(form.entries());
+  if (!values.crm_fxiaoke_request_json) delete values.crm_fxiaoke_request_json;
+  values.crm_sync_enabled = formNode.elements.crm_sync_enabled.checked;
+  await api("/api/config/crm", {
+    method: "PUT",
+    body: JSON.stringify(values),
+  });
+}
+
+$("#crm-sync-config-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await saveCrmConfig();
+    toast("CRM 同步配置已保存");
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["订单管理", "CRM 配置保存失败"]);
+  }
+});
+
+function openCrmSyncPopover() {
+  const popover = $("#crm-sync-popover");
+  if (!popover) return;
+  popover.hidden = false;
+}
+
+function closeCrmSyncPopover() {
+  const popover = $("#crm-sync-popover");
+  if (!popover) return;
+  popover.hidden = true;
+}
+
+$("#crm-sync-settings-open")?.addEventListener("click", (event) => {
+  event.preventDefault();
+  const popover = $("#crm-sync-popover");
+  if (!popover) return;
+  if (popover.hidden) openCrmSyncPopover();
+  else closeCrmSyncPopover();
+});
+
+$("#crm-sync-settings-close")?.addEventListener("click", closeCrmSyncPopover);
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeCrmSyncPopover();
+});
+
+document.addEventListener("click", (event) => {
+  const popover = $("#crm-sync-popover");
+  const button = $("#crm-sync-settings-open");
+  if (!popover || popover.hidden) return;
+  if (event.target.id === "crm-sync-popover") {
+    closeCrmSyncPopover();
+    return;
+  }
+  if (button?.contains(event.target)) return;
+});
+
+async function runCrmSyncAction(endpoint, pendingText) {
+  const resultNode = $("#crm-sync-result");
+  if (resultNode) {
+    resultNode.classList.add("show");
+    resultNode.textContent = pendingText;
+  }
+  try {
+    await saveCrmConfig();
+    const result = await api(endpoint, { method: "POST" });
+    if (resultNode) resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.message || "CRM 同步已触发");
+    await refreshCrmOrders();
+  } catch (error) {
+    notifyError(error, ["订单管理", "CRM 同步失败"]);
+    if (resultNode) resultNode.textContent = messageFromError(error);
+  }
+}
+
+$("#crm-sync-queue")?.addEventListener("click", async () => {
+  await runCrmSyncAction("/api/crm/sync/queue", "正在投递 CRM 订单同步任务...");
+});
+
+$("#crm-sync-run")?.addEventListener("click", async () => {
+  await runCrmSyncAction("/api/crm/sync/run", "正在直接同步 CRM 订单，可能需要几十秒...");
+});
+
+$("#test-erp-connection").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const resultNode = $("#erp-test-result");
+  button.disabled = true;
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在保存配置并测试金蝶登录鉴权...";
+  try {
+    await saveErpConfig();
+    const result = await api("/api/erp/test-connection", { method: "POST" });
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? "ERP 连接成功" : "ERP 连接失败");
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["接入配置", "ERP 连接测试失败"]);
+    resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#erp-query-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#run-erp-query");
+  const resultNode = $("#erp-query-result");
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  values.limit = Number(values.limit || 20);
+  values.start_row = Number(values.start_row || 0);
+  button.disabled = true;
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在调用金蝶只读查询...";
+  try {
+    const result = await api("/api/erp/query", {
+      method: "POST",
+      body: JSON.stringify(values),
+    });
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? `ERP 查询成功，返回 ${(result.items || []).length} 行` : "ERP 查询失败");
+  } catch (error) {
+    notifyError(error, ["接入配置", "ERP 查询失败"]);
+    resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#erp-material-search-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const resultNode = $("#erp-material-search-result");
+  const form = event.currentTarget;
+  const values = Object.fromEntries(new FormData(form).entries());
+  const params = new URLSearchParams({
+    q: values.q || "",
+    limit: values.limit || "20",
+    include_erp: form.elements.include_erp.checked ? "true" : "false",
+  });
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在查询物料...";
+  try {
+    const result = await api(`/api/erp/materials?${params.toString()}`);
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(`物料查询返回 ${result.total || 0} 条`);
+  } catch (error) {
+    notifyError(error, ["接入配置", "ERP 物料查询失败"]);
+    resultNode.textContent = messageFromError(error);
+  }
+});
+
+$("#erp-inventory-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const resultNode = $("#erp-inventory-result");
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const params = new URLSearchParams({
+    material_code: values.material_code || "",
+    warehouse_code: values.warehouse_code || "",
+    limit: values.limit || "50",
+  });
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在查询 ERP 即时库存...";
+  try {
+    const result = await api(`/api/erp/inventory?${params.toString()}`);
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? `库存查询返回 ${result.total || 0} 条` : "库存查询失败");
+  } catch (error) {
+    notifyError(error, ["接入配置", "ERP 库存查询失败"]);
+    resultNode.textContent = messageFromError(error);
   }
 });
 
@@ -2662,6 +3408,18 @@ $("#dashboard-insights")?.addEventListener("click", (event) => {
 
 $("#outbound-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");
+  if (target?.dataset.action === "jump-task") {
+    event.preventDefault();
+    event.stopPropagation();
+    await guardedAction(["外发", "跳转任务"], async () => jumpToTask(target.dataset.taskId, target.dataset.taskNo));
+    return;
+  }
+  if (target?.dataset.action === "jump-logistics-task") {
+    event.preventDefault();
+    event.stopPropagation();
+    await guardedAction(["外发", "跳转物流任务"], async () => jumpToLogisticsTask(target.dataset.taskId, target.dataset.taskNo));
+    return;
+  }
   if (target?.dataset.action === "retry-outbound") {
     await guardedAction(["外发", "重新入队"], async () => {
       await api(`/api/outbound-mails/${target.dataset.id}/retry`, { method: "POST" });
@@ -2862,6 +3620,13 @@ $("#mails-list")?.addEventListener("click", async (event) => {
     await guardedAction(["邮件", "跳转任务"], async () => jumpToTask(jumpButton.dataset.taskId, jumpButton.dataset.taskNo));
     return;
   }
+  const logisticsJumpButton = event.target.closest("[data-action='jump-logistics-task']");
+  if (logisticsJumpButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    await guardedAction(["邮件", "跳转物流任务"], async () => jumpToLogisticsTask(logisticsJumpButton.dataset.taskId, logisticsJumpButton.dataset.taskNo));
+    return;
+  }
   const row = event.target.closest("[data-mail-id]");
   if (!row) return;
   await guardedAction(["邮件", "详情"], async () => openMailDetail(row.dataset.mailId));
@@ -2869,8 +3634,13 @@ $("#mails-list")?.addEventListener("click", async (event) => {
 
 $("#mail-detail-fields")?.addEventListener("click", async (event) => {
   const jumpButton = event.target.closest("[data-action='jump-task']");
-  if (!jumpButton) return;
+  const logisticsJumpButton = event.target.closest("[data-action='jump-logistics-task']");
+  if (!jumpButton && !logisticsJumpButton) return;
   event.preventDefault();
+  if (logisticsJumpButton) {
+    await guardedAction(["邮件", "跳转物流任务"], async () => jumpToLogisticsTask(logisticsJumpButton.dataset.taskId, logisticsJumpButton.dataset.taskNo));
+    return;
+  }
   await guardedAction(["邮件", "跳转任务"], async () => jumpToTask(jumpButton.dataset.taskId, jumpButton.dataset.taskNo));
 });
 
@@ -2904,6 +3674,27 @@ $("#tasks").addEventListener("click", async (event) => {
   }
 });
 
+$("#logistics-tasks-list")?.addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  const id = target.dataset.id;
+  const action = target.dataset.action;
+  if (action === "workflow") {
+    await openWorkflow(id, "logistics");
+    return;
+  }
+  if (action === "manual-close-logistics-task") {
+    const note = window.prompt("关闭说明", "商务人工强制关闭物流任务");
+    if (note === null) return;
+    await api(`/api/logistics-tasks/${id}/manual-close`, {
+      method: "POST",
+      body: JSON.stringify({ note: note.trim() }),
+    });
+    toast("物流任务已手动关闭，并已通知销售和物流");
+    await refreshAll();
+  }
+});
+
 $("#workflow-close").addEventListener("click", closeWorkflow);
 $("#workflow-modal").addEventListener("click", (event) => {
   if (event.target.id === "workflow-modal") closeWorkflow();
@@ -2933,6 +3724,21 @@ $("#weekly-preview-modal").addEventListener("click", (event) => {
 $("#mail-detail-close")?.addEventListener("click", closeMailDetail);
 $("#mail-detail-modal")?.addEventListener("click", (event) => {
   if (event.target.id === "mail-detail-modal") closeMailDetail();
+});
+
+$("#crm-order-detail-close")?.addEventListener("click", closeCrmOrderDetail);
+$("#crm-order-detail-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "crm-order-detail-modal") closeCrmOrderDetail();
+});
+
+$("#inventory-detail-close")?.addEventListener("click", closeInventoryDetail);
+$("#inventory-detail-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "inventory-detail-modal") closeInventoryDetail();
+});
+
+$("#inventory-classification-close")?.addEventListener("click", closeInventoryClassificationDiagnostics);
+$("#inventory-classification-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "inventory-classification-modal") closeInventoryClassificationDiagnostics();
 });
 
 
@@ -2994,26 +3800,420 @@ function formatE2EResult(result) {
 // Product Management Logic
 // ==========================================
 
+function productLookupKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function cacheProductSpuRows(rows = []) {
+  window._productSpuRows = window._productSpuRows || {};
+  window._productSpuRowsByCode = window._productSpuRowsByCode || {};
+  rows.forEach((row) => {
+    window._productSpuRows[row.id] = row;
+    window._productSpuRowsByCode[productLookupKey(row.spu_id)] = row;
+  });
+}
+
+function cacheProductSkuRows(rows = []) {
+  window._productSkuRows = window._productSkuRows || {};
+  window._productSkuRowsByCode = window._productSkuRowsByCode || {};
+  rows.forEach((row) => {
+    if (row.binding_status && row.binding_status !== "ok") return;
+    const skuUuid = row.sku_uuid || row.id;
+    if (!skuUuid || !row.sku_id) return;
+    const cached = { ...row, id: skuUuid };
+    window._productSkuRows[skuUuid] = cached;
+    window._productSkuRowsByCode[productLookupKey(row.sku_id)] = cached;
+  });
+}
+
 async function refreshProductsSpu() {
   const data = await api(`/api/products/spu?${queryFromState(tableStates.productsSpu)}`);
   const rows = data.items || [];
+  cacheProductSpuRows(rows);
   $("#products-spu-list").innerHTML = rows.map(row => `
     <div class="row product-row">
       <div><strong>${h(row.spu_id)}</strong><br /><small>${h(row.name)}</small></div>
-      <div><small>${h(row.brand || "-")}</small><br /><small>${h(row.category || "-")}</small></div>
-      <div><small>${h(formatTime(row.created_at))}</small></div>
+      <div><small>${h(row.brand || "-")}</small><br /><small>${h(row.category || "-")} · 别名 ${h((row.review_aliases || []).length)}</small></div>
+      <div><small>${h(formatTime(row.created_at))}</small><br /><a href="#" class="link" data-action="edit-product-aliases" data-id="${h(row.id)}">维护预审别名</a></div>
     </div>
   `).join("") || `<div class="row product-row product-empty-row"><div>暂无 SPU 数据</div></div>`;
   renderListPagination("#products-spu-pagination", "productsSpu", data);
 }
 
+async function refreshProductSpuSuggestions(q = "") {
+  const node = $("#products-spu-suggestions");
+  if (!node) return;
+  const requestSeq = ++productSpuSuggestSeq;
+  const params = new URLSearchParams({
+    q: String(q || "").trim(),
+    page: "1",
+    page_size: "50",
+  });
+  const data = await api(`/api/products/spu?${params}`);
+  if (requestSeq !== productSpuSuggestSeq) return;
+  cacheProductSpuRows(data.items || []);
+  node.innerHTML = (data.items || []).map((row) => {
+    const code = row.spu_id || "";
+    const name = row.name || "";
+    const aliases = (row.review_aliases || []).slice(0, 2).join(" / ");
+    const label = [code, name, aliases ? `别名 ${aliases}` : ""].filter(Boolean).join(" · ");
+    return `<option value="${h(code)}" label="${h(label)}">${h(label)}</option>`;
+  }).join("");
+}
+
+function queueProductSpuSuggestions(value = "") {
+  window.clearTimeout(productSpuSuggestTimer);
+  productSpuSuggestTimer = window.setTimeout(() => {
+    guardedAction(["成品 SPU", "联想"], async () => refreshProductSpuSuggestions(value));
+  }, 160);
+}
+
+async function resolveProductSpuLookup(form) {
+  const hidden = form.elements.spu_uuid;
+  const input = form.elements.spu_lookup;
+  if (!input) return hidden?.value || "";
+  const value = String(input.value || "").trim();
+  if (!value) throw new Error("请选择所属成品 SPU");
+  const cached = window._productSpuRowsByCode?.[productLookupKey(value)];
+  if (cached) {
+    hidden.value = cached.id;
+    input.value = cached.spu_id;
+    return cached.id;
+  }
+  const data = await api(`/api/products/spu?${new URLSearchParams({ q: value, page: "1", page_size: "1" })}`);
+  const row = (data.items || [])[0];
+  if (!row) throw new Error(`未找到成品 SPU：${value}`);
+  cacheProductSpuRows([row]);
+  hidden.value = row.id;
+  input.value = row.spu_id;
+  return row.id;
+}
+
+async function refreshProductSkuSuggestions(q = "") {
+  const node = $("#products-sku-suggestions");
+  if (!node) return;
+  const requestSeq = ++productSkuSuggestSeq;
+  const params = new URLSearchParams({
+    q: String(q || "").trim(),
+    page: "1",
+    page_size: "50",
+  });
+  const data = await api(`/api/products/sku?${params}`);
+  if (requestSeq !== productSkuSuggestSeq) return;
+  cacheProductSkuRows(data.items || []);
+  node.innerHTML = (data.items || []).map((row) => {
+    const sku = row.sku_id || "";
+    const spu = [row.spu_id || "", row.spu_name || ""].filter(Boolean).join(" · ");
+    const aliases = (row.review_aliases || []).slice(0, 2).join(" / ");
+    const label = [sku, spu, aliases ? `别名 ${aliases}` : ""].filter(Boolean).join(" · ");
+    return `<option value="${h(sku)}" label="${h(label)}">${h(label)}</option>`;
+  }).join("");
+}
+
+function queueProductSkuSuggestions(value = "") {
+  window.clearTimeout(productSkuSuggestTimer);
+  productSkuSuggestTimer = window.setTimeout(() => {
+    guardedAction(["成品 SKU", "联想"], async () => refreshProductSkuSuggestions(value));
+  }, 160);
+}
+
+async function resolveProductSkuLookup(form) {
+  const hidden = form.elements.sku_uuid;
+  const input = form.elements.sku_lookup;
+  if (!input) return hidden?.value || "";
+  const value = String(input.value || "").trim();
+  if (!value) throw new Error("请选择成品 SKU");
+  const cached = window._productSkuRowsByCode?.[productLookupKey(value)];
+  if (cached) {
+    hidden.value = cached.id;
+    input.value = cached.sku_id;
+    return cached.id;
+  }
+  const data = await api(`/api/products/sku?${new URLSearchParams({ q: value, page: "1", page_size: "1" })}`);
+  const row = (data.items || [])[0];
+  if (!row) throw new Error(`未找到成品 SKU：${value}`);
+  cacheProductSkuRows([row]);
+  hidden.value = row.id;
+  input.value = row.sku_id;
+  return row.id;
+}
+
+function formatProductReviewPrice(value) {
+  if (value === null || value === undefined || value === "") return "未识别";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return `${(number / 100).toFixed(2)} 元`;
+}
+
+function formatProductMoney(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return `${(number / 100).toFixed(2)} 元`;
+}
+
+function centsToAmountInput(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return (number / 100).toFixed(2);
+}
+
+function amountInputToCents(value, label) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const number = Number(text);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`${label}请输入有效金额`);
+  }
+  return Math.round(number * 100);
+}
+
+function formatPromotionDiscount(row) {
+  if (!row) return "-";
+  if (row.discount_type === "fixed_amount") return formatProductMoney(row.discount_value);
+  return `${h(row.discount_value)}%`;
+}
+
+function promotionDiscountInputValue(row) {
+  if (!row) return "";
+  if (row.discount_type === "fixed_amount") return centsToAmountInput(row.discount_value);
+  return row.discount_value ?? "";
+}
+
+function productReviewStatusLabel(status) {
+  if (status === "Pass") return "通过";
+  if (status === "Warning") return "提醒";
+  if (status === "Exception") return "异常";
+  return status || "未审查";
+}
+
+function productReviewStatusClass(status) {
+  if (status === "Pass") return "is-active";
+  if (status === "Warning") return "is-warn";
+  if (status === "Exception") return "is-danger";
+  return "is-muted";
+}
+
+function productReviewIssueLabel(type) {
+  if (type === "missing_price") return "缺价格规则";
+  if (type === "incomplete_price") return "价格不完整";
+  if (type === "duplicate_alias") return "重复别名";
+  if (type === "missing_alias") return "缺人工别名";
+  if (type === "invalid_promotion") return "促销未绑定";
+  if (type === "duplicate_promotion") return "促销重复";
+  return type || "待处理";
+}
+
+async function refreshProductReviewReadiness() {
+  const summaryNode = $("#products-review-readiness-summary");
+  const listNode = $("#products-review-readiness-list");
+  if (!summaryNode || !listNode) return;
+  const channel = $("#products-review-preview-form input[name='channel']")?.value || "default";
+  summaryNode.innerHTML = `<div class="metric"><small>体检</small><strong>...</strong></div>`;
+  listNode.innerHTML = `<div class="review-preview-row"><div class="empty-note">正在检查预审准备度...</div></div>`;
+  const params = new URLSearchParams({ channel, limit: "20" });
+  const data = await api(`/api/products/review-readiness?${params}`);
+  const summary = data.summary || {};
+  summaryNode.innerHTML = `
+    <div class="metric ${summary.blocker_count ? "danger" : ""}"><small>准备度</small><strong>${h(summary.score ?? 0)}</strong></div>
+    <div class="metric ${summary.blocker_count ? "warn" : ""}"><small>阻断项</small><strong>${h(summary.blocker_count || 0)}</strong></div>
+    <div class="metric"><small>建议项</small><strong>${h(summary.warning_count || 0)}</strong></div>
+    <div class="metric"><small>成品 SKU</small><strong>${h(summary.finished_sku_count || 0)}</strong></div>
+  `;
+  const issues = data.issues || [];
+  window._productSpuRows = window._productSpuRows || {};
+  issues.forEach((issue) => {
+    if (issue.spu_uuid) {
+      window._productSpuRows[issue.spu_uuid] = {
+        id: issue.spu_uuid,
+        spu_id: issue.spu_id,
+        name: issue.product_name,
+        review_aliases: issue.review_aliases || [],
+      };
+    }
+  });
+  listNode.innerHTML = issues.map(issue => `
+    <div class="review-preview-row">
+      <div>
+        <strong>${h(productReviewIssueLabel(issue.issue_type))}</strong>
+        <br /><small>${h(issue.message || "-")}</small>
+      </div>
+      <div><strong>${h(issue.sku_id || issue.spu_id || issue.alias || "-")}</strong><br /><small>${h(issue.product_name || issue.channel || "-")}</small></div>
+      <div>
+        <span class="status-pill ${issue.severity === "blocker" ? "is-danger" : "is-warn"}">${h(issue.severity === "blocker" ? "需处理" : "建议")}</span>
+        ${issue.action === "configure_pricing" && issue.sku_uuid ? `<br /><button class="button ghost compact-action" type="button" data-action="quick-new-pricing" data-sku-uuid="${h(issue.sku_uuid)}" data-sku-id="${h(issue.sku_id || "")}" data-channel="${h(issue.channel || "default")}">配置价格规则</button>` : ""}
+        ${(issue.action === "configure_alias" || issue.action === "review_alias") && issue.spu_uuid ? `<br /><button class="button ghost compact-action" type="button" data-action="edit-product-aliases" data-id="${h(issue.spu_uuid)}">维护预审别名</button>` : ""}
+        ${issue.action === "configure_promotion" ? `<br /><button class="button ghost compact-action" type="button" data-action="goto-promotions" data-q="${h(issue.promotion_name || issue.promotion_id || "")}">维护促销规则</button>` : ""}
+      </div>
+    </div>
+  `).join("") || `<div class="review-preview-row"><div class="empty-note">当前渠道未发现会影响预审的体检项。</div></div>`;
+}
+
+function renderProductReviewPreview(result) {
+  const node = $("#products-review-preview-result");
+  if (!node) return;
+  const items = result.items || [];
+  const summary = result.summary || {};
+  if (!items.length) {
+    const suggestions = result.suggestions || [];
+    const aliasCandidate = result.alias_candidate || "";
+    node.innerHTML = `
+      <div class="product-review-summary">
+        <div class="metric warn"><small>匹配结果</small><strong>0</strong></div>
+        <div class="metric"><small>候选成品</small><strong>${h(suggestions.length)}</strong></div>
+        <div class="metric"><small>建议别名</small><strong>${h(aliasCandidate || "-")}</strong></div>
+      </div>
+      <div class="empty-note">未匹配到成品库存中的 SKU。可以从候选成品中选择一个，确认后把当前叫法维护为预审别名。</div>
+      ${suggestions.length ? `
+        <div class="review-preview-list">
+          ${suggestions.map(item => `
+            <div class="review-preview-row">
+              <div><strong>${h(item.spu_id)}</strong><br /><small>${h(item.name || "-")}</small></div>
+              <div><strong>${h(item.sku_id || "-")}</strong><br /><small>相似：${h(item.matched_alias || "-")}</small></div>
+              <div>
+                <button class="button ghost" type="button" data-action="use-review-alias-suggestion" data-id="${h(item.id)}" data-alias="${h(item.suggested_alias || aliasCandidate)}">维护为别名</button>
+                <br /><small>当前别名 ${h((item.review_aliases || []).length)} 个</small>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+    `;
+    return;
+  }
+  const riskFlags = summary.risk_flags || [];
+  node.innerHTML = `
+    <div class="product-review-summary">
+      <div class="metric"><small>匹配 SKU</small><strong>${h(summary.matched_count || items.length)}</strong></div>
+      <div class="metric ${riskFlags.length ? "warn" : ""}"><small>风险提示</small><strong>${h(riskFlags.length)}</strong></div>
+      <div class="metric"><small>渠道</small><strong>${h(result.channel || "default")}</strong></div>
+    </div>
+    ${riskFlags.length ? `<div class="review-risk-list">${riskFlags.map(flag => `<span>${h(flag)}</span>`).join("")}</div>` : ""}
+    <div class="review-preview-list">
+      ${items.map(item => {
+        const review = item.review || {};
+        const flags = review.risk_flags || [];
+        return `
+          <div class="review-preview-row">
+            <div>
+              <strong>${h(item.sku_id || item.sku_code || "未识别 SKU")}</strong>
+              <br /><small>${h(item.product_name || item.spu_id || "-")}</small>
+              <br /><small>${h(item.match_source === "product_alias" ? "别名匹配" : "SKU 编码匹配")}：${h(item.match_alias || "-")}</small>
+            </div>
+            <div><strong>${h(formatProductReviewPrice(item.unit_price))}</strong><br /><small>识别单价</small></div>
+            <div>
+              <span class="status-pill ${h(productReviewStatusClass(review.status))}">${h(productReviewStatusLabel(review.status))}</span>
+              <br /><small>${flags.length ? h(flags.join("；")) : "价格/促销规则未发现风险"}</small>
+              ${item.sku_uuid ? `<br /><button class="button ghost compact-action" type="button" data-action="quick-new-pricing" data-sku-uuid="${h(item.sku_uuid)}" data-sku-id="${h(item.sku_id || item.sku_code || "")}" data-channel="${h(result.channel || "default")}" data-unit-price="${h(item.unit_price || "")}" data-pricing-configured="${item.pricing_configured ? "true" : "false"}">${item.pricing_configured ? "调整价格规则" : "配置价格规则"}</button>` : ""}
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function openProductAliasModal(spuId) {
+  const row = window._productSpuRows?.[spuId];
+  if (!row) return;
+  const form = $("#product-alias-form");
+  if (!form) return;
+  form.spu_uuid.value = row.id || "";
+  form.spu_label.value = `${row.spu_id || ""} · ${row.name || ""}`;
+  form.aliases.value = (row.review_aliases || []).join("\n");
+  $("#product-alias-title").textContent = `维护预审别名 · ${row.spu_id || ""}`;
+  openModal("#product-alias-modal");
+}
+
+function openProductAliasSuggestion(spuId, alias) {
+  const row = window._productSpuRows?.[spuId];
+  if (!row) return;
+  openProductAliasModal(spuId);
+  const form = $("#product-alias-form");
+  const current = String(form.aliases.value || "")
+    .split(/\n+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+  const normalized = (value) => String(value || "").trim().toLowerCase().replace(/[\s_\-/,，、:：;；|()（）\[\]【】"“”'‘’]+/g, "");
+  if (alias && !current.some(item => normalized(item) === normalized(alias))) {
+    form.aliases.value = [...current, alias].join("\n");
+  }
+  form.aliases.focus();
+}
+
+function openProductPricingModal({ skuUuid, skuId = "", channel = "default", unitPrice = "", pricingConfigured = false } = {}) {
+  const form = $("#product-pricing-form");
+  if (!form || !skuUuid) return;
+  form.reset();
+  form.elements.sku_uuid.value = skuUuid;
+  form.elements.sku_lookup.value = skuId || skuUuid;
+  form.elements.channel.value = channel || "default";
+  if (unitPrice && !pricingConfigured) {
+    form.elements.map_price.value = centsToAmountInput(unitPrice);
+    form.elements.tier_a_price.value = centsToAmountInput(unitPrice);
+  }
+  $("#product-pricing-title").textContent = `${pricingConfigured ? "调整" : "配置"}渠道价格${skuId ? ` · ${skuId}` : ""}`;
+  openModal("#product-pricing-modal");
+}
+
+$("#products-spu-filter-form input[list='products-spu-suggestions']")?.addEventListener("focus", (event) => {
+  queueProductSpuSuggestions(event.currentTarget.value);
+});
+
+$("#products-spu-filter-form input[list='products-spu-suggestions']")?.addEventListener("input", (event) => {
+  queueProductSpuSuggestions(event.currentTarget.value);
+});
+
+$("#product-sku-form input[list='products-spu-suggestions']")?.addEventListener("focus", (event) => {
+  queueProductSpuSuggestions(event.currentTarget.value);
+});
+
+$("#product-sku-form input[list='products-spu-suggestions']")?.addEventListener("input", (event) => {
+  $("#product-sku-form").elements.spu_uuid.value = "";
+  queueProductSpuSuggestions(event.currentTarget.value);
+});
+
+document.querySelectorAll('input[list="products-sku-suggestions"]').forEach((input) => {
+  input.addEventListener("focus", () => queueProductSkuSuggestions(input.value));
+  input.addEventListener("input", () => {
+    const form = input.closest("form");
+    if (form?.elements?.sku_uuid) form.elements.sku_uuid.value = "";
+    queueProductSkuSuggestions(input.value);
+  });
+});
+
+$("#products-review-readiness-refresh")?.addEventListener("click", async () => {
+  await guardedAction(["物料中心", "刷新预审体检"], async () => refreshProductReviewReadiness());
+});
+
+$("#sync-erp-materials")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const resultNode = $("#erp-material-sync-result");
+  button.disabled = true;
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在从 ERP 同步物料...";
+  try {
+    const result = await api("/api/products/erp-sync", { method: "POST" });
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? `ERP 物料同步完成：${result.total || 0} 条` : "ERP 物料同步未执行");
+    await Promise.all([refreshProductsSpu(), refreshProductsSku()]);
+  } catch (error) {
+    notifyError(error, ["物料中心", "ERP 物料同步失败"]);
+    resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function refreshProductsSku() {
   const data = await api(`/api/products/sku?${queryFromState(tableStates.productsSku)}`);
   const rows = data.items || [];
+  cacheProductSkuRows(rows);
   $("#products-sku-list").innerHTML = rows.map(row => `
     <div class="row product-row">
       <div><strong>${h(row.sku_id)}</strong><br /><small>${h(JSON.stringify(row.attributes))}</small></div>
-      <div><a href="#" class="link" data-action="goto-spu" data-spu="${h(row.spu_id)}">${h(row.spu_id)}</a></div>
+      <div><a href="#" class="link" data-action="goto-spu" data-spu="${h(row.spu_id)}">${h(row.spu_id)}</a><br /><small>${h(row.spu_name || "")}</small></div>
       <div><small>${h(row.status)}</small><br /><a href="#" class="link" data-action="quick-new-pricing" data-sku-uuid="${h(row.id)}" data-sku-id="${h(row.sku_id)}">配置价格</a></div>
       <div><small>${h(formatTime(row.created_at))}</small></div>
     </div>
@@ -3021,17 +4221,382 @@ async function refreshProductsSku() {
   renderListPagination("#products-sku-pagination", "productsSku", data);
 }
 
+function inventoryAlertLabel(level) {
+  if (level === "zero") return "无库存";
+  if (level === "low") return "低库存";
+  return "正常";
+}
+
+function inventoryMeasureLabel(type) {
+  if (type === "length") return "按长度计物料";
+  if (type === "weight") return "按重量计物料";
+  if (type === "other") return "其他非统计类";
+  return "可计数物料";
+}
+
+async function refreshInventoryWarehouseSuggestions(q = "") {
+  const node = $("#inventory-warehouse-suggestions");
+  if (!node) return;
+  const requestSeq = ++inventoryWarehouseSuggestSeq;
+  const params = new URLSearchParams({ q: String(q || "").trim(), limit: "50" });
+  const data = await api(`/api/products/inventory/warehouses?${params}`);
+  if (requestSeq !== inventoryWarehouseSuggestSeq) return;
+  node.innerHTML = (data.items || []).map((row) => {
+    const code = row.warehouse_code || "";
+    const name = row.warehouse_name || "";
+    const label = row.label || [code, name].filter(Boolean).join(" · ");
+    return `<option value="${h(code)}" label="${h(label)}">${h(label)}</option>`;
+  }).join("");
+}
+
+function queueInventoryWarehouseSuggestions(value = "") {
+  window.clearTimeout(inventoryWarehouseSuggestTimer);
+  inventoryWarehouseSuggestTimer = window.setTimeout(() => {
+    guardedAction(["库存管理", "仓库联想"], async () => refreshInventoryWarehouseSuggestions(value));
+  }, 160);
+}
+
+document.querySelectorAll('input[list="inventory-warehouse-suggestions"]').forEach((input) => {
+  input.addEventListener("focus", () => queueInventoryWarehouseSuggestions(input.value));
+  input.addEventListener("input", () => queueInventoryWarehouseSuggestions(input.value));
+});
+
+function syncFinishedInventoryFilters(resetPage = false) {
+  const source = tableStates.productsInventory;
+  const target = tableStates.productsFinishedInventory;
+  if (!source || !target) return;
+  for (const key of ["q", "warehouse_code", "low_stock_only", "threshold"]) {
+    target[key] = source[key] || "";
+  }
+  target.countable_only = "false";
+  target.measure_type = "";
+  target.inventory_scope = "finished";
+  if (resetPage) target.page = 1;
+}
+
+function renderInventorySummary(selector, summary, totalLabel) {
+  const node = $(selector);
+  if (!node) return;
+  node.innerHTML = `
+    <div class="metric"><small>库存记录</small><strong>${h(summary.total_rows || 0)}</strong></div>
+    <div class="metric warn"><small>预警记录</small><strong>${h(summary.low_stock_count || 0)}</strong></div>
+    <div class="metric danger"><small>零库存记录</small><strong>${h(summary.zero_stock_count || 0)}</strong></div>
+    <div class="metric"><small>${h(totalLabel)}</small><strong>${h(summary.total_base_qty || 0)}</strong></div>
+  `;
+}
+
+function renderInventoryTypeRows(listSelector, rows, emptyText, tableKey, itemLabel = "物料") {
+  const node = $(listSelector);
+  if (!node) return;
+  node.innerHTML = rows.map(row => `
+    <div class="row product-row clickable-row" role="button" tabindex="0" title="查看该类型下的库存明细" data-action="open-inventory-detail" data-table-key="${h(tableKey)}" data-material-type="${h(row.material_type)}" data-parent-category="${h(row.parent_category || "")}">
+      <div><strong>${h(row.material_type)}</strong><br /><small>大类：${h(row.parent_category || "未分类")}</small></div>
+      <div><strong>${h(row.material_count)} 个${h(itemLabel)}</strong><br /><small>${h(row.inventory_row_count)} 条库存记录 / ${h(row.warehouse_count)} 个仓库</small></div>
+      <div><strong>${h(row.base_qty)}</strong><br /><small>辅助数量 ${h(row.qty)}</small></div>
+      <div><span class="status-pill ${row.alert_level === "ok" ? "is-active" : "is-warn"}">${h(inventoryAlertLabel(row.alert_level))}</span><br /><small>无库存记录 ${h(row.zero_stock_count)} / 低库存记录 ${h(row.low_stock_count)} · ${h(formatTime(row.synced_at))}</small></div>
+    </div>
+  `).join("") || `<div class="row product-row product-empty-row"><div>${h(emptyText)}</div></div>`;
+}
+
+async function refreshProductsInventory() {
+  syncFinishedInventoryFilters();
+  const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsInventory)}`);
+  const rows = data.items || [];
+  const summary = data.summary || {};
+  renderInventorySummary("#products-inventory-summary", summary, `${inventoryMeasureLabel(summary.measure_type)}合计`);
+  renderInventoryTypeRows("#products-inventory-list", rows, "暂无非成品库存数据，请先同步 ERP 库存", "productsInventory", "物料");
+  renderListPagination("#products-inventory-pagination", "productsInventory", data);
+  await refreshProductsFinishedInventory();
+}
+
+async function refreshProductsFinishedInventory() {
+  syncFinishedInventoryFilters();
+  const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsFinishedInventory)}`);
+  const rows = data.items || [];
+  const summary = data.summary || {};
+  renderInventorySummary("#products-finished-inventory-summary", summary, "成品库存合计");
+  renderInventoryTypeRows("#products-finished-inventory-list", rows, "暂无成品库存数据，请先同步 ERP 库存", "productsFinishedInventory", "成品");
+  renderListPagination("#products-finished-inventory-pagination", "productsFinishedInventory", data);
+}
+
+async function openInventoryDetail(materialType, parentCategory = "", page = 1, tableKey = "productsInventory") {
+  const modal = $("#inventory-detail-modal");
+  if (!modal || !materialType) return;
+  const sourceState = tableStates[tableKey] || tableStates.productsInventory;
+  inventoryDetailState = {
+    table_key: tableKey,
+    material_type: materialType,
+    parent_category: parentCategory,
+    q: "",
+    warehouse_code: sourceState.warehouse_code || "",
+    stock_status: sourceState.low_stock_only ? "low" : "",
+    page,
+    page_size: inventoryDetailState?.page_size || 100,
+  };
+  $("#inventory-detail-title").textContent = materialType;
+  $("#inventory-detail-meta").textContent = parentCategory ? `库存管理 · ${parentCategory}` : "库存管理";
+  $("#inventory-detail-summary").innerHTML = `<div class="empty-note">正在加载库存明细...</div>`;
+  $("#inventory-detail-list").innerHTML = "";
+  $("#inventory-detail-pagination").innerHTML = "";
+  syncInventoryDetailFilterForm();
+  modal.hidden = false;
+  await refreshInventoryDetail();
+}
+
+function syncInventoryDetailFilterForm() {
+  const form = $("#inventory-detail-filter-form");
+  if (!form || !inventoryDetailState) return;
+  form.q.value = inventoryDetailState.q || "";
+  form.warehouse_code.value = inventoryDetailState.warehouse_code || "";
+  form.stock_status.value = inventoryDetailState.stock_status || "";
+}
+
+async function refreshInventoryDetail() {
+  if (!inventoryDetailState) return;
+  const sourceState = tableStates[inventoryDetailState.table_key] || tableStates.productsInventory;
+  const params = new URLSearchParams({
+    material_type: inventoryDetailState.material_type,
+    parent_category: inventoryDetailState.parent_category || "",
+    measure_type: sourceState.measure_type || "",
+    inventory_scope: sourceState.inventory_scope || "",
+    threshold: sourceState.threshold || "1",
+    page: String(inventoryDetailState.page || 1),
+    page_size: String(inventoryDetailState.page_size || 100),
+  });
+  if (sourceState.countable_only !== undefined) params.set("countable_only", sourceState.countable_only);
+  if (inventoryDetailState.q) params.set("q", inventoryDetailState.q);
+  if (inventoryDetailState.warehouse_code) params.set("warehouse_code", inventoryDetailState.warehouse_code);
+  if (inventoryDetailState.stock_status) params.set("stock_status", inventoryDetailState.stock_status);
+  const data = await api(`/api/products/inventory/type-items?${params}`);
+  inventoryDetailState.page = data.page || 1;
+  inventoryDetailState.page_size = data.page_size || inventoryDetailState.page_size || 100;
+  const summary = data.summary || {};
+  $("#inventory-detail-summary").innerHTML = `
+    <div class="metric"><small>库存记录</small><strong>${h(summary.inventory_row_count || 0)}</strong></div>
+    <div class="metric"><small>物料 / 仓库</small><strong>${h(summary.material_count || 0)} / ${h(summary.warehouse_count || 0)}</strong></div>
+    <div class="metric"><small>库存合计</small><strong>${h(summary.base_qty || 0)}</strong></div>
+    <div class="metric warn"><small>无库存 / 低库存</small><strong>${h(summary.zero_stock_count || 0)} / ${h(summary.low_stock_count || 0)}</strong></div>
+  `;
+  $("#inventory-detail-list").innerHTML = (data.items || []).map(row => `
+    <div class="row inventory-detail-row ${Number(row.base_qty || 0) <= 0 ? "is-zero-stock" : ""}">
+      <div><strong>${h(row.material_code)}</strong><br /><small>${h(row.material_name)}</small></div>
+      <div><strong>${h(row.base_qty)}</strong><br /><small>辅助数量 ${h(row.qty)}</small></div>
+      <div><strong>${h(row.warehouse_name || row.warehouse_code)}</strong><br /><small>${h(row.warehouse_code)}</small></div>
+      <div><span class="status-pill ${row.alert_level === "ok" ? "is-active" : "is-warn"}">${h(inventoryAlertLabel(row.alert_level))}</span><br /><small>${h(formatTime(row.synced_at))}</small></div>
+    </div>
+  `).join("") || `<div class="row inventory-detail-row product-empty-row"><div>该中类下暂无库存明细</div></div>`;
+  renderInventoryDetailPagination(data);
+}
+
+function renderInventoryDetailPagination(data) {
+  const node = $("#inventory-detail-pagination");
+  if (!node || !inventoryDetailState) return;
+  const total = data.total || 0;
+  const page = data.page || 1;
+  const totalPages = data.total_pages || 1;
+  node.innerHTML = `
+    <div class="pagination-summary">共 ${h(total)} 条 · 第 ${h(page)} / ${h(totalPages)} 页</div>
+    <div class="pagination-controls">
+      <button class="button ghost" type="button" data-inventory-detail-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>上一页</button>
+      <button class="button ghost" type="button" data-inventory-detail-page="${page + 1}" ${page >= totalPages ? "disabled" : ""}>下一页</button>
+      <label>每页
+        <select data-inventory-detail-page-size>
+          ${[50, 100, 200, 500].map((size) => `<option value="${size}" ${Number(inventoryDetailState.page_size) === size ? "selected" : ""}>${size}</option>`).join("")}
+        </select>
+      </label>
+    </div>
+  `;
+}
+
+function closeInventoryDetail() {
+  const modal = $("#inventory-detail-modal");
+  if (modal) modal.hidden = true;
+  inventoryDetailState = null;
+}
+
+function closeInventoryClassificationDiagnostics() {
+  const modal = $("#inventory-classification-modal");
+  if (modal) modal.hidden = true;
+}
+
+function renderInventoryClassificationCounter(selector, rows, emptyText = "暂无数据") {
+  const node = $(selector);
+  if (!node) return;
+  node.innerHTML = rows.map((row) => `
+    <div class="classification-counter-row">
+      <div><strong>${h(row.label)}</strong><br /><small>${h(row.note || "")}</small></div>
+      <strong>${h(row.value)}</strong>
+    </div>
+  `).join("") || `<div class="empty-note">${h(emptyText)}</div>`;
+}
+
+function renderInventoryClassificationDiagnostics(data) {
+  const summary = data?.summary || {};
+  const scopes = summary.scope_counts || {};
+  const measures = summary.measure_counts || {};
+  const finishedMeasures = measures.finished || {};
+  const materialMeasures = measures.non_finished || {};
+  $("#inventory-classification-meta").textContent = `规则版本 V${data?.rules?.version || 1}`;
+  $("#inventory-classification-summary").innerHTML = `
+    <div class="metric"><small>库存记录</small><strong>${h(summary.total_inventory_rows || 0)}</strong></div>
+    <div class="metric"><small>成品 / 材料</small><strong>${h(scopes.finished || 0)} / ${h(scopes.non_finished || 0)}</strong></div>
+    <div class="metric"><small>成品可计数</small><strong>${h(finishedMeasures.countable || 0)}</strong></div>
+    <div class="metric ${summary.suspicious_sample_count ? "warn" : ""}"><small>疑似误分</small><strong>${h(summary.suspicious_sample_count || 0)}</strong></div>
+  `;
+  const measureRows = [];
+  for (const scope of [
+    ["成品库存", finishedMeasures],
+    ["材料库存", materialMeasures],
+  ]) {
+    for (const type of ["countable", "length", "weight", "other"]) {
+      if (!scope[1][type]) continue;
+      measureRows.push({
+        label: `${scope[0]} · ${inventoryMeasureLabel(type)}`,
+        value: scope[1][type],
+      });
+    }
+  }
+  renderInventoryClassificationCounter("#inventory-classification-measures", measureRows);
+  const reasonRows = Object.entries(summary.reason_counts || {})
+    .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+    .slice(0, 12)
+    .map(([key, value]) => {
+      const [type, reason] = String(key).split(":");
+      return { label: inventoryMeasureLabel(type), note: reason || key, value };
+    });
+  renderInventoryClassificationCounter("#inventory-classification-reasons", reasonRows);
+
+  const suspicious = data?.suspicious_samples || [];
+  $("#inventory-classification-suspicious").innerHTML = suspicious.map((row) => `
+    <div class="classification-suspicious-row">
+      <div><strong>${h(row.material_code)}</strong><br /><small>${h(row.category || "未分类")}</small></div>
+      <div><strong>${h(row.material_name)}</strong></div>
+      <div><strong>${h(inventoryMeasureLabel(row.measure_type))}</strong></div>
+      <div><small>${h(row.reason || "-")}</small><br /><small>${h(row.matched || "")}</small></div>
+    </div>
+  `).join("") || `<div class="empty-note">未发现疑似误分样本</div>`;
+
+  const rules = data?.rules || {};
+  const ruleSummary = {
+    version: rules.version || 1,
+    finished_categories: rules.finished_categories || [],
+    countable_category_keywords: rules.countable_category_keywords || [],
+    length_category_keywords: rules.length_category_keywords || [],
+    weight_category_keywords: rules.weight_category_keywords || [],
+    other_category_keywords: rules.other_category_keywords || [],
+  };
+  $("#inventory-classification-rules").textContent = JSON.stringify(ruleSummary, null, 2);
+}
+
+function bindInventoryListOpen(selector) {
+  $(selector)?.addEventListener("click", async (event) => {
+    const row = event.target.closest("[data-action='open-inventory-detail']");
+    if (!row) return;
+    await guardedAction(["库存管理", "查看明细"], async () => openInventoryDetail(row.dataset.materialType, row.dataset.parentCategory || "", 1, row.dataset.tableKey || "productsInventory"));
+  });
+
+  $(selector)?.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = event.target.closest("[data-action='open-inventory-detail']");
+    if (!row) return;
+    event.preventDefault();
+    await guardedAction(["库存管理", "查看明细"], async () => openInventoryDetail(row.dataset.materialType, row.dataset.parentCategory || "", 1, row.dataset.tableKey || "productsInventory"));
+  });
+}
+
+bindInventoryListOpen("#products-inventory-list");
+bindInventoryListOpen("#products-finished-inventory-list");
+
+$("#inventory-detail-pagination")?.addEventListener("click", async (event) => {
+  const target = event.target.closest("button[data-inventory-detail-page]");
+  if (!target || target.disabled || !inventoryDetailState) return;
+  inventoryDetailState.page = Number(target.dataset.inventoryDetailPage || 1);
+  await guardedAction(["库存管理", "明细翻页"], refreshInventoryDetail);
+});
+
+$("#inventory-detail-pagination")?.addEventListener("change", async (event) => {
+  if (!event.target.matches("[data-inventory-detail-page-size]") || !inventoryDetailState) return;
+  inventoryDetailState.page_size = Number(event.target.value || 100);
+  inventoryDetailState.page = 1;
+  await guardedAction(["库存管理", "明细分页"], refreshInventoryDetail);
+});
+
+$("#inventory-detail-filter-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!inventoryDetailState) return;
+  const form = new FormData(event.currentTarget);
+  inventoryDetailState.q = String(form.get("q") || "").trim();
+  inventoryDetailState.warehouse_code = String(form.get("warehouse_code") || "").trim();
+  inventoryDetailState.stock_status = String(form.get("stock_status") || "").trim();
+  inventoryDetailState.page = 1;
+  await guardedAction(["库存管理", "明细筛选"], refreshInventoryDetail);
+});
+
+$("[data-inventory-detail-reset]")?.addEventListener("click", async () => {
+  if (!inventoryDetailState) return;
+  inventoryDetailState.q = "";
+  inventoryDetailState.warehouse_code = "";
+  inventoryDetailState.stock_status = "";
+  inventoryDetailState.page = 1;
+  syncInventoryDetailFilterForm();
+  await guardedAction(["库存管理", "重置明细筛选"], refreshInventoryDetail);
+});
+
+$("#inventory-classification-diagnostics")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const modal = $("#inventory-classification-modal");
+  button.disabled = true;
+  if (modal) modal.hidden = false;
+  $("#inventory-classification-meta").textContent = "正在检查";
+  $("#inventory-classification-summary").innerHTML = `<div class="empty-note">正在检查库存分类规则...</div>`;
+  $("#inventory-classification-measures").innerHTML = "";
+  $("#inventory-classification-reasons").innerHTML = "";
+  $("#inventory-classification-suspicious").innerHTML = "";
+  $("#inventory-classification-rules").textContent = "";
+  try {
+    const result = await api("/api/products/inventory/classification-rules");
+    renderInventoryClassificationDiagnostics(result);
+    const suspiciousCount = result?.summary?.suspicious_sample_count || 0;
+    toast(suspiciousCount ? `分类诊断完成：发现 ${suspiciousCount} 条疑似样本` : "分类诊断完成：未发现疑似误分样本");
+  } catch (error) {
+    notifyError(error, ["库存管理", "分类诊断失败"]);
+    $("#inventory-classification-summary").innerHTML = `<div class="empty-note">${h(messageFromError(error))}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#sync-erp-inventory")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const resultNode = $("#erp-inventory-sync-result");
+  button.disabled = true;
+  resultNode.classList.add("show");
+  resultNode.textContent = "正在从 ERP 同步库存...";
+  try {
+    const result = await api("/api/products/inventory/erp-sync", { method: "POST" });
+    resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? `ERP 库存同步完成：${result.total || 0} 条` : "ERP 库存同步失败");
+    await refreshProductsInventory();
+  } catch (error) {
+    notifyError(error, ["物料中心", "ERP 库存同步失败"]);
+    resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function refreshProductsPricing() {
   const data = await api(`/api/pricing?${queryFromState(tableStates.productsPricing)}`);
   const rows = data.items || [];
+  cacheProductSkuRows(rows);
   $("#products-pricing-list").innerHTML = rows.map(row => `
     <div class="row product-row">
-      <div><strong>${h(row.channel)}</strong> / <a href="#" class="link" data-action="goto-sku" data-sku="${h(row.sku_id)}">${h(row.sku_id)}</a><br /><small>${h(row.currency)}</small></div>
+      <div><strong>${h(row.channel)}</strong> / <a href="#" class="link" data-action="goto-sku" data-sku="${h(row.sku_id)}">${h(row.sku_id)}</a><br /><small>${h(row.spu_name || row.spu_id || row.currency)}</small></div>
       <div>
-        <small>A: ${h(row.tier_a_price || "-")} | B: ${h(row.tier_b_price || "-")} | C: ${h(row.tier_c_price || "-")}</small>
+        <small>A: ${h(formatProductMoney(row.tier_a_price))} | B: ${h(formatProductMoney(row.tier_b_price))} | C: ${h(formatProductMoney(row.tier_c_price))}</small>
         ${row.promo_start_time ? `<br/><small class="text-secondary">${h(formatTime(row.promo_start_time))} 至 ${h(formatTime(row.promo_end_time))}</small>` : ""}
       </div>
-      <div><strong>${h(row.map_price)}</strong></div>
+      <div><strong>${h(formatProductMoney(row.map_price))}</strong></div>
       <div><small>${h(formatTime(row.updated_at))}</small></div>
     </div>
   `).join("") || `<div class="row product-row product-empty-row"><div>暂无定价数据</div></div>`;
@@ -3041,10 +4606,15 @@ async function refreshProductsPricing() {
 async function refreshProductsPromotions() {
   const data = await api(`/api/promotions?${queryFromState(tableStates.productsPromotions)}`);
   const rows = data.items || [];
+  cacheProductSkuRows(rows);
   $("#products-promotions-list").innerHTML = rows.map(row => `
     <div class="row product-row">
-      <div><strong>${h(row.name)}</strong><br /><small>${h(row.channel || "通用")}</small></div>
-      <div><small>${h(row.discount_type === 'percentage' ? '比例' : '固定减免')}</small><br /><strong>${h(row.discount_value)}</strong></div>
+      <div>
+        <strong>${h(row.name)}</strong><br />
+        <small>${h(row.sku_id || "未绑定")} · ${h(row.spu_name || row.channel || "通用")}</small>
+        ${row.binding_valid === false ? `<br /><span class="status-pill is-danger">${h(row.binding_label || "需绑定成品 SKU")}</span>` : ""}
+      </div>
+      <div><small>${h(row.discount_type === 'percentage' ? '比例折扣' : '固定减免')}</small><br /><strong>${formatPromotionDiscount(row)}</strong></div>
       <div><small>${h(row.start_time ? formatTime(row.start_time) : "不限")} - ${h(row.end_time ? formatTime(row.end_time) : "不限")}</small></div>
       <div>
         <small>${row.is_active ? "生效中" : "已停用"}</small><br/>
@@ -3078,6 +4648,9 @@ $("#products-tabs")?.addEventListener("click", (e) => {
     activeTab.hidden = false;
     activeTab.classList.add("is-active");
   }
+  if (tabName === "review") {
+    guardedAction(["物料中心", "预审体检"], async () => refreshProductReviewReadiness());
+  }
 });
 
 // Product Modals
@@ -3093,8 +4666,14 @@ function closeModal(id) {
 document.addEventListener("click", async (e) => {
   const target = e.target;
   if (target.dataset.action === "new-spu") openModal("#product-spu-modal");
-  if (target.dataset.action === "new-sku") openModal("#product-sku-modal");
-  if (target.dataset.action === "new-pricing") openModal("#product-pricing-modal");
+  if (target.dataset.action === "new-sku") {
+    $("#product-sku-form")?.reset();
+    openModal("#product-sku-modal");
+  }
+  if (target.dataset.action === "new-pricing") {
+    $("#product-pricing-form")?.reset();
+    openModal("#product-pricing-modal");
+  }
   if (target.dataset.action === "new-promotion") {
     e.preventDefault();
     editingPromotionId = null;
@@ -3121,9 +4700,9 @@ document.addEventListener("click", async (e) => {
   if (target.dataset.action === "goto-sku") {
     e.preventDefault();
     const skuId = target.dataset.sku;
-    tableStates.productsPricing.sku_id = skuId;
+    tableStates.productsPricing.q = skuId;
     tableStates.productsPricing.page = 1;
-    $("#products-pricing-filter-form [name=sku_id]").value = skuId;
+    $("#products-pricing-filter-form [name=q]").value = skuId;
     document.querySelectorAll("#products-tabs button").forEach(b => {
       if (b.dataset.tab === "pricing") b.click();
     });
@@ -3131,9 +4710,35 @@ document.addEventListener("click", async (e) => {
 
   if (target.dataset.action === "quick-new-pricing") {
     e.preventDefault();
-    const skuUuid = target.dataset.skuUuid;
-    openModal("#product-pricing-modal");
-    $("#product-pricing-form [name=sku_uuid]").value = skuUuid;
+    openProductPricingModal({
+      skuUuid: target.dataset.skuUuid,
+      skuId: target.dataset.skuId,
+      channel: target.dataset.channel || "default",
+      unitPrice: target.dataset.unitPrice || "",
+      pricingConfigured: target.dataset.pricingConfigured === "true",
+    });
+  }
+
+  if (target.dataset.action === "edit-product-aliases") {
+    e.preventDefault();
+    openProductAliasModal(target.dataset.id);
+  }
+
+  if (target.dataset.action === "goto-promotions") {
+    e.preventDefault();
+    const query = target.dataset.q || "";
+    tableStates.productsPromotions.q = query;
+    tableStates.productsPromotions.page = 1;
+    const formInput = $("#products-promotions-filter-form [name=q]");
+    if (formInput) formInput.value = query;
+    document.querySelectorAll("#products-tabs button").forEach(b => {
+      if (b.dataset.tab === "promotions") b.click();
+    });
+  }
+
+  if (target.dataset.action === "use-review-alias-suggestion") {
+    e.preventDefault();
+    openProductAliasSuggestion(target.dataset.id, target.dataset.alias || "");
   }
 
   if (target.dataset.action === "edit-promotion") {
@@ -3145,10 +4750,12 @@ document.addEventListener("click", async (e) => {
     openModal("#product-promotion-modal");
     $("#product-promotion-title").innerText = "编辑促销规则";
     const form = $("#product-promotion-form");
+    form.elements.sku_uuid.value = rule.sku_uuid || "";
+    form.elements.sku_lookup.value = rule.sku_id || "";
     form.elements.name.value = rule.name || "";
     form.elements.channel.value = rule.channel || "";
     form.elements.discount_type.value = rule.discount_type || "percentage";
-    form.elements.discount_value.value = rule.discount_value || "";
+    form.elements.discount_value.value = promotionDiscountInputValue(rule);
     form.elements.start_time.value = rule.start_time ? rule.start_time.slice(0, 16) : "";
     form.elements.end_time.value = rule.end_time ? rule.end_time.slice(0, 16) : "";
     form.elements.priority.value = rule.priority || 0;
@@ -3175,10 +4782,18 @@ document.addEventListener("click", async (e) => {
       refreshProductsPromotions();
     });
   }
+
+  if (target.dataset.action === "view-crm-order") {
+    e.preventDefault();
+    await guardedAction(["订单管理", "查看订单详情"], async () => {
+      await openCrmOrderDetail(target.dataset.id);
+    });
+  }
 });
 
 $("#product-spu-close")?.addEventListener("click", () => closeModal("#product-spu-modal"));
 $("#product-sku-close")?.addEventListener("click", () => closeModal("#product-sku-modal"));
+$("#product-alias-close")?.addEventListener("click", () => closeModal("#product-alias-modal"));
 $("#product-pricing-close")?.addEventListener("click", () => closeModal("#product-pricing-modal"));
 $("#product-promotion-close")?.addEventListener("click", () => closeModal("#product-promotion-modal"));
 $("#product-import-close")?.addEventListener("click", () => closeModal("#product-import-modal"));
@@ -3262,6 +4877,8 @@ $("#product-sku-form")?.addEventListener("submit", async (e) => {
     return;
   }
   await guardedAction(["物料中心", "新增 SKU"], async () => {
+    payload.spu_uuid = await resolveProductSpuLookup(e.target);
+    delete payload.spu_lookup;
     await api("/api/products/sku", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -3273,22 +4890,41 @@ $("#product-sku-form")?.addEventListener("submit", async (e) => {
   });
 });
 
+$("#product-alias-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const aliases = String(form.aliases.value || "")
+    .split(/\n+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+  await guardedAction(["物料中心", "保存预审别名"], async () => {
+    const result = await api(`/api/products/spu/${form.spu_uuid.value}/review-aliases`, {
+      method: "PUT",
+      body: JSON.stringify({ aliases }),
+    });
+    const row = window._productSpuRows?.[result.id];
+    if (row) row.review_aliases = result.review_aliases || [];
+    toast(`已保存 ${result.review_aliases?.length || 0} 个预审别名`);
+    closeModal("#product-alias-modal");
+    await refreshProductsSpu();
+    await refreshProductReviewReadiness();
+  });
+});
+
 $("#product-pricing-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
   const payload = Object.fromEntries(formData);
-  // Ensure integers where needed
-  ["map_price", "tier_a_price", "tier_b_price", "tier_c_price"].forEach(k => {
-    if (payload[k] !== undefined && payload[k] !== "") {
-      payload[k] = parseInt(payload[k], 10);
-    } else {
-      payload[k] = null;
-    }
-  });
   ["promo_start_time", "promo_end_time"].forEach(k => {
     if (!payload[k]) payload[k] = null;
   });
   await guardedAction(["物料中心", "配置价格"], async () => {
+    payload.sku_uuid = await resolveProductSkuLookup(e.target);
+    delete payload.sku_lookup;
+    payload.map_price = amountInputToCents(payload.map_price, "底价(MAP)");
+    payload.tier_a_price = amountInputToCents(payload.tier_a_price, "A档价格");
+    payload.tier_b_price = amountInputToCents(payload.tier_b_price, "B档价格");
+    payload.tier_c_price = amountInputToCents(payload.tier_c_price, "C档价格");
     await api("/api/pricing", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -3296,7 +4932,8 @@ $("#product-pricing-form")?.addEventListener("submit", async (e) => {
     toast("渠道价格配置成功");
     closeModal("#product-pricing-modal");
     e.target.reset();
-    refreshProductsPricing();
+    await refreshProductsPricing();
+    await refreshProductReviewReadiness();
   });
 });
 
@@ -3304,11 +4941,6 @@ $("#product-promotion-form")?.addEventListener("submit", async (e) => {
   e.preventDefault();
   const formData = new FormData(e.target);
   const payload = Object.fromEntries(formData);
-  payload.discount_value = parseInt(payload.discount_value, 10);
-  if (isNaN(payload.discount_value)) {
-    alert("请输入有效的折扣数值");
-    return;
-  }
   payload.priority = parseInt(payload.priority || "0", 10);
   if (isNaN(payload.priority)) payload.priority = 0;
   
@@ -3322,6 +4954,17 @@ $("#product-promotion-form")?.addEventListener("submit", async (e) => {
   const method = editingPromotionId ? "PATCH" : "POST";
 
   await guardedAction(["物料中心", label], async () => {
+    payload.sku_uuid = await resolveProductSkuLookup(e.target);
+    delete payload.sku_lookup;
+    if (payload.discount_type === "fixed_amount") {
+      payload.discount_value = amountInputToCents(payload.discount_value, "固定减免");
+    } else {
+      const discount = Number(payload.discount_value);
+      if (!Number.isFinite(discount) || discount <= 0 || discount > 100) {
+        throw new Error("比例折扣请输入 1-100 之间的数字");
+      }
+      payload.discount_value = Math.round(discount);
+    }
     await api(url, {
       method: method,
       body: JSON.stringify(payload),
@@ -3345,16 +4988,43 @@ $("#products-spu-filter-form")?.addEventListener("submit", (e) => {
 
 $("#products-sku-filter-form")?.addEventListener("submit", (e) => {
   e.preventDefault();
-  tableStates.productsSku.spu_id = e.target.spu_id.value;
+  tableStates.productsSku.q = e.target.q.value;
   tableStates.productsSku.page = 1;
   refreshProductsSku();
 });
 
 $("#products-pricing-filter-form")?.addEventListener("submit", (e) => {
   e.preventDefault();
-  tableStates.productsPricing.sku_id = e.target.sku_id.value;
+  tableStates.productsPricing.q = e.target.q.value;
   tableStates.productsPricing.page = 1;
   refreshProductsPricing();
+});
+
+$("#products-promotions-filter-form")?.addEventListener("submit", (e) => {
+  e.preventDefault();
+  tableStates.productsPromotions.q = e.target.q.value;
+  tableStates.productsPromotions.page = 1;
+  refreshProductsPromotions();
+});
+
+$("#products-review-preview-form")?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.currentTarget;
+  const resultNode = $("#products-review-preview-result");
+  if (resultNode) {
+    resultNode.innerHTML = `<div class="empty-note">正在按订单预审规则匹配成品 SKU...</div>`;
+  }
+  await guardedAction(["物料中心", "预审测试"], async () => {
+    const payload = {
+      text: String(form.text.value || "").trim(),
+      channel: String(form.channel.value || "default").trim() || "default",
+    };
+    const result = await api("/api/products/review-preview", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    renderProductReviewPreview(result);
+  });
 });
 
 resetWorkflowChat();

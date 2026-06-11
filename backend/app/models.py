@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -46,6 +46,19 @@ class MailTemplate(Base):
 
 class ProductionDepartment(Base):
     __tablename__ = "production_departments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    department_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    department_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    mail_to_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    mail_cc_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class LogisticsDepartment(Base):
+    __tablename__ = "logistics_departments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     department_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
@@ -259,6 +272,67 @@ class RequirementWorkflowBinding(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
+class LogisticsTask(Base):
+    __tablename__ = "logistics_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    requirement_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_requirements.id"), nullable=False)
+    current_version_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(64), default="LogisticsDrafted", nullable=False)
+    logistics_department_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("logistics_departments.id"))
+    target_mail_to_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    target_mail_cc_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    production_task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("production_tasks.id"))
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_reason: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    requirement: Mapped[OrderRequirement] = relationship()
+    department: Mapped[LogisticsDepartment | None] = relationship()
+    production_task: Mapped[ProductionTask | None] = relationship()
+    versions: Mapped[list["LogisticsTaskVersion"]] = relationship(back_populates="task")
+    items: Mapped[list["FulfillmentItem"]] = relationship(back_populates="logistics_task")
+
+
+class LogisticsTaskVersion(Base):
+    __tablename__ = "logistics_task_versions"
+    __table_args__ = (UniqueConstraint("logistics_task_id", "version_no", name="uq_logistics_task_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    logistics_task_id: Mapped[str] = mapped_column(String(36), ForeignKey("logistics_tasks.id"), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Draft", nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(String(128))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    task: Mapped[LogisticsTask] = relationship(back_populates="versions")
+
+
+class FulfillmentItem(Base):
+    __tablename__ = "fulfillment_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requirement_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_requirements.id"), nullable=False)
+    logistics_task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("logistics_tasks.id"))
+    material_code: Mapped[str | None] = mapped_column(String(128))
+    material_name: Mapped[str | None] = mapped_column(Text)
+    required_quantity: Mapped[str | None] = mapped_column(String(128))
+    available_quantity: Mapped[str | None] = mapped_column(String(128))
+    shortage_quantity: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    requirement: Mapped[OrderRequirement] = relationship()
+    logistics_task: Mapped[LogisticsTask | None] = relationship(back_populates="items")
+
+
 class ExtractionEvidence(Base):
     __tablename__ = "extraction_evidence"
 
@@ -418,6 +492,102 @@ class BackupJob(Base):
 
 
 # ==========================================
+# CRM Order Mirror Module Models
+# ==========================================
+
+class CrmSalesOrder(Base):
+    __tablename__ = "crm_sales_orders"
+    __table_args__ = (
+        UniqueConstraint("source_system", "crm_order_id", name="uq_crm_order_source_id"),
+        UniqueConstraint("source_system", "crm_order_no", name="uq_crm_order_source_no"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_order_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(128))
+    customer_name: Mapped[str | None] = mapped_column(String(255))
+    opportunity_id: Mapped[str | None] = mapped_column(String(128))
+    opportunity_name: Mapped[str | None] = mapped_column(String(255))
+    sales_user_id: Mapped[str | None] = mapped_column(String(128))
+    sales_user_name: Mapped[str | None] = mapped_column(String(128))
+    owner_department: Mapped[str | None] = mapped_column(String(128))
+    life_status: Mapped[str | None] = mapped_column(String(64))
+    approval_status: Mapped[str | None] = mapped_column(String(64))
+    order_date: Mapped[str | None] = mapped_column(String(32))
+    settlement_method: Mapped[str | None] = mapped_column(String(128))
+    currency: Mapped[str | None] = mapped_column(String(16))
+    order_amount: Mapped[str | None] = mapped_column(String(64))
+    received_amount: Mapped[str | None] = mapped_column(String(64))
+    receivable_amount: Mapped[str | None] = mapped_column(String(64))
+    invoice_amount: Mapped[str | None] = mapped_column(String(64))
+    product_amount: Mapped[str | None] = mapped_column(String(64))
+    logistics_status: Mapped[str | None] = mapped_column(String(64))
+    shipment_status: Mapped[str | None] = mapped_column(String(64))
+    invoice_status: Mapped[str | None] = mapped_column(String(64))
+    receipt_contact: Mapped[str | None] = mapped_column(String(128))
+    receipt_address: Mapped[str | None] = mapped_column(Text)
+    delivery_date: Mapped[str | None] = mapped_column(String(32))
+    remark: Mapped[str | None] = mapped_column(Text)
+    attachment_files_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    sync_status: Mapped[str] = mapped_column(String(32), default="Synced", nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    items: Mapped[list["CrmOrderItem"]] = relationship(back_populates="order")
+
+
+class CrmOrderItem(Base):
+    __tablename__ = "crm_order_items"
+    __table_args__ = (UniqueConstraint("source_system", "crm_item_id", name="uq_crm_order_item_source_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    order_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("crm_sales_orders.id"))
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    crm_item_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_order_id: Mapped[str | None] = mapped_column(String(128))
+    crm_order_no: Mapped[str | None] = mapped_column(String(128))
+    sku_code: Mapped[str | None] = mapped_column(String(128))
+    product_name: Mapped[str | None] = mapped_column(String(255))
+    specification: Mapped[str | None] = mapped_column(String(255))
+    quantity: Mapped[str | None] = mapped_column(String(64))
+    unit_price: Mapped[str | None] = mapped_column(String(64))
+    line_amount: Mapped[str | None] = mapped_column(String(64))
+    special_requirement: Mapped[str | None] = mapped_column(Text)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    order: Mapped[CrmSalesOrder | None] = relationship(back_populates="items")
+
+
+class CrmSyncRun(Base):
+    __tablename__ = "crm_sync_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    sync_type: Mapped[str] = mapped_column(String(64), default="sales_orders", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Running", nullable=False)
+    trigger: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unchanged_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+
+
+# ==========================================
 # Product Management Module Models
 # ==========================================
 
@@ -463,6 +633,25 @@ class ProductSKU(Base):
 
     spu: Mapped[ProductSPU] = relationship(back_populates="skus")
     channel_pricings: Mapped[list["ChannelPricing"]] = relationship(back_populates="sku")
+    promotion_rules: Mapped[list["PromotionRule"]] = relationship(back_populates="sku")
+
+
+class ProductInventorySnapshot(Base):
+    __tablename__ = "product_inventory_snapshots"
+    __table_args__ = (UniqueConstraint("material_code", "warehouse_code", name="uq_inventory_material_warehouse"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    material_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    material_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    warehouse_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    warehouse_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_qty: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    qty: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    source_payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Active", nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
 class ChannelPricing(Base):
@@ -494,6 +683,7 @@ class PromotionRule(Base):
     __tablename__ = "promotion_rules"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    sku_uuid: Mapped[str | None] = mapped_column(String(36), ForeignKey("product_skus.id"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     channel: Mapped[str | None] = mapped_column(String(64))
     start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -504,3 +694,5 @@ class PromotionRule(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    sku: Mapped[ProductSKU | None] = relationship(back_populates="promotion_rules")

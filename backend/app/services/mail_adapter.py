@@ -22,6 +22,7 @@ from backend.app.services.jsonutil import as_list, dumps
 from backend.app.services.mail_throttle import (
     mail_login_interval_seconds,
     reserve_mail_login,
+    reserve_mail_send,
     reserve_mail_send_slot,
 )
 from backend.app.services.parser import classify_mail, normalize_latest_reply
@@ -678,6 +679,10 @@ AUTO_WORKFLOW_MAIL_TYPES = {
     "DuplicateSubmissionNotice",
     "RequirementSupplementTaskIssue",
     "RequirementSupplementAcceptedReceipt",
+    "LogisticsTaskIssue",
+    "LogisticsShipped",
+    "LogisticsManualClosedSales",
+    "LogisticsManualClosedLogistics",
     "TaskIssue",
     "ProductionQuestionForward",
     "ProductionQuestionReceipt",

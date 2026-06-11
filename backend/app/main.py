@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from backend.app.config import settings
 from backend.app.database import SessionLocal, database_runtime_info, init_db
@@ -25,8 +25,14 @@ from backend.app.models import (
     AuditEvent,
     AttachmentAsset,
     BackupJob,
+    CrmSalesOrder,
+    CrmSyncRun,
     ExceptionCase,
     ExtractionEvidence,
+    FulfillmentItem,
+    LogisticsDepartment,
+    LogisticsTask,
+    LogisticsTaskVersion,
     MailMessage,
     MailWorkflowMatch,
     MailTemplate,
@@ -49,6 +55,9 @@ from backend.app.schemas import (
     AdminPasswordRequest,
     DemoOrderRequest,
     DepartmentUpsert,
+    CrmRuntimeConfigUpdate,
+    ErpBillQueryRequest,
+    ErpRuntimeConfigUpdate,
     ExceptionRequirementPatchRequest,
     ExceptionResolveRequest,
     InitialReviewConfigUpdate,
@@ -79,7 +88,26 @@ from backend.app.schemas import (
 from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_INTERVAL_SECONDS
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token
 from backend.app.services.bootstrap import seed_defaults, set_config
+from backend.app.services.crm_sync import (
+    crm_order_summary,
+    queue_crm_order_sync,
+    run_crm_sales_order_sync,
+    serialize_sync_run,
+)
 from backend.app.services.e2e_mail import run_tencent_mail_e2e
+from backend.app.services.erp.business_queries import (
+    inventory_classification_diagnostics,
+    list_inventory_warehouses,
+    list_inventory_snapshots,
+    list_inventory_type_items,
+    list_inventory_type_summary,
+    query_inventory,
+    save_inventory_classification_rules,
+    search_materials,
+    sync_inventory_snapshots,
+)
+from backend.app.services.erp.kingdee_client import execute_bill_query_from_config, normalize_kingdee_server_url, test_kingdee_connection_from_config
+from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.initial_review import (
     DEFAULT_REQUIRED_FIELDS,
     FIELD_LABELS,
@@ -116,8 +144,10 @@ from backend.app.services.workflow import (
     dashboard,
     enqueue_weekly_report,
     force_close_task_manual,
+    get_config,
     apply_exception_requirement_patch,
     process_inbound_mail,
+    recipient_hash,
     record_production_question,
     record_production_feedback,
     record_sales_reply,
@@ -161,6 +191,13 @@ from backend.app.services.products import (
     get_skus,
     get_channel_pricing,
     get_promotions,
+    promotion_rule_binding_info,
+    extract_order_products_for_review,
+    review_order_products,
+    product_review_readiness,
+    spu_review_aliases,
+    suggest_product_review_candidates,
+    update_spu_review_aliases,
     update_promotion_rule,
     delete_promotion_rule,
     toggle_promotion_rule,
@@ -174,6 +211,7 @@ PUBLIC_API_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/auth/me"}
 logger = logging.getLogger(__name__)
 mail_worker_task: asyncio.Task | None = None
 EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+LOGISTICS_TASK_NO_PATTERN = re.compile(r"LT-\d{8}-\d{4}", re.IGNORECASE)
 
 
 @app.middleware("http")
@@ -344,22 +382,31 @@ def invalid_email_addresses(values: list[str] | tuple[str, ...] | None) -> list[
 
 def clear_task_records(session: Session) -> dict:
     tasks_to_clear = session.query(ProductionTask).all()
+    logistics_tasks_to_clear = session.query(LogisticsTask).all()
     task_ids = [task.id for task in tasks_to_clear]
-    requirement_ids = [task.requirement_id for task in tasks_to_clear]
+    logistics_task_ids = [task.id for task in logistics_tasks_to_clear]
+    requirement_ids = sorted({task.requirement_id for task in tasks_to_clear} | {task.requirement_id for task in logistics_tasks_to_clear})
     version_ids = [
         row.id
         for row in session.query(ProductionTaskVersion.id).filter(ProductionTaskVersion.task_id.in_(task_ids)).all()
     ] if task_ids else []
+    logistics_version_ids = [
+        row.id
+        for row in session.query(LogisticsTaskVersion.id).filter(LogisticsTaskVersion.logistics_task_id.in_(logistics_task_ids)).all()
+    ] if logistics_task_ids else []
 
     mail_updates = 0
     outbound_updates = 0
     exception_updates = 0
     question_deletes = 0
     version_deletes = 0
+    logistics_version_deletes = 0
+    fulfillment_item_deletes = 0
     binding_deletes = 0
     evidence_deletes = 0
     requirement_deletes = 0
     task_deletes = 0
+    logistics_task_deletes = 0
 
     if task_ids:
         mail_updates = (
@@ -391,6 +438,25 @@ def clear_task_records(session: Session) -> dict:
             .filter(ProductionTaskVersion.task_id.in_(task_ids))
             .delete(synchronize_session=False)
         )
+
+    if logistics_task_ids:
+        fulfillment_item_deletes = (
+            session.query(FulfillmentItem)
+            .filter(FulfillmentItem.logistics_task_id.in_(logistics_task_ids))
+            .delete(synchronize_session=False)
+        )
+        logistics_version_deletes = (
+            session.query(LogisticsTaskVersion)
+            .filter(LogisticsTaskVersion.logistics_task_id.in_(logistics_task_ids))
+            .delete(synchronize_session=False)
+        )
+        logistics_task_deletes = (
+            session.query(LogisticsTask)
+            .filter(LogisticsTask.id.in_(logistics_task_ids))
+            .delete(synchronize_session=False)
+        )
+
+    if task_ids:
         task_deletes = (
             session.query(ProductionTask)
             .filter(ProductionTask.id.in_(task_ids))
@@ -398,6 +464,11 @@ def clear_task_records(session: Session) -> dict:
         )
 
     if requirement_ids:
+        fulfillment_item_deletes += (
+            session.query(FulfillmentItem)
+            .filter(FulfillmentItem.requirement_id.in_(requirement_ids))
+            .delete(synchronize_session=False)
+        )
         binding_deletes = (
             session.query(RequirementWorkflowBinding)
             .filter(RequirementWorkflowBinding.requirement_id.in_(requirement_ids))
@@ -416,8 +487,11 @@ def clear_task_records(session: Session) -> dict:
 
     return {
         "task_count": task_deletes,
+        "logistics_task_count": logistics_task_deletes,
         "requirement_count": requirement_deletes,
         "version_count": version_deletes,
+        "logistics_version_count": logistics_version_deletes,
+        "fulfillment_item_count": fulfillment_item_deletes,
         "question_count": question_deletes,
         "binding_count": binding_deletes,
         "evidence_count": evidence_deletes,
@@ -680,6 +754,92 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
         set_config(session, key, str(value), is_secret=key in secret_keys)
     session.commit()
     return config(session)
+
+
+@app.put("/api/config/erp")
+def update_erp_config(payload: ErpRuntimeConfigUpdate, session: Session = Depends(get_session)) -> dict:
+    values = payload.model_dump(exclude_unset=True)
+    if "erp_server_url" in values and values["erp_server_url"] not in (None, ""):
+        values["erp_server_url"] = normalize_kingdee_server_url(str(values["erp_server_url"]))
+    if "erp_lcid" in values and values["erp_lcid"] not in (None, ""):
+        try:
+            values["erp_lcid"] = int(values["erp_lcid"])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="ERP LCID 必须是数字") from exc
+    if "erp_material_sync_interval_seconds" in values and values["erp_material_sync_interval_seconds"] not in (None, ""):
+        interval = int(values["erp_material_sync_interval_seconds"])
+        if interval < 300:
+            raise HTTPException(status_code=400, detail="ERP 物料自动同步周期不能低于 300 秒")
+        values["erp_material_sync_interval_seconds"] = interval
+    secret_keys = {"erp_app_sec"}
+    for key, value in values.items():
+        if value in (None, ""):
+            continue
+        set_config(session, key, str(value), is_secret=key in secret_keys)
+    set_config(session, "erp_readonly", "true", is_secret=False)
+    set_config(session, "erp_write_enabled", "false", is_secret=False)
+    session.commit()
+    return config(session)
+
+
+@app.put("/api/config/crm")
+def update_crm_config(payload: CrmRuntimeConfigUpdate, session: Session = Depends(get_session)) -> dict:
+    values = payload.model_dump(exclude_unset=True)
+    if "crm_sync_interval_seconds" in values and values["crm_sync_interval_seconds"] not in (None, ""):
+        interval = int(values["crm_sync_interval_seconds"])
+        if interval < 60:
+            raise HTTPException(status_code=400, detail="CRM 同步周期不能低于 60 秒")
+        values["crm_sync_interval_seconds"] = interval
+    if "crm_sync_page_size" in values and values["crm_sync_page_size"] not in (None, ""):
+        page_size = int(values["crm_sync_page_size"])
+        if page_size < 1 or page_size > 200:
+            raise HTTPException(status_code=400, detail="CRM 每页条数需在 1-200 之间")
+        values["crm_sync_page_size"] = page_size
+    if "crm_sync_timeout_seconds" in values and values["crm_sync_timeout_seconds"] not in (None, ""):
+        timeout = int(values["crm_sync_timeout_seconds"])
+        if timeout < 30 or timeout > 600:
+            raise HTTPException(status_code=400, detail="CRM 同步超时需在 30-600 秒之间")
+        values["crm_sync_timeout_seconds"] = timeout
+    secret_keys = {"crm_fxiaoke_request_json"}
+    for key, value in values.items():
+        if value is None:
+            continue
+        set_config(session, key, str(value), is_secret=key in secret_keys)
+    session.commit()
+    return config(session)
+
+
+@app.post("/api/erp/test-connection")
+def test_erp_connection(session: Session = Depends(get_session)) -> dict:
+    return test_kingdee_connection_from_config(session)
+
+
+@app.post("/api/erp/query")
+def query_erp_bill(payload: ErpBillQueryRequest, session: Session = Depends(get_session)) -> dict:
+    return execute_bill_query_from_config(
+        session,
+        form_id=payload.form_id.strip(),
+        field_keys=payload.field_keys.strip(),
+        filter_string=payload.filter_string.strip(),
+        order_string=payload.order_string.strip(),
+        limit=payload.limit,
+        start_row=payload.start_row,
+    )
+
+
+@app.get("/api/erp/materials")
+def erp_materials(q: str = "", limit: int = Query(20, ge=1, le=100), include_erp: bool = False, session: Session = Depends(get_session)) -> dict:
+    return search_materials(session, q=q, limit=limit, include_erp=include_erp)
+
+
+@app.get("/api/erp/inventory")
+def erp_inventory(
+    material_code: str = "",
+    warehouse_code: str = "",
+    limit: int = Query(50, ge=1, le=200),
+    session: Session = Depends(get_session),
+) -> dict:
+    return query_inventory(session, material_code=material_code, warehouse_code=warehouse_code, limit=limit)
 
 
 @app.post("/api/system/business-data/clear")
@@ -1176,7 +1336,7 @@ def mails(
     mail_received_order = func.coalesce(MailMessage.received_at, MailMessage.created_at)
     return page_response(
         query.order_by(mail_received_order.desc(), MailMessage.created_at.desc()),
-        serialize_mail,
+        lambda row: serialize_mail(row, session),
         page,
         page_size,
         {
@@ -1191,7 +1351,7 @@ def mail_detail(mail_id: str, session: Session = Depends(get_session)) -> dict:
     mail = session.get(MailMessage, mail_id)
     if mail is None:
         raise HTTPException(status_code=404, detail="mail not found")
-    data = serialize_mail(mail)
+    data = serialize_mail(mail, session)
     data["body_text"] = mail.body_text
     data["attachments"] = [serialize_attachment(row) for row in session.query(AttachmentAsset).filter_by(mail_id=mail.id).all()]
     return data
@@ -1258,6 +1418,53 @@ def tasks(
     )
 
 
+@app.get("/api/logistics-tasks")
+def logistics_tasks(
+    q: str | None = None,
+    status: str | None = None,
+    customer: str | None = None,
+    product: str | None = None,
+    salesperson: str | None = None,
+    order_no: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(LogisticsTask).join(OrderRequirement, LogisticsTask.requirement_id == OrderRequirement.id)
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                LogisticsTask.task_no.ilike(pattern),
+                LogisticsTask.id.ilike(pattern),
+                LogisticsTask.status.ilike(pattern),
+                OrderRequirement.customer_name.ilike(pattern),
+                OrderRequirement.salesperson_email.ilike(pattern),
+                OrderRequirement.product_summary.ilike(pattern),
+                OrderRequirement.quantity_text.ilike(pattern),
+                OrderRequirement.external_order_no.ilike(pattern),
+            )
+        )
+    if status and status.strip():
+        query = query.filter(LogisticsTask.status == status.strip())
+    if customer and customer.strip():
+        query = query.filter(OrderRequirement.customer_name.ilike(f"%{customer.strip()}%"))
+    if product and product.strip():
+        query = query.filter(OrderRequirement.product_summary.ilike(f"%{product.strip()}%"))
+    if salesperson and salesperson.strip():
+        query = query.filter(OrderRequirement.salesperson_email.ilike(f"%{salesperson.strip()}%"))
+    if order_no and order_no.strip():
+        query = query.filter(OrderRequirement.external_order_no.ilike(f"%{order_no.strip()}%"))
+
+    return page_response(
+        query.order_by(LogisticsTask.created_at.desc()),
+        serialize_logistics_task,
+        page,
+        page_size,
+        {"status_options": distinct_values(session, LogisticsTask.status)},
+    )
+
+
 @app.post("/api/tasks/clear")
 def clear_tasks(payload: TaskClearRequest, request: Request, session: Session = Depends(get_session)) -> dict:
     require_admin_password(payload.admin_password)
@@ -1275,6 +1482,43 @@ def clear_tasks(payload: TaskClearRequest, request: Request, session: Session = 
     )
     session.commit()
     return {"cleared": detail["task_count"], **detail}
+
+
+@app.get("/api/logistics-tasks/{task_id}")
+def logistics_task_detail(task_id: str, session: Session = Depends(get_session)) -> dict:
+    task = session.get(LogisticsTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="logistics task not found")
+    return serialize_logistics_task(task, include_versions=True)
+
+
+@app.get("/api/logistics-tasks/{task_id}/workflow")
+def logistics_task_workflow(task_id: str, session: Session = Depends(get_session)) -> dict:
+    task = session.get(LogisticsTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="logistics task not found")
+    return build_logistics_task_workflow(session, task)
+
+
+@app.post("/api/logistics-tasks/{task_id}/manual-close")
+def manual_close_logistics_task(task_id: str, payload: TaskManualCloseRequest, request: Request, session: Session = Depends(get_session)) -> dict:
+    task = session.get(LogisticsTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="logistics task not found")
+    try:
+        jobs = force_close_logistics_task_manual(
+            session,
+            task,
+            reason=payload.note,
+            actor=getattr(request.state, "username", "business-owner"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    return {
+        "closed": True,
+        "outbound_jobs": [{"id": job.id, "mail_type": job.mail_type, "status": job.status} for job in jobs],
+    }
 
 
 @app.get("/api/tasks/{task_id}")
@@ -1369,6 +1613,324 @@ def task_trace_graph(session: Session, task: ProductionTask) -> dict:
         for row in audits
     ]
     return {"nodes": nodes, "edges": edges, "timeline": timeline}
+
+
+def logistics_task_outbounds(session: Session, task: LogisticsTask) -> list[OutboundMailJob]:
+    pattern = f"%{task.task_no}%"
+    return (
+        session.query(OutboundMailJob)
+        .filter(or_(OutboundMailJob.subject.ilike(pattern), OutboundMailJob.body.ilike(pattern)))
+        .order_by(OutboundMailJob.created_at)
+        .all()
+    )
+
+
+def logistics_task_mails(session: Session, task: LogisticsTask) -> list[MailMessage]:
+    pattern = f"%{task.task_no}%"
+    rows = (
+        session.query(MailMessage)
+        .filter(or_(MailMessage.subject.ilike(pattern), MailMessage.body_text.ilike(pattern)))
+        .order_by(func.coalesce(MailMessage.received_at, MailMessage.created_at))
+        .all()
+    )
+    source_mail = session.get(MailMessage, task.requirement.source_mail_id) if task.requirement.source_mail_id else None
+    if source_mail is not None and all(row.id != source_mail.id for row in rows):
+        rows.insert(0, source_mail)
+    return rows
+
+
+def build_logistics_task_trace_graph(session: Session, task: LogisticsTask) -> dict:
+    requirement = task.requirement
+    source_mail = session.get(MailMessage, requirement.source_mail_id) if requirement.source_mail_id else None
+    versions = session.query(LogisticsTaskVersion).filter_by(logistics_task_id=task.id).order_by(LogisticsTaskVersion.version_no).all()
+    outbounds = logistics_task_outbounds(session, task)
+    mails = logistics_task_mails(session, task)
+    evidences = session.query(ExtractionEvidence).filter_by(requirement_id=requirement.id).order_by(ExtractionEvidence.created_at).all()
+    binding = session.query(RequirementWorkflowBinding).filter_by(requirement_id=requirement.id).one_or_none()
+    production_task = session.get(ProductionTask, task.production_task_id) if task.production_task_id else None
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+
+    def add_node(node_id: str, node_type: str, label: str, *, status: str = "", meta: dict | None = None) -> None:
+        if not any(item["id"] == node_id for item in nodes):
+            nodes.append({"id": node_id, "type": node_type, "label": label, "status": status, "meta": meta or {}})
+
+    def add_edge(source: str, target: str, label: str) -> None:
+        if source and target and not any(item["source"] == source and item["target"] == target and item["label"] == label for item in edges):
+            edges.append({"source": source, "target": target, "label": label})
+
+    if source_mail is not None:
+        add_node(source_mail.id, "mail", source_mail.subject or "来源邮件", status=source_mail.classification or "", meta=serialize_mail(source_mail, session))
+        add_edge(source_mail.id, requirement.id, "抽取")
+    add_node(requirement.id, "requirement", requirement.internal_order_no, status=requirement.status, meta=serialize_requirement_summary(requirement))
+    add_node(task.id, "logistics_task", task.task_no, status=task.status, meta=serialize_logistics_task(task))
+    add_edge(requirement.id, task.id, "生成物流任务")
+    if binding is not None:
+        workflow_node_id = binding.workflow_version_id or f"workflow:{binding.workflow_code or 'unknown'}"
+        add_node(workflow_node_id, "workflow", binding.workflow_name or binding.workflow_code or "命中流程", status=str(binding.match_confidence), meta=serialize_requirement_workflow_binding(binding))
+        add_edge(workflow_node_id, requirement.id, "规则初审")
+    for version in versions:
+        add_node(version.id, "logistics_task_version", f"V{version.version_no}", status=version.status, meta={"subject": version.subject})
+        add_edge(task.id, version.id, "版本")
+    for job in outbounds:
+        add_node(job.id, "outbound_mail", job.subject, status=job.status, meta=serialize_outbound_mail(job, session))
+        add_edge(task.id, job.id, job.mail_type)
+    for mail in mails:
+        if source_mail is not None and mail.id == source_mail.id:
+            continue
+        add_node(mail.id, "mail", mail.subject or "物流回复", status=mail.classification or "", meta=serialize_mail(mail, session))
+        add_edge(mail.id, task.id, "物流回复")
+    if production_task is not None:
+        add_node(production_task.id, "task", production_task.task_no, status=production_task.status, meta=serialize_task(production_task))
+        add_edge(task.id, production_task.id, "缺货转生产")
+    for evidence in evidences:
+        add_node(evidence.id, "evidence", evidence.field_name, status=str(evidence.confidence), meta=serialize_evidence(evidence))
+        add_edge(evidence.source_mail_id or requirement.id, evidence.id, "证据")
+        add_edge(evidence.id, requirement.id, "支撑字段")
+
+    object_ids = {task.id, requirement.id, *(row.id for row in versions), *(row.id for row in outbounds), *(row.id for row in mails)}
+    if source_mail is not None:
+        object_ids.add(source_mail.id)
+    if production_task is not None:
+        object_ids.add(production_task.id)
+    audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.related_object_id.in_(object_ids))
+        .order_by(AuditEvent.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    timeline = [
+        {
+            "type": "audit",
+            "title": row.event_type,
+            "status": row.related_object_type,
+            "detail": loads(row.detail, {}),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in audits
+    ]
+    return {"nodes": nodes, "edges": edges, "timeline": timeline}
+
+
+def build_logistics_task_workflow(session: Session, task: LogisticsTask) -> dict:
+    requirement = task.requirement
+    source_mail = session.get(MailMessage, requirement.source_mail_id) if requirement.source_mail_id else None
+    versions = session.query(LogisticsTaskVersion).filter_by(logistics_task_id=task.id).order_by(LogisticsTaskVersion.version_no).all()
+    outbounds = logistics_task_outbounds(session, task)
+    mails = logistics_task_mails(session, task)
+    issue_job = next((job for job in outbounds if job.mail_type == "LogisticsTaskIssue"), None)
+    production_task = session.get(ProductionTask, task.production_task_id) if task.production_task_id else None
+
+    def step(key: str, title: str, status: str, detail: str = "", at=None) -> dict:
+        return {
+            "key": key,
+            "title": title,
+            "status": status,
+            "detail": detail,
+            "created_at": at.isoformat() if at else None,
+        }
+
+    issue_status = "pending"
+    issue_detail = "等待生成物流核查邮件"
+    if issue_job is not None:
+        issue_status = "done" if issue_job.status == "Sent" else "current"
+        issue_detail = f"{issue_job.mail_type} / {issue_job.status}"
+
+    logistics_status = "pending"
+    logistics_detail = "等待物流反馈库存满足或缺货"
+    if task.status == "Closed":
+        logistics_status = "done"
+        logistics_detail = task.closed_reason or "物流已闭环"
+    elif task.status in {"ProductionRequested", "LogisticsShortageReported"}:
+        logistics_status = "done"
+        logistics_detail = "物流反馈缺货，已转生产"
+    elif task.status == "LogisticsIssued":
+        logistics_status = "current"
+
+    production_status = "pending"
+    production_detail = "库存满足时无需生产；缺货时自动转生产"
+    if production_task is not None:
+        production_status = "done" if production_task.status == "Closed" else "current"
+        production_detail = f"{production_task.task_no} / {production_task.status}"
+
+    steps = [
+        step("received", "销售/订单需求", "done", source_mail.subject if source_mail else "来源需求已记录", source_mail.created_at if source_mail else task.created_at),
+        step("review", "自动初审", "done", "订单信息已通过初审", task.created_at),
+        step("draft", "生成物流核查单", "done", f"当前版本 V{task.current_version_no}", task.created_at),
+        step("issue", "自动下达物流", issue_status, issue_detail, issue_job.created_at if issue_job else None),
+        step("logistics", "物流处理", logistics_status, logistics_detail, task.closed_at or task.updated_at),
+    ]
+    if production_task is not None or task.status in {"ProductionRequested", "LogisticsShortageReported"}:
+        steps.append(step("production", "缺货转生产", production_status, production_detail, production_task.created_at if production_task else None))
+    steps.append(step("closed", "闭环", "done" if task.status == "Closed" else "pending", task.closed_reason or "", task.closed_at or task.updated_at))
+
+    object_ids = {task.id, requirement.id}
+    if source_mail is not None:
+        object_ids.add(source_mail.id)
+    object_ids.update(version.id for version in versions)
+    object_ids.update(job.id for job in outbounds)
+    object_ids.update(mail.id for mail in mails)
+    audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.related_object_id.in_(object_ids))
+        .order_by(AuditEvent.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    exceptions = (
+        session.query(ExceptionCase)
+        .filter(or_(ExceptionCase.detail.ilike(f"%{task.task_no}%"), ExceptionCase.detail.ilike(f"%{task.id}%")))
+        .order_by(ExceptionCase.created_at.desc())
+        .all()
+    )
+    timeline = [
+        {
+            "type": "audit",
+            "title": row.event_type,
+            "status": "记录",
+            "detail": loads(row.detail, {}),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in audits
+    ]
+    timeline.extend(
+        {
+            "type": "outbound",
+            "title": job.mail_type,
+            "status": job.status,
+            "detail": {"subject": job.subject, "to": as_list(job.to_json), "cc": as_list(job.cc_json)},
+            "created_at": job.created_at.isoformat(),
+        }
+        for job in outbounds
+    )
+    timeline.extend(
+        {
+            "type": "mail",
+            "title": mail.classification or "物流回复",
+            "status": mail.from_address,
+            "detail": {"subject": mail.subject},
+            "created_at": (mail.received_at or mail.created_at).isoformat(),
+        }
+        for mail in mails
+    )
+    timeline.extend(
+        {
+            "type": "exception",
+            "title": row.exception_type,
+            "status": row.status,
+            "detail": loads(row.detail, {}),
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in exceptions
+    )
+    timeline.sort(key=lambda item: item["created_at"], reverse=True)
+    return {
+        "task": serialize_logistics_task(task, include_versions=True),
+        "steps": steps,
+        "timeline": timeline[:80],
+        "trace": build_logistics_task_trace_graph(session, task),
+    }
+
+
+def enqueue_manual_close_logistics_sales_notice(session: Session, task: LogisticsTask, *, reason: str) -> OutboundMailJob | None:
+    sales_email = (task.requirement.salesperson_email or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    idem = f"logistics-manual-close-sales:{task.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body_lines = ["销售同事好，", "", f"物流任务 {task.task_no} 已由商务人员手动强制关闭。"]
+    if reason:
+        body_lines.extend(["", f"关闭说明：{reason}"])
+    body_lines.extend(["", get_config(session, "bot_signature", "积木易搭AI机器人")])
+    job = OutboundMailJob(
+        mail_type="LogisticsManualClosedSales",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[物流任务手动关闭][{task.task_no}] 商务已关闭任务",
+        body="\n".join(body_lines),
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit_event(session, "LogisticsManualClosedSalesQueued", "LogisticsTask", task.id, {"task_no": task.task_no})
+    return job
+
+
+def enqueue_manual_close_logistics_notice(session: Session, task: LogisticsTask, *, reason: str) -> OutboundMailJob | None:
+    to_addresses = as_list(task.target_mail_to_json)
+    cc_addresses = as_list(task.target_mail_cc_json)
+    if not to_addresses:
+        return None
+    idem = f"logistics-manual-close-logistics:{task.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body_lines = ["物流部同事好，", "", f"物流任务 {task.task_no} 已由商务人员手动强制关闭，请停止后续处理。"]
+    if reason:
+        body_lines.extend(["", f"关闭说明：{reason}"])
+    body_lines.extend(["", get_config(session, "bot_signature", "积木易搭AI机器人")])
+    job = OutboundMailJob(
+        mail_type="LogisticsManualClosedLogistics",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[物流任务手动关闭][{task.task_no}] 请停止处理",
+        body="\n".join(body_lines),
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit_event(session, "LogisticsManualClosedLogisticsQueued", "LogisticsTask", task.id, {"task_no": task.task_no})
+    return job
+
+
+def add_audit_event(session: Session, event_type: str, object_type: str, object_id: str, detail: dict, actor: str = "System") -> None:
+    session.add(
+        AuditEvent(
+            event_type=event_type,
+            actor=actor,
+            related_object_type=object_type,
+            related_object_id=object_id,
+            detail=dumps(detail),
+            created_at=now_utc(),
+        )
+    )
+
+
+def force_close_logistics_task_manual(session: Session, task: LogisticsTask, *, reason: str = "", actor: str = "business-owner") -> list[OutboundMailJob]:
+    if task.status == "Closed":
+        raise ValueError("logistics task is already closed")
+    clean_reason = reason.strip()
+    task.status = "Closed"
+    task.closed_reason = "ManualForceClosed"
+    task.closed_at = now_utc()
+    task.updated_at = now_utc()
+    if not task.production_task_id:
+        task.requirement.status = "Closed"
+        task.requirement.updated_at = now_utc()
+    for item in task.items:
+        if item.status not in {"Shipped", "NeedProduction"}:
+            item.status = "Closed"
+            item.updated_at = now_utc()
+    outbound_jobs = [
+        enqueue_manual_close_logistics_sales_notice(session, task, reason=clean_reason),
+        enqueue_manual_close_logistics_notice(session, task, reason=clean_reason),
+    ]
+    valid_jobs = [job for job in outbound_jobs if job is not None]
+    add_audit_event(
+        session,
+        "LogisticsTaskManualForceClosed",
+        "LogisticsTask",
+        task.id,
+        {"reason": clean_reason, "outbound_job_ids": [job.id for job in valid_jobs]},
+        actor,
+    )
+    return valid_jobs
 
 
 @app.get("/api/tasks/{task_id}/workflow")
@@ -1600,6 +2162,7 @@ def outbound_mails(
         query = query.filter(
             or_(
                 OutboundMailJob.subject.ilike(pattern),
+                OutboundMailJob.body.ilike(pattern),
                 OutboundMailJob.mail_type.ilike(pattern),
                 OutboundMailJob.status.ilike(pattern),
                 OutboundMailJob.to_json.ilike(pattern),
@@ -2528,6 +3091,110 @@ def upsert_default_department(payload: DepartmentUpsert, session: Session = Depe
     return save_production_department(payload, session)
 
 
+@app.get("/api/logistics-departments")
+def list_logistics_departments(
+    q: str | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(LogisticsDepartment)
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                LogisticsDepartment.department_code.ilike(pattern),
+                LogisticsDepartment.department_name.ilike(pattern),
+                LogisticsDepartment.mail_to_json.ilike(pattern),
+                LogisticsDepartment.mail_cc_json.ilike(pattern),
+                LogisticsDepartment.status.ilike(pattern),
+            )
+        )
+    if status and status.strip():
+        query = query.filter(LogisticsDepartment.status == status.strip())
+    else:
+        query = query.filter(LogisticsDepartment.status != "Deleted")
+    return page_response(
+        query.order_by(LogisticsDepartment.department_code),
+        serialize_logistics_department,
+        page,
+        page_size,
+        {
+            "status_options": [
+                value
+                for value in distinct_values(session, LogisticsDepartment.status)
+                if value != "Deleted"
+            ]
+        },
+    )
+
+
+def save_logistics_department(payload: DepartmentUpsert, session: Session) -> dict:
+    department_code = str(payload.department_code or "").strip()
+    department_name = str(payload.department_name or "").strip()
+    if not department_code:
+        raise HTTPException(status_code=400, detail="部门编码必填")
+    if not department_name:
+        raise HTTPException(status_code=400, detail="部门名称必填")
+    mail_to = normalize_email_values(payload.mail_to)
+    mail_cc = normalize_email_values(payload.mail_cc)
+    invalid_to = invalid_email_addresses(mail_to)
+    invalid_cc = invalid_email_addresses(mail_cc)
+    if invalid_to:
+        raise HTTPException(status_code=400, detail=f"主送邮箱格式不合法：{', '.join(invalid_to)}")
+    if invalid_cc:
+        raise HTTPException(status_code=400, detail=f"抄送邮箱格式不合法：{', '.join(invalid_cc)}")
+    dept = session.query(LogisticsDepartment).filter_by(department_code=department_code).one_or_none()
+    if dept is None:
+        dept = LogisticsDepartment(department_code=department_code)
+        session.add(dept)
+    dept.department_name = department_name
+    dept.mail_to_json = dumps(mail_to)
+    dept.mail_cc_json = dumps(mail_cc)
+    dept.status = "Active"
+    dept.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "department_id": dept.id}
+
+
+@app.post("/api/logistics-departments")
+def create_or_update_logistics_department(payload: DepartmentUpsert, session: Session = Depends(get_session)) -> dict:
+    return save_logistics_department(payload, session)
+
+
+@app.delete("/api/logistics-departments/{department_id}")
+def delete_logistics_department(department_id: str, request: Request, session: Session = Depends(get_session)) -> dict:
+    dept = session.get(LogisticsDepartment, department_id)
+    if dept is None or dept.status == "Deleted":
+        raise HTTPException(status_code=404, detail="logistics department not found")
+    dept.status = "Deleted"
+    dept.updated_at = now_utc()
+    actor = getattr(request.state, "username", "system")
+    session.add(
+        AuditEvent(
+            event_type="LogisticsDepartmentDeleted",
+            actor=actor,
+            related_object_type="LogisticsDepartment",
+            related_object_id=dept.id,
+            detail=dumps(
+                {
+                    "department_code": dept.department_code,
+                    "department_name": dept.department_name,
+                }
+            ),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return {"ok": True, "department": serialize_logistics_department(dept)}
+
+
+@app.put("/api/logistics-departments/default")
+def upsert_default_logistics_department(payload: DepartmentUpsert, session: Session = Depends(get_session)) -> dict:
+    return save_logistics_department(payload, session)
+
+
 @app.get("/api/templates/production-task")
 def get_task_template(session: Session = Depends(get_session)) -> dict:
     template = session.query(MailTemplate).filter_by(template_code="production_task", status="Active").first()
@@ -2765,7 +3432,19 @@ def serialize_department(row: ProductionDepartment) -> dict:
     }
 
 
+def serialize_logistics_department(row: LogisticsDepartment) -> dict:
+    return {
+        "id": row.id,
+        "department_code": row.department_code,
+        "department_name": row.department_name,
+        "mail_to": as_list(row.mail_to_json),
+        "mail_cc": as_list(row.mail_cc_json),
+        "status": row.status,
+    }
+
+
 def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None, *, include_body: bool = False) -> dict:
+    related = infer_related_task_for_outbound(session, row)
     payload = {
         "id": row.id,
         "mail_type": row.mail_type,
@@ -2775,13 +3454,15 @@ def serialize_outbound_mail(row: OutboundMailJob, session: Session | None = None
         "status": row.status,
         "created_at": row.created_at.isoformat(),
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        "related_task_id": related["id"],
+        "related_task_no": related["task_no"],
+        "related_task_type": related["type"],
         "pending_diagnosis": outbound_pending_diagnosis(session, row) if session is not None else None,
     }
     if include_body:
         payload.update(
             {
                 "body": row.body,
-                "related_task_id": row.related_task_id,
                 "related_version_id": row.related_version_id,
                 "idempotency_key": row.idempotency_key,
             }
@@ -2905,12 +3586,13 @@ def serialize_requirement_summary(row: OrderRequirement) -> dict:
     }
 
 
-def serialize_mail(row: MailMessage) -> dict:
-    related_task_no = None
-    if row.related_task_id:
-        with SessionLocal() as session:
-            task = session.get(ProductionTask, row.related_task_id)
-            related_task_no = task.task_no if task is not None else None
+def serialize_mail(row: MailMessage, session: Session | None = None) -> dict:
+    active_session = session or object_session(row)
+    if active_session is None:
+        with SessionLocal() as fallback_session:
+            related = infer_related_task_for_mail(fallback_session, row)
+    else:
+        related = infer_related_task_for_mail(active_session, row)
     return {
         "id": row.id,
         "direction": row.direction,
@@ -2920,11 +3602,63 @@ def serialize_mail(row: MailMessage) -> dict:
         "subject": row.subject,
         "classification": row.classification,
         "classification_confidence": row.classification_confidence,
-        "related_task_id": row.related_task_id,
-        "related_task_no": related_task_no,
+        "related_task_id": related["id"],
+        "related_task_no": related["task_no"],
+        "related_task_type": related["type"],
         "received_at": (row.received_at or row.created_at).isoformat(),
         "created_at": row.created_at.isoformat(),
     }
+
+
+def empty_related_task() -> dict[str, str]:
+    return {"id": "", "task_no": "", "type": ""}
+
+
+def production_task_related(session: Session, task_id: str | None) -> dict[str, str]:
+    if not task_id:
+        return empty_related_task()
+    task = session.get(ProductionTask, task_id)
+    if task is None:
+        return {"id": task_id, "task_no": "", "type": "production"}
+    return {"id": task.id, "task_no": task.task_no, "type": "production"}
+
+
+def logistics_task_related(task: LogisticsTask | None) -> dict[str, str]:
+    if task is None:
+        return empty_related_task()
+    return {"id": task.id, "task_no": task.task_no, "type": "logistics"}
+
+
+def find_logistics_task_by_text(session: Session, text: str) -> LogisticsTask | None:
+    for task_no in LOGISTICS_TASK_NO_PATTERN.findall(text or ""):
+        task = session.query(LogisticsTask).filter(func.upper(LogisticsTask.task_no) == task_no.upper()).one_or_none()
+        if task is not None:
+            return task
+    return None
+
+
+def infer_related_task_for_mail(session: Session, row: MailMessage) -> dict[str, str]:
+    if row.related_task_id:
+        return production_task_related(session, row.related_task_id)
+    task = find_logistics_task_by_text(session, f"{row.subject}\n{row.body_text}")
+    if task is not None:
+        return logistics_task_related(task)
+    task = (
+        session.query(LogisticsTask)
+        .join(OrderRequirement, OrderRequirement.id == LogisticsTask.requirement_id)
+        .filter(OrderRequirement.source_mail_id == row.id)
+        .order_by(LogisticsTask.created_at.desc())
+        .first()
+    )
+    return logistics_task_related(task)
+
+
+def infer_related_task_for_outbound(session: Session | None, row: OutboundMailJob) -> dict[str, str]:
+    if session is None:
+        return empty_related_task()
+    if row.related_task_id:
+        return production_task_related(session, row.related_task_id)
+    return logistics_task_related(find_logistics_task_by_text(session, f"{row.subject}\n{row.body}"))
 
 
 def serialize_attachment(row: AttachmentAsset) -> dict:
@@ -2944,6 +3678,94 @@ def serialize_attachment(row: AttachmentAsset) -> dict:
         "text_preview": (row.extracted_text or "")[:300],
         "created_at": row.created_at.isoformat(),
     }
+
+
+def serialize_crm_order(row: CrmSalesOrder, *, include_raw: bool = False) -> dict:
+    data = {
+        "id": row.id,
+        "source_system": row.source_system,
+        "crm_order_id": row.crm_order_id,
+        "crm_order_no": row.crm_order_no,
+        "customer_id": row.customer_id,
+        "customer_name": row.customer_name,
+        "opportunity_id": row.opportunity_id,
+        "opportunity_name": row.opportunity_name,
+        "sales_user_id": row.sales_user_id,
+        "sales_user_name": row.sales_user_name,
+        "owner_department": row.owner_department,
+        "life_status": row.life_status,
+        "approval_status": row.approval_status,
+        "order_date": row.order_date,
+        "settlement_method": row.settlement_method,
+        "currency": row.currency,
+        "order_amount": row.order_amount,
+        "received_amount": row.received_amount,
+        "receivable_amount": row.receivable_amount,
+        "invoice_amount": row.invoice_amount,
+        "product_amount": row.product_amount,
+        "logistics_status": row.logistics_status,
+        "shipment_status": row.shipment_status,
+        "invoice_status": row.invoice_status,
+        "receipt_contact": row.receipt_contact,
+        "receipt_address": row.receipt_address,
+        "delivery_date": row.delivery_date,
+        "remark": row.remark,
+        "attachment_files": as_list(row.attachment_files_json),
+        "sync_status": row.sync_status,
+        "synced_at": row.synced_at.isoformat() if row.synced_at else None,
+        "source_created_at": row.source_created_at.isoformat() if row.source_created_at else None,
+        "source_updated_at": row.source_updated_at.isoformat() if row.source_updated_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if include_raw:
+        data["raw"] = loads(row.raw_json, {})
+    return data
+
+
+def serialize_fulfillment_item(row: FulfillmentItem) -> dict:
+    return {
+        "id": row.id,
+        "material_code": row.material_code,
+        "material_name": row.material_name,
+        "required_quantity": row.required_quantity,
+        "available_quantity": row.available_quantity,
+        "shortage_quantity": row.shortage_quantity,
+        "status": row.status,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+def serialize_logistics_task(task: LogisticsTask, include_versions: bool = False) -> dict:
+    data = {
+        "id": task.id,
+        "task_no": task.task_no,
+        "status": task.status,
+        "customer_name": task.requirement.customer_name,
+        "external_order_no": task.requirement.external_order_no,
+        "salesperson_email": task.requirement.salesperson_email,
+        "product_summary": task.requirement.product_summary,
+        "quantity_text": task.requirement.quantity_text,
+        "expected_delivery_date": task.requirement.expected_delivery_date,
+        "target_mail_to": as_list(task.target_mail_to_json),
+        "target_mail_cc": as_list(task.target_mail_cc_json),
+        "production_task_id": task.production_task_id,
+        "closed_reason": task.closed_reason,
+        "created_at": task.created_at.isoformat(),
+    }
+    if include_versions:
+        data["versions"] = [
+            {
+                "id": version.id,
+                "version_no": version.version_no,
+                "subject": version.subject,
+                "body": version.body,
+                "status": version.status,
+            }
+            for version in sorted(task.versions, key=lambda row: row.version_no)
+        ]
+        data["items"] = [serialize_fulfillment_item(row) for row in sorted(task.items, key=lambda row: row.created_at)]
+    return data
 
 
 def serialize_task(task: ProductionTask, include_versions: bool = False) -> dict:
@@ -3057,6 +3879,7 @@ def list_products_spu_api(
                 "name": spu.name,
                 "brand": spu.brand,
                 "category": spu.category,
+                "review_aliases": spu_review_aliases(spu),
                 "created_at": spu.created_at.isoformat(),
             } for spu in items
         ],
@@ -3071,6 +3894,17 @@ def create_product_spu_api(payload: ProductSPUCreate, session: Session = Depends
     spu = create_spu(session, spu_id=payload.spu_id, name=payload.name, brand=payload.brand, category=payload.category)
     session.commit()
     return {"id": spu.id, "spu_id": spu.spu_id}
+
+
+@app.put("/api/products/spu/{spu_uuid}/review-aliases")
+def update_product_spu_review_aliases_api(spu_uuid: str, payload: dict, session: Session = Depends(get_session)) -> dict:
+    try:
+        spu = update_spu_review_aliases(session, spu_uuid, payload.get("aliases"))
+        session.commit()
+        return {"ok": True, "id": spu.id, "spu_id": spu.spu_id, "review_aliases": spu_review_aliases(spu)}
+    except ValueError as error:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 import tempfile
@@ -3099,23 +3933,261 @@ def api_confirm_product_import(data: dict, session: Session = Depends(get_sessio
     return {"message": "导入成功", "counts": counts}
 
 
+@app.get("/api/crm/orders")
+def list_crm_orders(
+    q: str = "",
+    status: str = "",
+    customer: str = "",
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    query = session.query(CrmSalesOrder)
+    if q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                CrmSalesOrder.crm_order_no.ilike(pattern),
+                CrmSalesOrder.customer_name.ilike(pattern),
+                CrmSalesOrder.opportunity_name.ilike(pattern),
+                CrmSalesOrder.sales_user_name.ilike(pattern),
+            )
+        )
+    if status.strip():
+        query = query.filter(CrmSalesOrder.life_status == status.strip())
+    if customer.strip():
+        query = query.filter(CrmSalesOrder.customer_name.ilike(f"%{customer.strip()}%"))
+    total = query.count()
+    rows = (
+        query.order_by(CrmSalesOrder.order_date.desc(), CrmSalesOrder.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "items": [serialize_crm_order(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "summary": crm_order_summary(session),
+        "status_options": [row[0] for row in session.query(CrmSalesOrder.life_status).distinct().all() if row[0]],
+    }
+
+
+@app.get("/api/crm/orders/{order_id}")
+def get_crm_order(order_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(CrmSalesOrder, order_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="CRM 订单不存在")
+    return serialize_crm_order(row, include_raw=True)
+
+
+@app.get("/api/crm/sync/summary")
+def get_crm_sync_summary(session: Session = Depends(get_session)) -> dict:
+    runs = session.query(CrmSyncRun).order_by(CrmSyncRun.started_at.desc()).limit(10).all()
+    return {**crm_order_summary(session), "runs": [serialize_sync_run(row) for row in runs]}
+
+
+@app.post("/api/crm/sync/queue")
+def queue_crm_sync(session: Session = Depends(get_session)) -> dict:
+    return queue_crm_order_sync(session, source="manual")
+
+
+@app.post("/api/crm/sync/run")
+def run_crm_sync_now(session: Session = Depends(get_session)) -> dict:
+    try:
+        return run_crm_sales_order_sync(session, trigger="manual")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/products/erp-sync")
+def sync_products_from_erp(session: Session = Depends(get_session)) -> dict:
+    result = sync_erp_materials(session)
+    session.commit()
+    return result
+
+
+@app.post("/api/products/review-preview")
+def preview_product_review_api(payload: dict, session: Session = Depends(get_session)) -> dict:
+    text = str(payload.get("text") or payload.get("product_summary") or "").strip()
+    source_text = str(payload.get("source_text") or "").strip()
+    channel = str(payload.get("channel") or "default").strip() or "default"
+    if not text and not source_text:
+        raise HTTPException(status_code=400, detail="请提供需要测试的订单物料文本")
+    extracted_items = extract_order_products_for_review(session, text, source_text, channel=channel)
+    reviewed_items = review_order_products(session, extracted_items, channel=channel) if extracted_items else []
+    suggestions = suggest_product_review_candidates(session, f"{text}\n{source_text}", limit=5) if not reviewed_items else []
+    status_counts: dict[str, int] = {}
+    risk_flags: list[str] = []
+    for item in reviewed_items:
+        review = item.get("review") or {}
+        status = review.get("status") or "Unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        risk_flags.extend(str(flag) for flag in review.get("risk_flags") or [] if str(flag).strip())
+    return {
+        "ok": True,
+        "channel": channel,
+        "items": reviewed_items,
+        "suggestions": suggestions,
+        "alias_candidate": suggestions[0]["suggested_alias"] if suggestions else "",
+        "summary": {
+            "matched_count": len(reviewed_items),
+            "suggestion_count": len(suggestions),
+            "status_counts": status_counts,
+            "risk_flags": risk_flags,
+        },
+    }
+
+
+@app.get("/api/products/review-readiness")
+def product_review_readiness_api(
+    channel: str = "default",
+    limit: int = Query(20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return product_review_readiness(session, channel=channel, limit=limit)
+
+
+@app.get("/api/products/inventory")
+def list_product_inventory(
+    q: str = "",
+    material_code: str = "",
+    warehouse_code: str = "",
+    low_stock_only: bool = False,
+    countable_only: bool = True,
+    measure_type: str = "",
+    inventory_scope: str = "",
+    threshold: float = Query(1, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return list_inventory_snapshots(
+        session,
+        q=q,
+        material_code=material_code,
+        warehouse_code=warehouse_code,
+        low_stock_only=low_stock_only,
+        countable_only=countable_only,
+        measure_type=measure_type,
+        inventory_scope=inventory_scope,
+        threshold=threshold,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/products/inventory/warehouses")
+def list_product_inventory_warehouses(
+    q: str = "",
+    limit: int = Query(30, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return list_inventory_warehouses(session, q=q, limit=limit)
+
+
+@app.get("/api/products/inventory/types")
+def list_product_inventory_types(
+    q: str = "",
+    warehouse_code: str = "",
+    low_stock_only: bool = False,
+    countable_only: bool = True,
+    measure_type: str = "",
+    inventory_scope: str = "",
+    threshold: float = Query(1, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return list_inventory_type_summary(
+        session,
+        q=q,
+        warehouse_code=warehouse_code,
+        low_stock_only=low_stock_only,
+        countable_only=countable_only,
+        measure_type=measure_type,
+        inventory_scope=inventory_scope,
+        threshold=threshold,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/products/inventory/type-items")
+def list_product_inventory_type_items(
+    material_type: str = Query(..., min_length=1),
+    parent_category: str = "",
+    q: str = "",
+    warehouse_code: str = "",
+    stock_status: str = "",
+    low_stock_only: bool = False,
+    countable_only: bool = True,
+    measure_type: str = "",
+    inventory_scope: str = "",
+    threshold: float = Query(1, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> dict:
+    return list_inventory_type_items(
+        session,
+        material_type=material_type,
+        parent_category=parent_category,
+        q=q,
+        warehouse_code=warehouse_code,
+        stock_status=stock_status,
+        low_stock_only=low_stock_only,
+        countable_only=countable_only,
+        measure_type=measure_type,
+        inventory_scope=inventory_scope,
+        threshold=threshold,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/products/inventory/classification-rules")
+def get_inventory_classification_rules(session: Session = Depends(get_session)) -> dict:
+    return inventory_classification_diagnostics(session)
+
+
+@app.put("/api/products/inventory/classification-rules")
+def update_inventory_classification_rules(payload: dict, session: Session = Depends(get_session)) -> dict:
+    rules = payload.get("rules") if isinstance(payload.get("rules"), dict) else payload
+    normalized = save_inventory_classification_rules(session, rules)
+    session.commit()
+    return {"ok": True, "rules": normalized, "diagnostics": inventory_classification_diagnostics(session)}
+
+
+@app.post("/api/products/inventory/erp-sync")
+def sync_inventory_from_erp(session: Session = Depends(get_session)) -> dict:
+    result = sync_inventory_snapshots(session)
+    session.commit()
+    return result
+
+
 @app.get("/api/products/sku")
 def list_products_sku_api(
     spu_id: str = Query(None, description="所属 SPU ID (Code)"),
     spu_uuid: str = Query(None, description="所属 SPU UUID"),
+    q: str = Query("", description="搜索 SKU、SPU、成品名称或预审别名"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     session: Session = Depends(get_session)
 ) -> dict:
     skip = (page - 1) * page_size
-    items, total = get_skus(session, skip=skip, limit=page_size, spu_id=spu_id, spu_uuid=spu_uuid)
+    items, total = get_skus(session, skip=skip, limit=page_size, spu_id=spu_id, spu_uuid=spu_uuid, query=q)
     return {
         "items": [
             {
                 "id": sku.id,
                 "spu_id": sku.spu.spu_id,
+                "spu_name": sku.spu.name,
                 "sku_id": sku.sku_id,
                 "status": sku.status,
+                "review_aliases": spu_review_aliases(sku.spu),
                 "attributes": loads(sku.attributes_json, {}),
                 "created_at": sku.created_at.isoformat(),
             } for sku in items
@@ -3128,26 +4200,35 @@ def list_products_sku_api(
 
 @app.post("/api/products/sku")
 def create_product_sku_api(payload: ProductSKUCreate, session: Session = Depends(get_session)) -> dict:
-    sku = create_sku(session, spu_uuid=payload.spu_uuid, sku_id=payload.sku_id, attributes=payload.attributes)
-    session.commit()
-    return {"id": sku.id, "sku_id": sku.sku_id}
+    try:
+        sku = create_sku(session, spu_uuid=payload.spu_uuid, sku_id=payload.sku_id, attributes=payload.attributes)
+        session.commit()
+        return {"id": sku.id, "sku_id": sku.sku_id}
+    except ValueError as error:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.get("/api/pricing")
 def list_channel_pricing_api(
     sku_id: str = Query(None, description="按 SKU ID (Code) 筛选"),
     sku_uuid: str = Query(None, description="按 SKU UUID 筛选"),
+    q: str = Query("", description="搜索 SKU、SPU、成品名称或预审别名"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     session: Session = Depends(get_session)
 ) -> dict:
     skip = (page - 1) * page_size
-    items, total = get_channel_pricing(session, skip=skip, limit=page_size, sku_id=sku_id, sku_uuid=sku_uuid)
+    items, total = get_channel_pricing(session, skip=skip, limit=page_size, sku_id=sku_id, sku_uuid=sku_uuid, query=q)
     return {
         "items": [
             {
                 "id": p.id,
+                "sku_uuid": p.sku_uuid,
                 "sku_id": p.sku.sku_id,
+                "spu_id": p.sku.spu.spu_id,
+                "spu_name": p.sku.spu.name,
+                "review_aliases": spu_review_aliases(p.sku.spu),
                 "channel": p.channel,
                 "tier_a_price": p.tier_a_price,
                 "tier_b_price": p.tier_b_price,
@@ -3167,45 +4248,58 @@ def list_channel_pricing_api(
 
 @app.post("/api/pricing")
 def set_channel_pricing_api(payload: ChannelPricingUpdate, session: Session = Depends(get_session)) -> dict:
-    pricing = set_channel_pricing(
-        session,
-        sku_uuid=payload.sku_uuid,
-        channel=payload.channel,
-        tier_a_price=payload.tier_a_price,
-        tier_b_price=payload.tier_b_price,
-        tier_c_price=payload.tier_c_price,
-        map_price=payload.map_price,
-        promo_start_time=payload.promo_start_time,
-        promo_end_time=payload.promo_end_time,
-        currency=payload.currency
-    )
-    session.commit()
-    return {"id": pricing.id, "sku_uuid": pricing.sku_uuid, "channel": pricing.channel}
+    try:
+        pricing = set_channel_pricing(
+            session,
+            sku_uuid=payload.sku_uuid,
+            channel=payload.channel,
+            tier_a_price=payload.tier_a_price,
+            tier_b_price=payload.tier_b_price,
+            tier_c_price=payload.tier_c_price,
+            map_price=payload.map_price,
+            promo_start_time=payload.promo_start_time,
+            promo_end_time=payload.promo_end_time,
+            currency=payload.currency
+        )
+        session.commit()
+        return {"id": pricing.id, "sku_uuid": pricing.sku_uuid, "channel": pricing.channel}
+    except ValueError as error:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 @app.get("/api/promotions")
 def list_promotions_api(
+    q: str = Query("", description="搜索促销名、SKU、成品、渠道或绑定状态"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     session: Session = Depends(get_session)
 ) -> dict:
     skip = (page - 1) * page_size
-    items, total = get_promotions(session, skip=skip, limit=page_size)
+    items, total = get_promotions(session, skip=skip, limit=page_size, query=q)
+    def serialize_promotion(rule):
+        binding = promotion_rule_binding_info(session, rule)
+        return {
+            "id": rule.id,
+            "sku_uuid": rule.sku_uuid,
+            "sku_id": rule.sku.sku_id if rule.sku else "",
+            "spu_id": rule.sku.spu.spu_id if rule.sku and rule.sku.spu else "",
+            "spu_name": rule.sku.spu.name if rule.sku and rule.sku.spu else "",
+            "binding_status": binding["status"],
+            "binding_label": binding["label"],
+            "binding_valid": binding["is_valid"],
+            "name": rule.name,
+            "channel": rule.channel,
+            "is_active": rule.is_active,
+            "start_time": rule.start_time.isoformat() if rule.start_time else None,
+            "end_time": rule.end_time.isoformat() if rule.end_time else None,
+            "priority": rule.priority,
+            "discount_type": rule.discount_type,
+            "discount_value": rule.discount_value,
+            "created_at": rule.created_at.isoformat(),
+        }
     return {
-        "items": [
-            {
-                "id": rule.id,
-                "name": rule.name,
-                "channel": rule.channel,
-                "is_active": rule.is_active,
-                "start_time": rule.start_time.isoformat() if rule.start_time else None,
-                "end_time": rule.end_time.isoformat() if rule.end_time else None,
-                "priority": rule.priority,
-                "discount_type": rule.discount_type,
-                "discount_value": rule.discount_value,
-                "created_at": rule.created_at.isoformat(),
-            } for rule in items
-        ],
+        "items": [serialize_promotion(rule) for rule in items],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -3218,6 +4312,7 @@ def create_promotion_api(payload: PromotionRuleCreate, session: Session = Depend
         rule = create_promotion_rule(
             session,
             name=payload.name,
+            sku_uuid=payload.sku_uuid,
             discount_type=payload.discount_type,
             discount_value=payload.discount_value,
             channel=payload.channel,
@@ -3228,6 +4323,9 @@ def create_promotion_api(payload: PromotionRuleCreate, session: Session = Depend
         res = {"id": rule.id, "name": rule.name}
         session.commit()
         return res
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         session.rollback()
         logger.exception("Error in create_promotion_api")
@@ -3242,6 +4340,9 @@ def update_promotion_api(rule_id: str, payload: PromotionRuleUpdate, session: Se
         res = {"id": rule.id, "name": rule.name}
         session.commit()
         return res
+    except ValueError as e:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         session.rollback()
         logger.exception("Error in update_promotion_api")

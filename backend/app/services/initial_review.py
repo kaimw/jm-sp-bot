@@ -328,6 +328,8 @@ def find_recent_duplicate_requirement(session: Session, requirement: OrderRequir
         .all()
     )
     for candidate in candidates:
+        if candidate.source_mail_id == requirement.source_mail_id:
+            continue
         if _normalize_compare_text(candidate.salesperson_email) != salesperson_email:
             continue
         if not _same_requirement_content(requirement, candidate):

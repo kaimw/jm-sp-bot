@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.models import ProductSPU, ProductSKU, ChannelPricing
+from backend.app.services.products import validate_channel_pricing_values
 
 def _clean_val(v):
     if pd.isna(v):
@@ -252,6 +253,15 @@ def confirm_excel_import(data: Dict[str, Any], session: Session) -> Dict[str, in
         )).scalars().first()
         
         if existing:
+            validate_channel_pricing_values(
+                tier_a_price=pricing_data.get("tier_a_price", existing.tier_a_price),
+                tier_b_price=pricing_data.get("tier_b_price", existing.tier_b_price),
+                tier_c_price=pricing_data.get("tier_c_price", existing.tier_c_price),
+                map_price=pricing_data.get("map_price", existing.map_price),
+                max_price=pricing_data.get("max_price", existing.max_price),
+                promo_start_time=pricing_data.get("promo_start_time", existing.promo_start_time),
+                promo_end_time=pricing_data.get("promo_end_time", existing.promo_end_time),
+            )
             existing.channel_sku_id = pricing_data.get("channel_sku_id", existing.channel_sku_id)
             existing.listing_id = pricing_data.get("listing_id", existing.listing_id)
             existing.status = pricing_data.get("status", existing.status)
@@ -268,6 +278,15 @@ def confirm_excel_import(data: Dict[str, Any], session: Session) -> Dict[str, in
             existing.stock_quantity = pricing_data.get("stock_quantity", existing.stock_quantity)
             existing.manager = pricing_data.get("manager", existing.manager)
         else:
+            validate_channel_pricing_values(
+                tier_a_price=pricing_data.get("tier_a_price"),
+                tier_b_price=pricing_data.get("tier_b_price"),
+                tier_c_price=pricing_data.get("tier_c_price"),
+                map_price=pricing_data.get("map_price"),
+                max_price=pricing_data.get("max_price"),
+                promo_start_time=pricing_data.get("promo_start_time"),
+                promo_end_time=pricing_data.get("promo_end_time"),
+            )
             new_pricing = ChannelPricing(
                 sku_uuid=sku.id,
                 channel=channel,

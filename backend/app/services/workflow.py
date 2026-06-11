@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_
@@ -14,9 +14,13 @@ from backend.app.models import (
     AttachmentAsset,
     ExceptionCase,
     ExtractionEvidence,
+    FulfillmentItem,
     MailMessage,
     MailTemplate,
     ModelProviderConfig,
+    LogisticsDepartment,
+    LogisticsTask,
+    LogisticsTaskVersion,
     OrderRequirement,
     OutboundMailJob,
     ProcessingJob,
@@ -52,6 +56,7 @@ from backend.app.services.products import (
 
 
 TASK_NO_PATTERN = re.compile(r"PT-\d{8}-\d{4}", re.IGNORECASE)
+LOGISTICS_TASK_NO_PATTERN = re.compile(r"LT-\d{8}-\d{4}", re.IGNORECASE)
 REQUIREMENT_NO_PATTERN = re.compile(r"REQ-\d{8}-\d{4}", re.IGNORECASE)
 INCOMPLETE_REPLY_KEYWORDS = ["待确认", "不确定", "稍后", "无法确认", "再确认"]
 QUESTION_INDICATORS = ["?", "？", "疑问", "请确认", "信息不足", "未写明", "没有写明", "不明确", "哪个", "哪一", "国内", "海外"]
@@ -61,6 +66,8 @@ STATUS_QUERY_INTENT_KEYWORDS = ["状态", "进度", "处理到哪", "到哪了",
 PRODUCTION_CONFIRM_KEYWORDS = ["确认", "确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 PRODUCTION_EXPLICIT_CONFIRM_KEYWORDS = ["确认排产", "可以生产", "已排产", "安排生产", "同意排产", "同意生产", "同意安排生产", "确认生产"]
 PRODUCTION_TERMINATE_KEYWORDS = ["终止生产", "停止生产", "暂停生产", "取消生产", "终止排产", "停止排单", "停止该任务", "终止该任务"]
+LOGISTICS_STOCK_OK_KEYWORDS = ["库存满足", "可以发货", "可发货", "已发货", "快递单号", "物流单号", "发货单号", "已安排发货"]
+LOGISTICS_SHORTAGE_KEYWORDS = ["库存不足", "缺货", "缺失物料", "不能满足", "无法满足", "无库存", "不够"]
 SALES_ACK_CLASSIFICATIONS = {
     "SalesOrderRequirement",
     "SalesClarificationReply",
@@ -68,7 +75,15 @@ SALES_ACK_CLASSIFICATIONS = {
     "OrderCancelRequest",
 }
 OUTBOUND_PRIORITY_TASK = 30
+OUTBOUND_PRIORITY_LOGISTICS = 25
 REPORT_TIMEZONE = timezone(timedelta(hours=8))
+
+
+@dataclass(frozen=True)
+class MaterialOrderItem:
+    product_summary: str
+    quantity_text: str
+    raw_text: str
 
 
 def get_config(session: Session, key: str, fallback: str = "") -> str:
@@ -197,6 +212,10 @@ def make_task_no(session: Session) -> str:
     return f"PT-{datetime.now().strftime('%Y%m%d')}-{next_sequence(session, ProductionTask, 'id'):04d}"
 
 
+def make_logistics_task_no(session: Session) -> str:
+    return f"LT-{datetime.now().strftime('%Y%m%d')}-{next_sequence(session, LogisticsTask, 'id'):04d}"
+
+
 def recipient_hash(to_addresses: list[str], cc_addresses: list[str]) -> str:
     raw = dumps({"to": sorted(to_addresses), "cc": sorted(cc_addresses)})
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -214,9 +233,29 @@ def primary_department(session: Session) -> ProductionDepartment:
     return department
 
 
+def primary_logistics_department(session: Session) -> LogisticsDepartment:
+    departments = session.query(LogisticsDepartment).filter_by(status="Active").order_by(LogisticsDepartment.department_code).all()
+    department = next((item for item in departments if as_list(item.mail_to_json)), None)
+    if department is None and departments:
+        department = departments[0]
+    if department is None:
+        department = LogisticsDepartment(department_code="default", department_name="默认物流部门")
+        session.add(department)
+        session.flush()
+    return department
+
+
 def production_department_addresses(session: Session) -> set[str]:
     addresses: set[str] = set()
     for department in session.query(ProductionDepartment).filter_by(status="Active").all():
+        addresses.update(address.lower() for address in as_list(department.mail_to_json))
+        addresses.update(address.lower() for address in as_list(department.mail_cc_json))
+    return addresses
+
+
+def logistics_department_addresses(session: Session) -> set[str]:
+    addresses: set[str] = set()
+    for department in session.query(LogisticsDepartment).filter_by(status="Active").all():
         addresses.update(address.lower() for address in as_list(department.mail_to_json))
         addresses.update(address.lower() for address in as_list(department.mail_cc_json))
     return addresses
@@ -286,6 +325,18 @@ def active_task_template(session: Session) -> MailTemplate:
     return template
 
 
+def active_logistics_task_template(session: Session) -> MailTemplate:
+    template = (
+        session.query(MailTemplate)
+        .filter(MailTemplate.template_code == "logistics_task", MailTemplate.status == "Active")
+        .order_by(MailTemplate.created_at.desc())
+        .first()
+    )
+    if template is None:
+        raise RuntimeError("missing logistics task template")
+    return template
+
+
 def find_task_for_mail(session: Session, mail: MailMessage) -> ProductionTask | None:
     if mail.related_task_id:
         task = session.get(ProductionTask, mail.related_task_id)
@@ -322,6 +373,27 @@ def find_task_for_mail(session: Session, mail: MailMessage) -> ProductionTask | 
         .first()
     )
     return open_question.task if open_question is not None else None
+
+
+def find_logistics_task_for_mail(session: Session, mail: MailMessage) -> LogisticsTask | None:
+    text = f"{mail.subject}\n{mail.body_text}"
+    for task_no in LOGISTICS_TASK_NO_PATTERN.findall(text):
+        task = session.query(LogisticsTask).filter(func.upper(LogisticsTask.task_no) == task_no.upper()).one_or_none()
+        if task is not None:
+            return task
+
+    extracted = extract_requirement(mail.subject, text, mail.from_address)
+    if extracted.external_order_no:
+        task = (
+            session.query(LogisticsTask)
+            .join(OrderRequirement, OrderRequirement.id == LogisticsTask.requirement_id)
+            .filter(OrderRequirement.external_order_no == extracted.external_order_no)
+            .order_by(LogisticsTask.created_at.desc())
+            .first()
+        )
+        if task is not None:
+            return task
+    return None
 
 
 def create_inbound_mail(
@@ -365,6 +437,7 @@ def enqueue_sales_receipt_ack(
     *,
     allow_order_requirement: bool = False,
     task_no: str | None = None,
+    task_nos: list[str] | None = None,
 ) -> OutboundMailJob | None:
     from_address = (mail.from_address or "").strip()
     if not from_address or mail.classification not in SALES_ACK_CLASSIFICATIONS:
@@ -386,13 +459,17 @@ def enqueue_sales_receipt_ack(
     subject = mail.subject.strip() if mail.subject else "生产订单需求"
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
-    if mail.classification == "SalesOrderRequirement" and task_no:
+    task_no_list = [item for item in (task_nos or ([task_no] if task_no else [])) if item]
+    if mail.classification == "SalesOrderRequirement" and task_no_list:
+        logistics_only = all(str(item).upper().startswith("LT-") for item in task_no_list)
+        accepted_text = "创建物流核查任务" if logistics_only else "创建生产任务"
+        task_no_text = "、".join(task_no_list)
         body = "\n".join(
             [
                 "销售同事好，",
                 "",
-                "您的需求邮件已通过系统初审并创建生产任务。",
-                f"任务号：{task_no}",
+                f"您的需求邮件已通过系统初审并{accepted_text}。",
+                f"任务号：{task_no_text}",
                 f"原邮件主题：{mail.subject or ''}",
                 "",
                 "后续如需变更请邮件回复“订单变更 + 任务号”；如需撤回请邮件回复“撤回需求 + 任务号”（生产确认排单前有效）。",
@@ -430,7 +507,7 @@ def enqueue_sales_receipt_ack(
         "SalesReceiptAckQueued",
         "MailMessage",
         mail.id,
-        {"to": to_addresses, "classification": mail.classification, "task_no": task_no or ""},
+        {"to": to_addresses, "classification": mail.classification, "task_no": task_no or "", "task_nos": task_no_list},
     )
     return job
 
@@ -513,8 +590,16 @@ def route_is_configured(session: Session) -> bool:
     return any(as_list(department.mail_to_json) for department in session.query(ProductionDepartment).filter_by(status="Active").all())
 
 
+def logistics_route_is_configured(session: Session) -> bool:
+    return any(as_list(department.mail_to_json) for department in session.query(LogisticsDepartment).filter_by(status="Active").all())
+
+
 WORKFLOW_EXTRA_FIELD_LABELS = {
     "material_details": "物料详情描述",
+    "material_code": "物料编码",
+    "material_name": "物料名称",
+    "material_spec": "物料规格",
+    "material_quantity": "数量",
     "logistics_method": "物流发货方式",
     "shipping_time_requirement": "出货时间要求",
     "customer_receiver_info": "客户收件信息",
@@ -532,7 +617,7 @@ def workflow_field_label(field: str) -> str:
 
 def workflow_required_field_missing(requirement: OrderRequirement, extracted_fields: dict[str, str], field: str) -> bool:
     if field in CORE_FIELD_LABELS:
-        return not bool(getattr(requirement, field, "") or "")
+        return not bool(getattr(requirement, field, "") or (extracted_fields or {}).get(field) or "")
     return not bool((extracted_fields or {}).get(field))
 
 
@@ -682,6 +767,55 @@ def task_template_for_requirement(
     return template.subject_template, template.body_template, binding
 
 
+def logistics_routing_for_requirement(session: Session, requirement: OrderRequirement) -> tuple[list[str], list[str]]:
+    department = primary_logistics_department(session)
+    return as_list(department.mail_to_json), as_list(department.mail_cc_json)
+
+
+def logistics_task_template_for_requirement(session: Session, requirement: OrderRequirement) -> tuple[str, str]:
+    template = active_logistics_task_template(session)
+    return template.subject_template, template.body_template
+
+
+ECOMMERCE_ORDER_KEYWORDS = [
+    "电商",
+    "独立站",
+    "平台订单",
+    "线上订单",
+    "shopify",
+    "amazon",
+    "tiktok",
+    "temu",
+    "跨境",
+]
+
+
+def workflow_fulfillment_policy(session: Session, requirement: OrderRequirement) -> dict:
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    if binding is None or not binding.workflow_version_id:
+        return {}
+    version = session.get(WorkflowVersion, binding.workflow_version_id)
+    if version is None:
+        return {}
+    rules = loads(version.compiled_rules_json, {})
+    policy = rules.get("fulfillment_policy") if isinstance(rules, dict) else {}
+    return policy if isinstance(policy, dict) else {}
+
+
+def should_route_logistics_first(session: Session, requirement: OrderRequirement, mail: MailMessage, source_text: str) -> bool:
+    binding = workflow_binding_for_requirement(session, requirement.id)
+    policy = workflow_fulfillment_policy(session, requirement)
+    route = str(policy.get("route") or "").strip().lower()
+    if route in {"logistics_first", "logistics-first", "物流优先"}:
+        return True
+    if route in {"production_first", "production-only", "production_only"}:
+        return False
+    if binding is not None:
+        return False
+    compact = f"{mail.subject}\n{source_text}".lower()
+    return any(keyword.lower() in compact for keyword in ECOMMERCE_ORDER_KEYWORDS)
+
+
 def merge_extracted_requirement(
     extracted: ExtractedRequirement,
     llm_fields: dict[str, str],
@@ -745,49 +879,145 @@ def extract_requirement_with_fallback(
     return merged
 
 
-def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask | None:
-    if mail.related_task_id:
-        existing_task = session.get(ProductionTask, mail.related_task_id)
-        if existing_task is not None:
-            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=existing_task.task_no)
-            return existing_task
-    existing_requirements = (
-        session.query(OrderRequirement)
-        .filter_by(source_mail_id=mail.id)
-        .order_by(OrderRequirement.created_at, OrderRequirement.id)
-        .all()
-    )
-    if existing_requirements:
-        requirement_ids = [row.id for row in existing_requirements]
-        existing_task = (
-            session.query(ProductionTask)
-            .filter(ProductionTask.requirement_id.in_(requirement_ids))
-            .order_by(ProductionTask.created_at, ProductionTask.id)
-            .first()
-        )
-        if existing_task is not None:
-            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=existing_task.task_no)
-            return existing_task
-        existing_requirement = existing_requirements[0]
-        if existing_requirement.status == "ReviewFailed":
-            missing_fields = as_list(existing_requirement.missing_fields_json)
-            if missing_fields:
-                enqueue_missing_field_request(session, existing_requirement, [str(field) for field in missing_fields])
-            return None
-        return None
+MATERIAL_CODE_LABELS = ["物料编码", "物料编号", "产品编码", "商品编码", "编码"]
+MATERIAL_NAME_LABELS = ["物料名称", "产品名称", "商品名称", "品名"]
+MATERIAL_QUANTITY_LABELS = ["数量", "物料数量", "需求数量", "生产数量"]
+MATERIAL_ITEM_STOP_LABELS = [
+    *MATERIAL_CODE_LABELS,
+    *MATERIAL_NAME_LABELS,
+    *MATERIAL_QUANTITY_LABELS,
+    "物料规格",
+    "产品规格",
+    "商品规格",
+    "规格型号",
+    "客户名称",
+    "客户",
+    "出货时间要求",
+    "期望交期",
+    "交期",
+    "订单号",
+    "物流发货方式",
+    "出货仓",
+    "交付要求",
+    "客户收件信息",
+]
 
-    if mail.classification != "SalesOrderRequirement":
-        record_exception_case(
-            session,
-            exception_type="NonRequirementMail",
-            severity="Low",
-            detail={"source_mail_id": mail.id, "classification": mail.classification, "message": f"邮件分类为 {mail.classification}，未创建生产任务。"},
-            source_mail_id=mail.id,
-        )
-        return None
 
-    source_text = mail_text_with_attachments(session, mail)
-    extracted = extract_requirement_with_fallback(session, mail, source_text)
+def _normalize_material_item_text(text: str) -> str:
+    normalized = str(text or "").replace("\xa0", " ").replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"(?<!^)(?<!\n)\s+(\d+\s*[.、)]\s*(?=(?:物料|产品|商品|编码)))", r"\n\1", normalized)
+
+
+def _material_item_segments(source_text: str) -> list[str]:
+    lines = [line.strip() for line in _normalize_material_item_text(source_text).splitlines()]
+    segments: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if not line:
+            if current:
+                segments.append("\n".join(current))
+                current = []
+            continue
+        is_numbered_material = bool(re.match(r"^\d+\s*[.、)]\s*", line)) and any(label in line for label in [*MATERIAL_CODE_LABELS, *MATERIAL_NAME_LABELS])
+        if is_numbered_material:
+            if current:
+                segments.append("\n".join(current))
+            current = [line]
+            continue
+        if current:
+            if any(label in line for label in ["出货时间要求", "期望交期", "交期", "订单号", "物流发货方式", "出货仓", "交付要求", "客户收件信息"]):
+                segments.append("\n".join(current))
+                current = []
+            else:
+                current.append(line)
+    if current:
+        segments.append("\n".join(current))
+
+    if segments:
+        return segments
+    return [line for line in lines if any(label in line for label in [*MATERIAL_CODE_LABELS, *MATERIAL_NAME_LABELS]) and any(label in line for label in MATERIAL_QUANTITY_LABELS)]
+
+
+def _clean_material_item_value(value: str) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "")).strip()
+    clean = re.sub(r"^\d+\s*[.、)]\s*", "", clean)
+    return clean.strip(" \t\r\n，,；;。:：")
+
+
+def _extract_material_item_value(segment: str, labels: list[str]) -> str:
+    stop_labels = sorted({label for label in MATERIAL_ITEM_STOP_LABELS if label}, key=len, reverse=True)
+    stop_pattern = "|".join(re.escape(label) for label in stop_labels)
+    for label in sorted(labels, key=len, reverse=True):
+        pattern = rf"{re.escape(label)}\s*[:：]\s*(?P<value>.*?)(?=(?:\s*[，,；;]?\s*(?:{stop_pattern})\s*[:：])|\s*$)"
+        match = re.search(pattern, segment, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            value = _clean_material_item_value(match.group("value"))
+            if value and value != label:
+                return value[:500]
+    return ""
+
+
+def extract_material_order_items(source_text: str) -> list[MaterialOrderItem]:
+    items: list[MaterialOrderItem] = []
+    seen: set[tuple[str, str, str]] = set()
+    for segment in _material_item_segments(source_text):
+        code = _extract_material_item_value(segment, MATERIAL_CODE_LABELS)
+        name = _extract_material_item_value(segment, MATERIAL_NAME_LABELS)
+        quantity = _extract_material_item_value(segment, MATERIAL_QUANTITY_LABELS)
+        if not quantity or not (code or name):
+            continue
+        if code and name:
+            product_summary = f"物料编码：{code}，物料名称：{name}"
+        else:
+            product_summary = name or f"物料编码：{code}"
+        key = (product_summary, quantity, _clean_material_item_value(segment))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(MaterialOrderItem(product_summary=product_summary, quantity_text=quantity, raw_text=segment.strip()))
+    return items if len(items) > 1 else []
+
+
+def material_item_source_text(source_text: str, item: MaterialOrderItem) -> str:
+    return "\n\n".join(
+        [
+            "当前物料生产单：",
+            "物料详情描述：",
+            item.raw_text,
+            "",
+            "原邮件全文：",
+            source_text,
+        ]
+    ).strip()
+
+
+def extracted_requirements_for_mail(extracted: ExtractedRequirement, source_text: str) -> list[tuple[ExtractedRequirement, str]]:
+    items = extract_material_order_items(source_text)
+    if not items:
+        return [(extracted, source_text)]
+    return [
+        (
+            replace(
+                extracted,
+                product_summary=item.product_summary,
+                quantity_text=item.quantity_text,
+                missing_fields=[field for field in extracted.missing_fields if field not in {"物料/规格", "数量"}],
+            ),
+            material_item_source_text(source_text, item),
+        )
+        for item in items
+    ]
+
+
+def _create_task_from_extracted_requirement(
+    session: Session,
+    mail: MailMessage,
+    extracted: ExtractedRequirement,
+    source_text: str,
+    *,
+    relate_mail: bool,
+    include_duplicate_check: bool = True,
+) -> ProductionTask | LogisticsTask | None:
     requirement_no = f"REQ-{datetime.now().strftime('%Y%m%d')}-{next_sequence(session, OrderRequirement, 'id'):04d}"
     requirement = OrderRequirement(
         source_mail_id=mail.id,
@@ -814,7 +1044,13 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
         source_text,
     )
     if workflow_binding is None:
-        review = evaluate_initial_review(session, requirement, source_text=source_text, parser_risk_flags=extracted.risk_flags)
+        review = evaluate_initial_review(
+            session,
+            requirement,
+            source_text=source_text,
+            parser_risk_flags=extracted.risk_flags,
+            include_duplicate_check=include_duplicate_check,
+        )
     else:
         review = evaluate_initial_review(
             session,
@@ -823,6 +1059,7 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
             parser_risk_flags=extracted.risk_flags,
             required_fields_override=[],
             rules_override=[],
+            include_duplicate_check=include_duplicate_check,
         )
     
     # ---------------------------------------------------------
@@ -898,6 +1135,30 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
         )
         return None
 
+    if should_route_logistics_first(session, requirement, mail, source_text):
+        to_addresses, _cc_addresses = logistics_routing_for_requirement(session, requirement)
+        if not to_addresses:
+            requirement.status = "ReviewFailed"
+            record_exception_case(
+                session,
+                exception_type="LogisticsRoutingMissing",
+                severity="High",
+                detail={
+                    "requirement_id": requirement.id,
+                    "source_mail_id": mail.id,
+                    "missing_fields": [],
+                    "risk_flags": ["物流部门邮箱未配置"],
+                    "message": "订单初审已通过，但物流部门邮箱未配置，系统无法自动创建物流核查单。",
+                    "action_hint": "请先在【物流邮箱】页面配置主送邮箱，保存后重新处理该订单。",
+                },
+                source_mail_id=mail.id,
+            )
+            add_audit(session, "LogisticsRoutingMissing", "OrderRequirement", requirement.id, {"source_mail_id": mail.id})
+            return None
+        logistics_task = draft_logistics_task_from_requirement(session, requirement)
+        approve_logistics_task(session, logistics_task.id, actor="System")
+        return logistics_task
+
     to_addresses, _cc_addresses, binding = routing_for_requirement(session, requirement)
     if not to_addresses:
         requirement.status = "ReviewFailed"
@@ -927,10 +1188,106 @@ def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask
         add_audit(session, "RoutingMissing", "OrderRequirement", requirement.id, {"source_mail_id": mail.id})
         return None
 
-    task = draft_task_from_requirement(session, requirement, mail)
+    task = draft_task_from_requirement(session, requirement, mail if relate_mail else None)
     approve_task(session, task.id, actor="System")
-    enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=task.task_no)
     return task
+
+
+def create_task_from_mail(session: Session, mail: MailMessage) -> ProductionTask | LogisticsTask | None:
+    if mail.related_task_id:
+        existing_task = session.get(ProductionTask, mail.related_task_id)
+        if existing_task is not None:
+            existing_tasks = (
+                session.query(ProductionTask)
+                .join(OrderRequirement, OrderRequirement.id == ProductionTask.requirement_id)
+                .filter(OrderRequirement.source_mail_id == mail.id)
+                .order_by(ProductionTask.created_at, ProductionTask.id)
+                .all()
+            )
+            task_nos = [task.task_no for task in existing_tasks] or [existing_task.task_no]
+            enqueue_sales_receipt_ack(session, mail, allow_order_requirement=True, task_no=existing_task.task_no, task_nos=task_nos)
+            return existing_task
+    existing_requirements = (
+        session.query(OrderRequirement)
+        .filter_by(source_mail_id=mail.id)
+        .order_by(OrderRequirement.created_at, OrderRequirement.id)
+        .all()
+    )
+    if existing_requirements:
+        requirement_ids = [row.id for row in existing_requirements]
+        existing_tasks = (
+            session.query(ProductionTask)
+            .filter(ProductionTask.requirement_id.in_(requirement_ids))
+            .order_by(ProductionTask.created_at, ProductionTask.id)
+            .all()
+        )
+        if existing_tasks:
+            enqueue_sales_receipt_ack(
+                session,
+                mail,
+                allow_order_requirement=True,
+                task_no=existing_tasks[0].task_no,
+                task_nos=[task.task_no for task in existing_tasks],
+            )
+            return existing_tasks[0]
+        existing_logistics_tasks = (
+            session.query(LogisticsTask)
+            .filter(LogisticsTask.requirement_id.in_(requirement_ids))
+            .order_by(LogisticsTask.created_at, LogisticsTask.id)
+            .all()
+        )
+        if existing_logistics_tasks:
+            enqueue_sales_receipt_ack(
+                session,
+                mail,
+                allow_order_requirement=True,
+                task_no=existing_logistics_tasks[0].task_no,
+                task_nos=[task.task_no for task in existing_logistics_tasks],
+            )
+            return existing_logistics_tasks[0]
+        existing_requirement = existing_requirements[0]
+        if existing_requirement.status == "ReviewFailed":
+            missing_fields = as_list(existing_requirement.missing_fields_json)
+            if missing_fields:
+                enqueue_missing_field_request(session, existing_requirement, [str(field) for field in missing_fields])
+            return None
+        return None
+
+    if mail.classification != "SalesOrderRequirement":
+        record_exception_case(
+            session,
+            exception_type="NonRequirementMail",
+            severity="Low",
+            detail={"source_mail_id": mail.id, "classification": mail.classification, "message": f"邮件分类为 {mail.classification}，未创建生产任务。"},
+            source_mail_id=mail.id,
+        )
+        return None
+
+    source_text = mail_text_with_attachments(session, mail)
+    extracted = extract_requirement_with_fallback(session, mail, source_text)
+    extracted_requirements = extracted_requirements_for_mail(extracted, source_text)
+    created_tasks: list[ProductionTask | LogisticsTask] = []
+    for item_extracted, item_source_text in extracted_requirements:
+        task = _create_task_from_extracted_requirement(
+            session,
+            mail,
+            item_extracted,
+            item_source_text,
+            relate_mail=not created_tasks,
+        )
+        if task is not None:
+            created_tasks.append(task)
+
+    if created_tasks:
+        enqueue_sales_receipt_ack(
+            session,
+            mail,
+            allow_order_requirement=True,
+            task_no=created_tasks[0].task_no,
+            task_nos=[task.task_no for task in created_tasks],
+        )
+        return created_tasks[0]
+    return None
 
 
 def find_requirement_for_supplement_reply(session: Session, mail: MailMessage) -> OrderRequirement | None:
@@ -1308,6 +1665,143 @@ def draft_task_from_requirement(
     requirement.updated_at = now_utc()
     add_audit(session, "TaskDrafted", "ProductionTask", task.id, {"task_no": task.task_no})
     return task
+
+
+def material_identity_from_summary(product_summary: str | None) -> tuple[str, str]:
+    text = product_summary or ""
+    code = _extract_material_item_value(text, MATERIAL_CODE_LABELS)
+    name = _extract_material_item_value(text, MATERIAL_NAME_LABELS)
+    if not code:
+        match = re.search(r"(?:物料编码|物料编号|产品编码|商品编码|编码)\s*[:：]\s*([^\s，,；;]+)", text)
+        code = match.group(1).strip() if match else ""
+    if not name:
+        match = re.search(r"(?:物料名称|产品名称|商品名称|品名)\s*[:：]\s*([^，,；;]+)", text)
+        name = match.group(1).strip() if match else ""
+    return code[:128], (name or text)[:500]
+
+
+def ensure_fulfillment_items(session: Session, logistics_task: LogisticsTask, requirement: OrderRequirement) -> list[FulfillmentItem]:
+    existing = session.query(FulfillmentItem).filter_by(logistics_task_id=logistics_task.id).order_by(FulfillmentItem.created_at).all()
+    if existing:
+        return existing
+    material_code, material_name = material_identity_from_summary(requirement.product_summary)
+    item = FulfillmentItem(
+        requirement_id=requirement.id,
+        logistics_task_id=logistics_task.id,
+        material_code=material_code or None,
+        material_name=material_name or requirement.product_summary,
+        required_quantity=requirement.quantity_text,
+        status="Pending",
+    )
+    session.add(item)
+    session.flush()
+    return [item]
+
+
+def logistics_task_context(session: Session, task: LogisticsTask, version_no: int | None = None) -> dict[str, str | int | None]:
+    requirement = task.requirement
+    items = ensure_fulfillment_items(session, task, requirement)
+    item_lines = [
+        f"{index}. 物料编码：{item.material_code or ''}，物料名称：{item.material_name or ''}，需求数量：{item.required_quantity or ''}".strip("，")
+        for index, item in enumerate(items, start=1)
+    ]
+    return {
+        "logistics_task_no": task.task_no,
+        "task_no": task.task_no,
+        "version_no": version_no or task.current_version_no,
+        "customer_name": requirement.customer_name,
+        "salesperson_name": requirement.salesperson_name,
+        "salesperson_email": requirement.salesperson_email,
+        "product_summary": requirement.product_summary,
+        "quantity_text": requirement.quantity_text,
+        "expected_delivery_date": requirement.expected_delivery_date,
+        "external_order_no": requirement.external_order_no,
+        "fulfillment_items": "\n".join(item_lines),
+        "bot_signature": get_config(session, "bot_signature", "积木易搭AI机器人"),
+    }
+
+
+def draft_logistics_task_from_requirement(
+    session: Session,
+    requirement: OrderRequirement,
+) -> LogisticsTask:
+    existing_task = session.query(LogisticsTask).filter_by(requirement_id=requirement.id).one_or_none()
+    if existing_task is not None:
+        return existing_task
+
+    route_to, route_cc = logistics_routing_for_requirement(session, requirement)
+    department = primary_logistics_department(session)
+    task = LogisticsTask(
+        task_no=make_logistics_task_no(session),
+        requirement_id=requirement.id,
+        current_version_no=1,
+        status="LogisticsDrafted",
+        logistics_department_id=department.id,
+        target_mail_to_json=dumps(route_to),
+        target_mail_cc_json=dumps(route_cc),
+    )
+    session.add(task)
+    session.flush()
+    ensure_fulfillment_items(session, task, requirement)
+
+    subject_template, body_template = logistics_task_template_for_requirement(session, requirement)
+    context = logistics_task_context(session, task, version_no=1)
+    version = LogisticsTaskVersion(
+        logistics_task_id=task.id,
+        version_no=1,
+        subject=render_template(subject_template, context),
+        body=render_template(body_template, context),
+        status="Draft",
+    )
+    session.add(version)
+    session.flush()
+    requirement.status = "LogisticsTaskCreated"
+    requirement.updated_at = now_utc()
+    add_audit(session, "LogisticsTaskDrafted", "LogisticsTask", task.id, {"task_no": task.task_no})
+    return task
+
+
+def approve_logistics_task(session: Session, logistics_task_id: str, actor: str = "System") -> OutboundMailJob:
+    task = session.get(LogisticsTask, logistics_task_id)
+    if task is None:
+        raise ValueError("logistics task not found")
+    if task.status not in {"LogisticsDrafted", "LogisticsIssued"}:
+        raise ValueError(f"logistics task status {task.status} cannot be approved")
+    version_no = task.current_version_no or 1
+    version = (
+        session.query(LogisticsTaskVersion)
+        .filter_by(logistics_task_id=task.id, version_no=version_no)
+        .one_or_none()
+    )
+    if version is None:
+        raise ValueError("logistics task version not found")
+    to_addresses = as_list(task.target_mail_to_json)
+    if not to_addresses:
+        raise ValueError("logistics department email is not configured")
+    cc_addresses = as_list(task.target_mail_cc_json)
+    idem = f"logistics-task-issue:{task.id}:v{version.version_no}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    version.status = "Sent"
+    version.approved_by = actor
+    version.approved_at = now_utc()
+    task.status = "LogisticsIssued"
+    task.issued_at = now_utc()
+    task.updated_at = now_utc()
+    job = OutboundMailJob(
+        mail_type="LogisticsTaskIssue",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=version.subject,
+        body=version.body,
+        idempotency_key=idem,
+        status="Pending",
+        priority=OUTBOUND_PRIORITY_LOGISTICS,
+    )
+    session.add(job)
+    add_audit(session, "LogisticsTaskApprovedForSend", "LogisticsTask", task.id, {"actor": actor, "outbound_job": job.id}, actor)
+    return job
 
 
 def task_context(session: Session, task: ProductionTask, version_no: int | None = None) -> dict[str, str | int | None]:
@@ -1924,6 +2418,137 @@ def handle_status_query_mail_command(session: Session, mail: MailMessage) -> Out
     if sender == bot_email:
         return None
     return enqueue_status_query_reply(session, mail, role="sales")
+
+
+def looks_like_logistics_stock_ok(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in LOGISTICS_STOCK_OK_KEYWORDS)
+
+
+def looks_like_logistics_shortage(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return any(keyword in compact for keyword in LOGISTICS_SHORTAGE_KEYWORDS)
+
+
+def enqueue_logistics_shipped_notice(session: Session, task: LogisticsTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    requirement = task.requirement
+    salesperson_email = requirement.salesperson_email or ""
+    if not salesperson_email:
+        return None
+    ops_email = get_config(session, "ops_cc_email", "jinlei@jimuyida.com")
+    to_addresses = [salesperson_email]
+    cc_addresses = [ops_email] if ops_email else []
+    idem = f"logistics-shipped:{task.id}:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"物流已反馈任务 {task.task_no} 库存满足并安排发货，本订单已闭环。",
+            "",
+            "订单信息：",
+            f"客户名称：{requirement.customer_name or ''}",
+            f"物料/规格：{requirement.product_summary or ''}",
+            f"数量：{requirement.quantity_text or ''}",
+            f"订单号：{requirement.external_order_no or ''}",
+            "",
+            "物流反馈：",
+            source_mail.body_text.strip()[:1000],
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        mail_type="LogisticsShipped",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[物流发货确认][{task.task_no}] 已闭环",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "LogisticsShippedNoticeQueued", "LogisticsTask", task.id, {"source_mail_id": source_mail.id, "to": to_addresses})
+    return job
+
+
+def close_logistics_task_as_shipped(session: Session, task: LogisticsTask, source_mail: MailMessage) -> OutboundMailJob | None:
+    source_mail.classification = "LogisticsShipmentConfirmation"
+    source_mail.classification_confidence = max(source_mail.classification_confidence, 90)
+    task.status = "Closed"
+    task.closed_reason = "LogisticsShipped"
+    task.closed_at = now_utc()
+    task.updated_at = now_utc()
+    task.requirement.status = "Closed"
+    task.requirement.updated_at = now_utc()
+    for item in ensure_fulfillment_items(session, task, task.requirement):
+        item.status = "Shipped"
+        item.updated_at = now_utc()
+    add_audit(session, "LogisticsTaskClosedShipped", "LogisticsTask", task.id, {"source_mail_id": source_mail.id})
+    return enqueue_logistics_shipped_notice(session, task, source_mail)
+
+
+def logistics_shortage_to_production(session: Session, task: LogisticsTask, source_mail: MailMessage) -> OutboundMailJob:
+    source_mail.classification = "LogisticsShortageReply"
+    source_mail.classification_confidence = max(source_mail.classification_confidence, 90)
+    task.status = "LogisticsShortageReported"
+    task.updated_at = now_utc()
+    for item in ensure_fulfillment_items(session, task, task.requirement):
+        item.status = "NeedProduction"
+        item.shortage_quantity = item.required_quantity
+        item.updated_at = now_utc()
+    if task.production_task_id:
+        production_task = session.get(ProductionTask, task.production_task_id)
+        if production_task is None:
+            raise ValueError("linked production task not found")
+    else:
+        production_task = draft_task_from_requirement(session, task.requirement)
+        task.production_task_id = production_task.id
+    task.status = "ProductionRequested"
+    task.requirement.status = "TaskCreated"
+    task.requirement.updated_at = now_utc()
+    job = approve_task(session, production_task.id, actor="System")
+    add_audit(
+        session,
+        "LogisticsShortageToProduction",
+        "LogisticsTask",
+        task.id,
+        {"source_mail_id": source_mail.id, "production_task_id": production_task.id, "outbound_job": job.id},
+    )
+    return job
+
+
+def handle_logistics_reply(session: Session, mail: MailMessage, logistics_task: LogisticsTask) -> OutboundMailJob | None:
+    text = f"{mail.subject}\n{mail.body_text}"
+    if logistics_task.status == "Closed":
+        record_exception_case(
+            session,
+            exception_type="ClosedLogisticsTaskReply",
+            severity="Low",
+            detail={"source_mail_id": mail.id, "logistics_task_no": logistics_task.task_no, "message": "物流任务已关闭，本次回复未自动处理。"},
+            source_mail_id=mail.id,
+        )
+        return None
+    if looks_like_logistics_shortage(text):
+        return logistics_shortage_to_production(session, logistics_task, mail)
+    if looks_like_logistics_stock_ok(text):
+        return close_logistics_task_as_shipped(session, logistics_task, mail)
+    record_exception_case(
+        session,
+        exception_type="LogisticsReplyUnclear",
+        severity="Medium",
+        detail={
+            "source_mail_id": mail.id,
+            "logistics_task_no": logistics_task.task_no,
+            "message": "物流回复未明确库存满足或缺货，需人工确认。",
+            "reply_text": mail.body_text[:1000],
+        },
+        source_mail_id=mail.id,
+    )
+    add_audit(session, "LogisticsReplyUnclear", "LogisticsTask", logistics_task.id, {"source_mail_id": mail.id})
+    return None
 
 
 def enqueue_production_pending_tasks_reply(session: Session, source_mail: MailMessage) -> OutboundMailJob | None:
@@ -2609,6 +3234,49 @@ def enqueue_sales_withdraw_rejected_notice(
     return job
 
 
+def enqueue_sales_withdraw_unlinked_rejected_notice(
+    session: Session,
+    source_mail: MailMessage,
+    *,
+    requested_task_nos: set[str],
+    reason: str,
+) -> OutboundMailJob | None:
+    sales_email = (source_mail.from_address or "").strip()
+    if not sales_email:
+        return None
+    to_addresses = [sales_email]
+    cc_addresses: list[str] = []
+    task_no_label = "、".join(sorted(requested_task_nos)) if requested_task_nos else "未识别任务号"
+    idem = f"sales-demand-withdraw-unlinked-rejected:{source_mail.id}:{recipient_hash(to_addresses, cc_addresses)}"
+    existing = session.query(OutboundMailJob).filter_by(idempotency_key=idem).one_or_none()
+    if existing is not None:
+        return existing
+    body = "\n".join(
+        [
+            "销售同事好，",
+            "",
+            f"撤回失败：{reason}",
+            f"邮件中识别到的任务号：{task_no_label}",
+            "",
+            "请确认任务号是否来自当前系统，或联系商务部人工介入。",
+            "",
+            get_config(session, "bot_signature", "积木易搭AI机器人"),
+        ]
+    )
+    job = OutboundMailJob(
+        mail_type="SalesDemandWithdrawRejected",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=f"[撤回失败][{task_no_label}] 未找到可撤回任务",
+        body=body,
+        idempotency_key=idem,
+        status="Pending",
+    )
+    session.add(job)
+    add_audit(session, "SalesDemandWithdrawUnlinkedRejectedQueued", "MailMessage", source_mail.id, {"requested_task_nos": sorted(requested_task_nos), "reason": reason})
+    return job
+
+
 def enqueue_manual_close_sales_notice(
     session: Session,
     task: ProductionTask,
@@ -2892,6 +3560,30 @@ def handle_classified_mail(session: Session, mail: MailMessage) -> object | None
 
     task = find_task_for_mail(session, mail)
     if task is None:
+        if mail.classification == "OrderCancelRequest":
+            text = f"{mail.subject}\n{mail.body_text}"
+            requested_task_nos = query_requested_task_nos(text)
+            reason = (
+                f"当前系统未找到任务号 {'、'.join(sorted(requested_task_nos))}。"
+                if requested_task_nos
+                else "未识别到任务号，请按“撤回需求 + 任务号”格式发送。"
+            )
+            record_exception_case(
+                session,
+                exception_type="OrderCancelTaskLinkFailed",
+                severity="Medium",
+                detail={
+                    "source_mail_id": mail.id,
+                    "classification": mail.classification,
+                    "subject": mail.subject,
+                    "requested_task_nos": sorted(requested_task_nos),
+                    "message": reason,
+                },
+                source_mail_id=mail.id,
+            )
+            enqueue_sales_withdraw_unlinked_rejected_notice(session, mail, requested_task_nos=requested_task_nos, reason=reason)
+            add_audit(session, "OrderCancelTaskLinkFailed", "MailMessage", mail.id, {"requested_task_nos": sorted(requested_task_nos)})
+            return None
         record_exception_case(
             session,
             exception_type="MailTaskLinkFailed",
@@ -2972,6 +3664,12 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
     status_query_command = handle_status_query_mail_command(session, mail)
     if status_query_command is not None:
         return status_query_command
+    logistics_task = find_logistics_task_for_mail(session, mail)
+    if logistics_task is not None:
+        sender = (mail.from_address or "").lower().strip()
+        text = f"{mail.subject}\n{mail.body_text}"
+        if sender in logistics_department_addresses(session) or LOGISTICS_TASK_NO_PATTERN.search(text):
+            return handle_logistics_reply(session, mail, logistics_task)
     if find_requirement_for_supplement_reply(session, mail) is not None:
         return handle_requirement_supplement_reply(session, mail)
     if mail.classification == "SalesOrderRequirement":
@@ -3003,6 +3701,30 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
 
     task = find_task_for_mail(session, mail)
     if task is None:
+        if mail.classification == "OrderCancelRequest":
+            text = f"{mail.subject}\n{mail.body_text}"
+            requested_task_nos = query_requested_task_nos(text)
+            reason = (
+                f"当前系统未找到任务号 {'、'.join(sorted(requested_task_nos))}。"
+                if requested_task_nos
+                else "未识别到任务号，请按“撤回需求 + 任务号”格式发送。"
+            )
+            record_exception_case(
+                session,
+                exception_type="OrderCancelTaskLinkFailed",
+                severity="Medium",
+                detail={
+                    "source_mail_id": mail.id,
+                    "classification": mail.classification,
+                    "subject": mail.subject,
+                    "requested_task_nos": sorted(requested_task_nos),
+                    "message": reason,
+                },
+                source_mail_id=mail.id,
+            )
+            enqueue_sales_withdraw_unlinked_rejected_notice(session, mail, requested_task_nos=requested_task_nos, reason=reason)
+            add_audit(session, "OrderCancelTaskLinkFailed", "MailMessage", mail.id, {"requested_task_nos": sorted(requested_task_nos)})
+            return None
         record_exception_case(
             session,
             exception_type="MailTaskLinkFailed",
@@ -3181,6 +3903,13 @@ def record_production_feedback(session: Session, task_id: str, feedback_type: st
         task.confirmed_at = now_utc()
         task.closed_reason = "ScheduledConfirmed"
         task.updated_at = now_utc()
+        task.requirement.status = "Closed"
+        linked_logistics_task = session.query(LogisticsTask).filter_by(production_task_id=task.id).one_or_none()
+        if linked_logistics_task is not None and linked_logistics_task.status != "Closed":
+            linked_logistics_task.status = "Closed"
+            linked_logistics_task.closed_reason = "ProductionScheduled"
+            linked_logistics_task.closed_at = now_utc()
+            linked_logistics_task.updated_at = now_utc()
         cc = [ceo_email, ops_email]
         if salesperson_email:
             cc.insert(1, salesperson_email)

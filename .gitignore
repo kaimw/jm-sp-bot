@@ -13,4 +13,5 @@ data/backups/
 data/maintenance/
 data/test-reports/
 test-results/
+*.log
 *.egg-info/

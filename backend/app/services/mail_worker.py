@@ -8,8 +8,11 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import MAIL_WORKER_MIN_INTERVAL_SECONDS, settings
 from backend.app.database import SessionLocal
-from backend.app.models import OutboundMailJob
+from backend.app.models import OutboundMailJob, ProcessingJob
+from backend.app.services.crm_sync import schedule_crm_order_sync_if_due
+from backend.app.services.erp.material_sync import erp_material_sync_due
 from backend.app.services.jobs import run_pending_jobs
+from backend.app.services.jsonutil import dumps
 from backend.app.services.mail_adapter import (
     AUTO_WORKFLOW_MAIL_TYPES,
     OUTBOUND_PRIORITY_NOTIFY,
@@ -56,11 +59,10 @@ def run_mail_auto_worker_once() -> dict:
                     started,
                 )
             
-            if not get_config(session, "bot_email_password", ""):
-                return _finish_worker_run({"enabled": True, "skipped": "bot_email_password is not configured"}, started)
-
             result = {
                 "enabled": True,
+                "erp_material_sync": schedule_erp_material_sync_if_due(session),
+                "crm_order_sync": schedule_crm_order_sync_if_due(session),
                 "synced": {"imported": 0, "queued": 0},
                 "processed": {"completed": 0, "failed": 0, "total": 0},
                 "high_priority_mails": {"sent": 0, "failed": 0, "total": 0},
@@ -75,6 +77,10 @@ def run_mail_auto_worker_once() -> dict:
                 session.rollback()
                 logger.exception("mail auto worker processing failed")
                 result["processed"] = {"completed": 0, "failed": 0, "total": 0, "error": str(exc)}
+
+            if not get_config(session, "bot_email_password", ""):
+                result["skipped"] = "bot_email_password is not configured"
+                return _finish_worker_run(result, started)
 
             # 2. 高优先级通道技能
             high_priority_count = _pending_high_priority_count(session)
@@ -132,6 +138,22 @@ def _finish_worker_run(result: dict, started: float) -> dict:
     _WORKER_STATUS["last_duration_seconds"] = round(monotonic() - started, 3)
     _WORKER_STATUS["last_result"] = result
     return result
+
+
+def schedule_erp_material_sync_if_due(session: Session) -> dict:
+    if not erp_material_sync_due(session):
+        return {"queued": False, "reason": "not due"}
+    existing = (
+        session.query(ProcessingJob)
+        .filter(ProcessingJob.job_type == "sync_erp_materials", ProcessingJob.status.in_(["Pending", "Running"]))
+        .first()
+    )
+    if existing is not None:
+        return {"queued": False, "reason": "already queued", "job_id": existing.id}
+    job = ProcessingJob(job_type="sync_erp_materials", payload_json=dumps({"source": "auto"}), status="Pending")
+    session.add(job)
+    session.commit()
+    return {"queued": True, "job_id": job.id}
 
 
 def get_mail_worker_status(configured_interval_seconds: int | None = None) -> dict:

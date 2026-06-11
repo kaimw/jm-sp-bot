@@ -302,13 +302,19 @@ label {
   box-shadow: var(--shadow);
 }
 
-.product-page,
 .skill-page {
   max-width: 1240px;
 }
 
+.product-page {
+  max-width: none;
+}
+
 .product-section-head {
-  margin-top: 0;
+  grid-template-columns: minmax(160px, 220px) minmax(260px, 1fr);
+  gap: 18px;
+  margin: 18px 0 10px;
+  padding-bottom: 10px;
 }
 
 .tabs {
@@ -369,6 +375,81 @@ label {
   gap: 8px;
 }
 
+.product-page .compact-metrics {
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.product-page .compact-metrics .metric {
+  min-height: 66px;
+  padding: 10px 12px;
+  border-color: var(--line);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.product-page .compact-metrics .metric::after {
+  display: none;
+}
+
+.product-page .compact-metrics .metric strong {
+  font-size: 24px;
+}
+
+.product-inventory-toolbar {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 10px;
+}
+
+.product-inventory-toolbar .inline-form {
+  display: grid !important;
+  grid-template-columns: minmax(240px, 1.6fr) minmax(150px, 0.8fr) minmax(120px, 0.6fr) minmax(150px, 0.75fr) minmax(92px, 0.45fr) auto auto;
+  gap: 8px;
+  width: 100%;
+}
+
+.product-inventory-toolbar .inline-form input,
+.product-inventory-toolbar .inline-form select {
+  width: 100%;
+  min-width: 0;
+}
+
+.inventory-split-lists {
+  display: grid;
+  gap: 18px;
+}
+
+.inventory-list-section {
+  display: grid;
+  gap: 8px;
+}
+
+.inventory-list-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.inventory-list-head h3 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.inventory-list-head p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.product-page .inventory-list-metrics {
+  margin-bottom: 2px;
+}
+
 .product-table {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -383,8 +464,8 @@ label {
 }
 
 .product-table .head {
-  min-height: 42px;
-  padding: 10px 16px;
+  min-height: 38px;
+  padding: 9px 14px;
   background: var(--surface-soft);
   color: var(--muted);
   font-size: 12px;
@@ -392,7 +473,9 @@ label {
 }
 
 .product-row {
-  gap: 16px;
+  gap: 14px;
+  min-height: 62px;
+  padding: 12px 14px;
 }
 
 .product-spu-table .product-row {
@@ -403,6 +486,244 @@ label {
 .product-pricing-table .product-row,
 .product-promotions-table .product-row {
   grid-template-columns: minmax(240px, 1.25fr) minmax(170px, 0.9fr) minmax(160px, 0.8fr) minmax(180px, auto);
+}
+
+.product-inventory-table .product-row {
+  grid-template-columns: minmax(220px, 1.25fr) minmax(200px, 0.95fr) minmax(130px, 0.55fr) minmax(240px, 1.05fr);
+}
+
+.crm-orders-page {
+  max-width: none;
+}
+
+#crm-orders-summary {
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+#crm-orders-summary .metric {
+  min-width: 0;
+  min-height: 112px;
+  padding: 14px;
+}
+
+#crm-orders-summary .metric strong {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  align-items: baseline;
+  min-width: 0;
+  font-size: clamp(22px, 2.2vw, 30px);
+  line-height: 1.05;
+  overflow-wrap: anywhere;
+}
+
+#crm-orders-summary .metric span,
+#crm-orders-summary .metric small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#crm-orders-summary .metric-unit {
+  font-size: 0.78em;
+  line-height: 1;
+}
+
+.crm-orders-toolbar {
+  grid-template-columns: minmax(260px, 1.7fr) minmax(120px, 0.5fr) minmax(160px, 0.7fr) auto;
+}
+
+.crm-orders-toolbar .filter-actions {
+  align-items: center;
+}
+
+.crm-sync-settings-button {
+  min-width: 88px;
+  white-space: nowrap;
+}
+
+.crm-sync-settings-panel {
+  width: min(960px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  gap: 14px;
+}
+
+.crm-sync-layout {
+  display: grid;
+  grid-template-columns: minmax(460px, 1fr) minmax(300px, 0.72fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.crm-sync-form,
+.crm-sync-runs {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.crm-sync-form {
+  gap: 8px;
+  max-width: none;
+  margin-top: 0;
+}
+
+.crm-sync-form label {
+  font-size: 12px;
+}
+
+.crm-sync-form input,
+.crm-sync-form textarea {
+  min-height: 34px;
+}
+
+.crm-sync-form textarea {
+  height: 86px;
+  resize: vertical;
+}
+
+.crm-sync-runs {
+  display: grid;
+  gap: 8px;
+  max-height: 342px;
+  overflow: hidden;
+}
+
+.crm-sync-runs .inventory-list-head {
+  padding-top: 0;
+}
+
+.crm-sync-runs .list {
+  max-height: 270px;
+  overflow: auto;
+}
+
+.crm-sync-run-row {
+  grid-template-columns: minmax(140px, 0.7fr) minmax(190px, 1fr) minmax(180px, 1fr);
+  min-height: 54px;
+  padding: 10px 12px;
+}
+
+.crm-sync-settings-panel .test-result {
+  max-width: none;
+  min-height: 0;
+  max-height: 112px;
+  margin-top: 10px;
+  padding: 10px;
+  overflow: auto;
+  font-size: 12px;
+}
+
+.crm-orders-table .crm-order-row {
+  grid-template-columns: minmax(260px, 1.2fr) minmax(220px, 1fr) minmax(150px, 0.65fr) minmax(140px, 0.6fr) minmax(130px, auto);
+}
+
+.product-review-panel {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.product-review-readiness {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.product-review-form,
+.product-review-result {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.product-review-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.product-review-form textarea {
+  min-height: 180px;
+  resize: vertical;
+}
+
+.product-review-actions {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.product-review-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.product-review-summary .metric {
+  min-height: 64px;
+  padding: 10px 12px;
+  box-shadow: none;
+}
+
+.review-risk-list {
+  display: grid;
+  gap: 6px;
+}
+
+.review-risk-list span {
+  padding: 8px 10px;
+  border: 1px solid rgba(192, 93, 93, 0.24);
+  border-radius: 6px;
+  color: #9d3434;
+  background: #fff7f7;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.review-preview-list {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--line);
+}
+
+.review-preview-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 1.15fr) minmax(120px, 0.55fr) minmax(220px, 1.05fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 68px;
+  padding: 12px;
+  background: var(--surface);
+}
+
+.review-preview-row + .review-preview-row {
+  border-top: 1px solid var(--line);
+}
+
+.inventory-detail-row {
+  grid-template-columns: minmax(260px, 1.35fr) minmax(130px, 0.65fr) minmax(190px, 0.9fr) minmax(170px, auto);
+}
+
+.inventory-detail-row.is-zero-stock {
+  color: #8a94a3;
+}
+
+.inventory-detail-row.is-zero-stock strong,
+.inventory-detail-row.is-zero-stock small {
+  color: #8a94a3;
 }
 
 .product-empty-row {
@@ -536,6 +857,14 @@ label {
   border-color: var(--accent);
   background: var(--accent-soft);
   box-shadow: none;
+}
+
+.button.compact-action {
+  min-height: 30px;
+  margin-top: 8px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .button.warn {
@@ -1335,8 +1664,14 @@ label {
 }
 
 .outbound-filter-bar {
-  grid-template-columns: minmax(280px, 1.6fr) minmax(120px, 0.7fr) minmax(120px, 0.7fr) minmax(150px, 0.85fr) repeat(5, 40px);
+  grid-template-columns: minmax(260px, 1.4fr) minmax(110px, 0.55fr) minmax(110px, 0.55fr) minmax(140px, 0.7fr) repeat(6, 38px);
+  grid-auto-flow: column;
+  grid-auto-columns: 38px;
   overflow-x: auto;
+}
+
+.outbound-filter-bar > * {
+  min-width: 0;
 }
 
 .clearable-filter-bar {
@@ -1681,6 +2016,18 @@ textarea:focus {
   background: rgba(20, 126, 113, 0.08);
 }
 
+.status-pill.is-warn {
+  border-color: rgba(186, 129, 32, 0.28);
+  color: #a36f18;
+  background: #fff8e8;
+}
+
+.status-pill.is-danger {
+  border-color: rgba(192, 93, 93, 0.28);
+  color: #a43a3a;
+  background: #fff1f1;
+}
+
 .status-pill.is-muted {
   color: var(--muted);
   background: var(--surface-soft);
@@ -1792,6 +2139,116 @@ textarea:focus {
   width: min(880px, 100%);
 }
 
+.crm-order-detail-panel {
+  width: min(980px, 100%);
+}
+
+.inventory-detail-panel {
+  width: min(1080px, 100%);
+}
+
+.classification-diagnostics-panel {
+  width: min(1040px, 100%);
+}
+
+.inventory-detail-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.inventory-detail-summary .metric {
+  min-height: 78px;
+}
+
+.inventory-detail-summary .metric strong {
+  font-size: 22px;
+}
+
+.inventory-detail-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.3fr) minmax(180px, 0.9fr) minmax(140px, 0.65fr) auto auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.classification-diagnostics-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.classification-diagnostics-section {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.classification-diagnostics-section h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.classification-counter-list,
+.classification-suspicious-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.classification-counter-row,
+.classification-suspicious-row {
+  display: grid;
+  gap: 10px;
+  align-items: center;
+  min-height: 42px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.classification-counter-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.classification-suspicious-row {
+  grid-template-columns: minmax(150px, 0.85fr) minmax(180px, 1.1fr) minmax(120px, 0.7fr) minmax(180px, 1fr);
+}
+
+.classification-counter-row strong,
+.classification-suspicious-row strong {
+  overflow-wrap: anywhere;
+}
+
+.classification-counter-row small,
+.classification-suspicious-row small {
+  color: var(--muted);
+}
+
+.classification-rule-details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.classification-rule-details summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 800;
+}
+
+.classification-rule-pre {
+  max-height: 240px;
+  margin: 0;
+  overflow: auto;
+  padding: 0 12px 12px;
+  color: var(--ink);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
 .self-maintenance-detail-panel {
   width: min(1040px, 100%);
 }
@@ -1832,6 +2289,42 @@ textarea:focus {
   color: #f8fafc;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.crm-order-detail-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.crm-order-detail-summary .metric {
+  min-height: 82px;
+}
+
+.crm-order-detail-summary .metric strong {
+  font-size: 22px;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.crm-order-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.crm-order-detail-grid h3,
+.crm-order-detail-panel h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.crm-order-detail-fields {
+  grid-template-columns: 1fr;
+}
+
+.crm-order-detail-raw {
+  max-height: min(300px, 34vh);
 }
 
 .icon-button {
@@ -2100,7 +2593,7 @@ textarea:focus {
 
 .workflow-mail-preview {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
   min-height: 0;
   max-height: none;
@@ -2149,6 +2642,28 @@ textarea:focus {
   min-height: 0;
   max-height: none;
   height: 100%;
+}
+
+.workflow-mail-preview-body {
+  margin: 0;
+  overflow: auto;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+}
+
+.workflow-preview-line {
+  min-height: 20px;
+  white-space: pre-wrap;
+}
+
+.workflow-preview-label {
+  color: var(--accent);
+  font-weight: 800;
 }
 
 .workflow-preview-required-fields {
@@ -2284,7 +2799,31 @@ textarea:focus {
 }
 
 .workflow-required-grid {
-  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.workflow-required-group {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.workflow-required-group + .workflow-required-group {
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+.workflow-required-group-title {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.workflow-required-group-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(110px, 1fr));
   gap: 8px;
 }
 
@@ -2374,6 +2913,10 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 
+  .classification-diagnostics-grid {
+    grid-template-columns: 1fr;
+  }
+
   .task-filter-bar {
     grid-template-columns: minmax(250px, 1.8fr) minmax(130px, 0.8fr) repeat(5, minmax(108px, 0.75fr)) repeat(3, 38px);
   }
@@ -2383,7 +2926,7 @@ textarea:focus {
   }
 
   .outbound-filter-bar {
-    grid-template-columns: minmax(260px, 1.5fr) minmax(116px, 0.75fr) minmax(116px, 0.75fr) minmax(140px, 0.85fr) repeat(5, 40px);
+    grid-template-columns: minmax(240px, 1.3fr) minmax(108px, 0.55fr) minmax(108px, 0.55fr) minmax(128px, 0.7fr) repeat(6, 38px);
   }
 
   .row {
@@ -2402,6 +2945,10 @@ textarea:focus {
   .product-pricing-table .product-row,
   .product-promotions-table .product-row {
     grid-template-columns: minmax(220px, 1.2fr) minmax(160px, 0.8fr) minmax(150px, 0.8fr) minmax(170px, auto);
+  }
+
+  .product-review-panel {
+    grid-template-columns: 1fr;
   }
 
   .skill-lab-container {
@@ -2481,6 +3028,9 @@ textarea:focus {
   .workflow-steps,
   .report-preview-meta,
   .timeline-item,
+  .crm-sync-layout,
+  .crm-sync-run-row,
+  .crm-order-row,
   .chat-input {
     grid-template-columns: 1fr;
   }
@@ -2488,6 +3038,22 @@ textarea:focus {
   .task-filter-bar,
   .table-filter-bar {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .crm-sync-settings-panel {
+    max-height: calc(100vh - 28px);
+  }
+
+  .crm-sync-form {
+    grid-template-columns: 1fr;
+  }
+
+  .crm-sync-runs {
+    max-height: 180px;
+  }
+
+  .crm-sync-runs .list {
+    max-height: 120px;
   }
 
   .product-page .table-filter-bar,
@@ -2513,8 +3079,15 @@ textarea:focus {
   }
 
   .compact-list .skill-row,
-  .product-row {
+  .product-row,
+  .review-preview-row,
+  .classification-suspicious-row {
     grid-template-columns: 1fr !important;
+  }
+
+  .product-review-actions,
+  .product-review-summary {
+    grid-template-columns: 1fr;
   }
 
   .skill-row .actions {
@@ -2522,7 +3095,7 @@ textarea:focus {
   }
 
   .outbound-filter-bar {
-    grid-template-columns: minmax(240px, 1.4fr) minmax(112px, 0.7fr) minmax(112px, 0.7fr) minmax(132px, 0.8fr) repeat(5, 40px);
+    grid-template-columns: minmax(220px, 1.2fr) minmax(104px, 0.55fr) minmax(104px, 0.55fr) minmax(120px, 0.65fr) repeat(6, 38px);
   }
 
   .task-filter-bar .filter-search,

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 from contextlib import nullcontext
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import httpx
@@ -20,6 +21,10 @@ from backend.app.models import (
     BackupJob,
     ExceptionCase,
     ExtractionEvidence,
+    FulfillmentItem,
+    LogisticsDepartment,
+    LogisticsTask,
+    LogisticsTaskVersion,
     MailMessage,
     MailWorkflowMatch,
     MaintenanceAction,
@@ -29,6 +34,10 @@ from backend.app.models import (
     OutboundMailJob,
     ProcessingJob,
     ProductionDepartment,
+    ProductInventorySnapshot,
+    PromotionRule,
+    ProductSPU,
+    ProductSKU,
     ProductionTask,
     ProductionTaskVersion,
     QuestionAndReply,
@@ -59,7 +68,7 @@ from backend.app.services.initial_review import initial_review_config, remember_
 from backend.app.services.model_provider import build_openai_chat_payload, call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, execute_cleanup, weekly_report_csv
 from backend.app.services.pdf import simple_pdf
-from backend.app.services.products import create_spu, create_sku, set_channel_pricing
+from backend.app.services.products import create_promotion_rule, create_spu, create_sku, extract_order_products_from_text, get_promotions, parse_price_to_cents, review_order_products, set_channel_pricing, update_spu_review_aliases
 from backend.app.services.self_maintenance import (
     apply_maintenance_action,
     archive_maintenance_session,
@@ -81,6 +90,7 @@ from backend.app.services.workflow import (
     dashboard,
     enqueue_weekly_report,
     force_close_task_manual,
+    process_inbound_mail,
     record_exception_case,
     record_production_feedback,
     record_production_question,
@@ -99,6 +109,7 @@ from backend.app.services.workflow_rules import (
     match_workflow_for_mail,
     rollback_workflow_version,
     save_workflow_version_rules,
+    workflow_binding_for_requirement,
     workflow_version_diff,
 )
 from backend.app.models import now_utc
@@ -132,6 +143,12 @@ def configure_department(session):
     session.commit()
 
 
+def configure_logistics_department(session):
+    department = session.query(LogisticsDepartment).filter_by(department_code="default").one()
+    department.mail_to_json = dumps(["logistics@jimuyida.com"])
+    session.commit()
+
+
 def create_valid_task(session, order_no="SO-001"):
     mail = create_inbound_mail(
         session,
@@ -158,7 +175,7 @@ def test_seed_defaults_omit_plaintext_secrets():
     assert session.get(SystemConfig, "bot_email").value == "bot.market@jimuyida.com"
     assert session.get(SystemConfig, "mail_auto_worker_interval_seconds").value == "60"
     assert session.get(SystemConfig, "mail_rate_limit_interval_seconds").value == "60"
-    assert session.get(SystemConfig, "bot_enabled").value == "false"
+    assert session.get(SystemConfig, "bot_enabled").value == "true"
     assert session.get(SystemConfig, "outbound_failed_alert_threshold").value == "1"
     assert session.get(SystemConfig, "outbound_pending_age_alert_seconds").value == "3600"
     model = session.query(ModelProviderConfig).one()
@@ -184,6 +201,501 @@ def test_baidu_map_ak_is_treated_as_secret_config():
     assert config(session)["configs"]["baidu_map_ak"] == "***"
 
 
+def test_erp_config_masks_app_secret_and_normalizes_server_url():
+    from backend.app.main import config, update_erp_config
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+
+    session = make_session()
+
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_enabled=True,
+            erp_server_url="http://erp.local/K3Cloud/html5/index.aspx?ud=test",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_lcid=2052,
+        ),
+        session,
+    )
+
+    assert session.get(SystemConfig, "erp_server_url").value == "http://erp.local/K3Cloud/"
+    assert session.get(SystemConfig, "erp_app_sec").value == "app-secret"
+    assert session.get(SystemConfig, "erp_app_sec").is_secret is True
+    assert session.get(SystemConfig, "erp_write_enabled").value == "false"
+    assert config(session)["configs"]["erp_app_sec"] == "***"
+
+
+def test_kingdee_connection_test_uses_login_by_app_secret_and_sanitizes_result(monkeypatch):
+    from backend.app.main import test_erp_connection, update_erp_config
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "LoginResultType": 1,
+                "KDSVCSessionId": "session-id",
+                "Context": {"UserName": "erp-user", "UserId": 1001, "DataCenterName": "测试账套"},
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("backend.app.services.erp.kingdee_client.httpx.Client", FakeClient)
+    session = make_session()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_lcid=2052,
+        ),
+        session,
+    )
+
+    result = test_erp_connection(session)
+
+    assert result["ok"] is True
+    assert result["message"] == "连接成功"
+    assert result["context"]["user_name"] == "erp-user"
+    assert captured["url"] == "http://erp.local/k3cloud/Kingdee.BOS.WebApi.ServicesStub.AuthService.LoginByAppSecret.common.kdsvc"
+    assert captured["json"]["parameters"] == ["test-db", "erp-user", "app-id", "app-secret", 2052]
+    assert "app-secret" not in str(result)
+
+
+def test_kingdee_readonly_query_logs_in_then_calls_execute_bill_query(monkeypatch):
+    from backend.app.main import query_erp_bill, update_erp_config
+    from backend.app.schemas import ErpBillQueryRequest, ErpRuntimeConfigUpdate
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if "LoginByAppSecret" in url:
+                return FakeResponse({"LoginResultType": 1, "KDSVCSessionId": "session-id"})
+            return FakeResponse([["MAT-001", "测试物料"]])
+
+    monkeypatch.setattr("backend.app.services.erp.kingdee_client.httpx.Client", FakeClient)
+    session = make_session()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_lcid=2052,
+        ),
+        session,
+    )
+
+    result = query_erp_bill(
+        ErpBillQueryRequest(form_id="BD_MATERIAL", field_keys="FNumber,FName", filter_string="FNumber='MAT-001'", limit=10),
+        session,
+    )
+
+    assert result["ok"] is True
+    assert result["items"] == [["MAT-001", "测试物料"]]
+    assert calls[1]["url"] == "http://erp.local/k3cloud/Kingdee.BOS.WebApi.ServicesStub.DynamicFormService.ExecuteBillQuery.common.kdsvc"
+    assert calls[1]["json"]["parameters"][0]["FormId"] == "BD_MATERIAL"
+    assert calls[1]["json"]["parameters"][0]["FieldKeys"] == "FNumber,FName"
+    assert calls[1]["json"]["parameters"][0]["FilterString"] == "FNumber='MAT-001'"
+    assert calls[1]["json"]["parameters"][0]["Limit"] == 10
+
+
+def test_kingdee_query_detects_embedded_error_list():
+    from backend.app.services.erp.kingdee_client import is_query_success, normalize_query_rows, query_message
+
+    payload = [
+        [
+            {
+                "Result": {
+                    "ResponseStatus": {
+                        "IsSuccess": False,
+                        "Errors": [{"Message": "标识为“BD_MATERIALGROUP”的业务对象不存在"}],
+                    }
+                }
+            }
+        ]
+    ]
+
+    assert is_query_success(payload) is False
+    assert normalize_query_rows(payload) == []
+    assert "业务对象不存在" in query_message(payload)
+
+
+def test_erp_material_sync_upserts_product_center_spu_and_sku(monkeypatch):
+    from backend.app.main import sync_products_from_erp, update_erp_config
+    from backend.app.models import ProductSKU, ProductSPU
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+
+    def fake_query(config, **kwargs):
+        if kwargs["start_row"] > 0:
+            return {"ok": True, "items": [], "elapsed_ms": 1}
+        return {
+            "ok": True,
+            "items": [["MAT-001", "测试物料", "规格A", "测试分类", "A"]],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr("backend.app.services.erp.material_sync.execute_bill_query_with_config", fake_query)
+    session = make_session()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_enabled=True,
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_lcid=2052,
+            erp_material_field_keys="FNumber,FName,FSpecification,FMaterialGroup.FName,FForbidStatus",
+        ),
+        session,
+    )
+
+    result = sync_products_from_erp(session)
+
+    spu = session.query(ProductSPU).filter_by(spu_id="MAT-001").one()
+    sku = session.query(ProductSKU).filter_by(sku_id="MAT-001").one()
+    assert result["ok"] is True
+    assert result["total"] == 1
+    assert result["created_spu"] == 1
+    assert result["created_sku"] == 1
+    assert spu.name == "测试物料"
+    assert spu.category == "测试分类"
+    assert sku.spu_uuid == spu.id
+    assert loads(sku.attributes_json, {})["erp_specification"] == "规格A"
+    assert session.get(SystemConfig, "erp_material_last_sync_at").value
+
+
+def test_erp_material_sync_skips_duplicate_material_numbers_in_same_batch(monkeypatch):
+    from backend.app.main import sync_products_from_erp, update_erp_config
+    from backend.app.models import ProductSKU
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+
+    def fake_query(config, **kwargs):
+        return {
+            "ok": True,
+            "items": [["MAT-DUP", "重复物料"], ["MAT-DUP", "重复物料"]],
+            "elapsed_ms": 1,
+        }
+
+    monkeypatch.setattr("backend.app.services.erp.material_sync.execute_bill_query_with_config", fake_query)
+    session = make_session()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_enabled=True,
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_material_field_keys="FNumber,FName",
+        ),
+        session,
+    )
+
+    result = sync_products_from_erp(session)
+
+    assert result["total"] == 1
+    assert result["skipped_duplicates"] == 1
+    assert session.query(ProductSKU).filter_by(sku_id="MAT-DUP").count() == 1
+
+
+def test_processing_job_runs_erp_material_sync(monkeypatch):
+    from backend.app.models import ProductSPU
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+    from backend.app.main import update_erp_config
+
+    def fake_query(config, **kwargs):
+        return {"ok": True, "items": [["MAT-JOB", "队列物料"]], "elapsed_ms": 1}
+
+    monkeypatch.setattr("backend.app.services.erp.material_sync.execute_bill_query_with_config", fake_query)
+    session = make_session()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_enabled=True,
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+            erp_material_field_keys="FNumber,FName",
+        ),
+        session,
+    )
+    session.add(ProcessingJob(job_type="sync_erp_materials", payload_json=dumps({"source": "test"}), status="Pending"))
+    session.commit()
+
+    result = run_pending_jobs(session)
+
+    assert result["completed"] == 1
+    assert session.query(ProductSPU).filter_by(spu_id="MAT-JOB").one().name == "队列物料"
+    assert session.query(ProcessingJob).filter_by(job_type="sync_erp_materials", status="Completed").count() == 1
+
+
+def test_business_material_search_reads_synced_product_center():
+    from backend.app.services.erp.business_queries import search_materials
+
+    session = make_session()
+    spu = create_spu(session, spu_id="MAT-SEARCH", name="查询物料", category="同步分类")
+    session.flush()
+    session.add(ProductSKU(spu_uuid=spu.id, sku_id="MAT-SEARCH", attributes_json=dumps({"erp_specification": "规格S"})))
+    session.commit()
+
+    result = search_materials(session, q="SEARCH", limit=10)
+
+    assert result["ok"] is True
+    assert result["items"][0]["material_code"] == "MAT-SEARCH"
+    assert result["items"][0]["material_name"] == "查询物料"
+    assert result["items"][0]["specification"] == "规格S"
+
+
+def test_business_inventory_query_maps_erp_rows(monkeypatch):
+    from backend.app.services.erp.business_queries import query_inventory
+
+    captured = {}
+
+    def fake_query(session, **kwargs):
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "message": "查询成功",
+            "elapsed_ms": 12,
+            "items": [["MAT-INV", "库存物料", "WH01", "测试仓", 5, 3]],
+        }
+
+    monkeypatch.setattr("backend.app.services.erp.business_queries.execute_bill_query_from_config", fake_query)
+    session = make_session()
+
+    result = query_inventory(session, material_code="MAT-INV", warehouse_code="WH01", limit=10)
+
+    assert result["ok"] is True
+    assert result["items"][0]["material_code"] == "MAT-INV"
+    assert result["items"][0]["warehouse_code"] == "WH01"
+    assert result["items"][0]["base_qty"] == 5.0
+    assert captured["form_id"] == "STK_Inventory"
+    assert "FMaterialId.FNumber = 'MAT-INV'" in captured["filter_string"]
+    assert "FStockId.FNumber = 'WH01'" in captured["filter_string"]
+
+
+def test_inventory_snapshot_sync_aggregates_and_lists_alerts(monkeypatch):
+    from backend.app.services.erp.business_queries import list_inventory_snapshots, sync_inventory_snapshots
+    from backend.app.schemas import ErpRuntimeConfigUpdate
+    from backend.app.main import update_erp_config
+
+    def fake_query(config, **kwargs):
+        return {
+            "ok": True,
+            "items": [
+                ["MAT-STOCK", "库存物料", "WH01", "主仓", 1, 0],
+                ["MAT-STOCK", "库存物料", "WH01", "主仓", 2, 0],
+                ["MAT-ZERO", "零库存物料", "WH02", "备仓", 0, 0],
+            ],
+        }
+
+    monkeypatch.setattr("backend.app.services.erp.business_queries.execute_bill_query_with_config", fake_query)
+    session = make_session()
+    session.add_all(
+        [
+            ProductSPU(spu_id="MAT-STOCK", name="库存物料", category="成品"),
+            ProductSPU(spu_id="MAT-ZERO", name="零库存物料", category="成品"),
+        ]
+    )
+    session.flush()
+    update_erp_config(
+        ErpRuntimeConfigUpdate(
+            erp_enabled=True,
+            erp_server_url="http://erp.local/k3cloud/",
+            erp_acct_id="test-db",
+            erp_username="erp-user",
+            erp_app_id="app-id",
+            erp_app_sec="app-secret",
+        ),
+        session,
+    )
+
+    result = sync_inventory_snapshots(session)
+    listed = list_inventory_snapshots(session, low_stock_only=True, threshold=1, page=1, page_size=10)
+
+    assert result["ok"] is True
+    assert result["total"] == 2
+    assert session.query(ProductInventorySnapshot).filter_by(material_code="MAT-STOCK", warehouse_code="WH01").one().base_qty == 3
+    assert listed["summary"]["zero_stock_count"] == 1
+    assert listed["summary"]["low_stock_count"] == 1
+    assert listed["items"][0]["material_code"] == "MAT-ZERO"
+    assert listed["items"][0]["alert_level"] == "zero"
+
+
+def test_inventory_summary_excludes_non_countable_materials_by_default():
+    from backend.app.services.erp.business_queries import list_inventory_snapshots
+
+    session = make_session()
+    countable = ProductSPU(spu_id="COUNT-001", name="计数物料", category="成品")
+    consumable = ProductSPU(spu_id="CONS-001", name="耗材物料", category="工具耗材")
+    session.add_all([countable, consumable])
+    session.flush()
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="COUNT-001", material_name="计数物料", warehouse_code="WH", warehouse_name="主仓", base_qty=2, qty=2),
+            ProductInventorySnapshot(material_code="CONS-001", material_name="耗材物料", warehouse_code="WH", warehouse_name="主仓", base_qty=100, qty=100),
+        ]
+    )
+    session.commit()
+
+    default_result = list_inventory_snapshots(session, page=1, page_size=10)
+    all_result = list_inventory_snapshots(session, countable_only=False, page=1, page_size=10)
+
+    assert default_result["summary"]["total_rows"] == 1
+    assert default_result["summary"]["total_base_qty"] == 2
+    assert {item["material_code"] for item in default_result["items"]} == {"COUNT-001"}
+    assert all_result["summary"]["total_rows"] == 2
+    assert all_result["summary"]["total_base_qty"] == 102
+
+
+def test_inventory_type_summary_groups_by_material_middle_type():
+    from backend.app.services.erp.business_queries import list_inventory_type_summary
+
+    session = make_session()
+    session.add_all(
+        [
+            ProductSPU(spu_id="A-001", name="A1", category="成品", product_type="扫描仪"),
+            ProductSPU(spu_id="A-002", name="A2", category="成品", product_type="扫描仪"),
+            ProductSPU(spu_id="B-001", name="B1", category="结构件", product_type="支架"),
+        ]
+    )
+    session.flush()
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="A-001", material_name="A1", warehouse_code="WH1", warehouse_name="主仓", base_qty=2, qty=2),
+            ProductInventorySnapshot(material_code="A-002", material_name="A2", warehouse_code="WH1", warehouse_name="主仓", base_qty=3, qty=3),
+            ProductInventorySnapshot(material_code="B-001", material_name="B1", warehouse_code="WH2", warehouse_name="备仓", base_qty=0, qty=0),
+        ]
+    )
+    session.commit()
+
+    result = list_inventory_type_summary(session, countable_only=True, page=1, page_size=10)
+    by_type = {item["material_type"]: item for item in result["items"]}
+
+    assert result["total"] == 2
+    assert by_type["扫描仪"]["parent_category"] == "成品"
+    assert by_type["扫描仪"]["material_count"] == 2
+    assert by_type["扫描仪"]["base_qty"] == 5
+    assert by_type["支架"]["alert_level"] == "zero"
+
+
+def test_inventory_type_summary_derives_middle_type_from_material_name():
+    from backend.app.services.erp.business_queries import list_inventory_type_summary
+
+    session = make_session()
+    session.add_all(
+        [
+            ProductSPU(spu_id="P-001", name="CR-scan上壳", category="塑胶件"),
+            ProductSPU(spu_id="P-002", name="CR-scan下壳", category="塑胶件"),
+            ProductSPU(spu_id="S-001", name="Seal双轴转台-底座", category="塑胶件"),
+        ]
+    )
+    session.flush()
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="P-001", material_name="CR-scan上壳", warehouse_code="WH1", warehouse_name="主仓", base_qty=2, qty=2),
+            ProductInventorySnapshot(material_code="P-002", material_name="CR-scan下壳", warehouse_code="WH1", warehouse_name="主仓", base_qty=3, qty=3),
+            ProductInventorySnapshot(material_code="S-001", material_name="Seal双轴转台-底座", warehouse_code="WH1", warehouse_name="主仓", base_qty=4, qty=4),
+        ]
+    )
+    session.commit()
+
+    result = list_inventory_type_summary(session, countable_only=True, page=1, page_size=10)
+    by_type = {item["material_type"]: item for item in result["items"]}
+
+    assert by_type["CR-scan"]["material_count"] == 2
+    assert by_type["Seal双轴转台"]["material_count"] == 1
+
+
+def test_inventory_type_items_lists_material_warehouse_details():
+    from backend.app.services.erp.business_queries import list_inventory_type_items
+
+    session = make_session()
+    session.add_all(
+        [
+            ProductSPU(spu_id="P-001", name="CR-scan上壳", category="塑胶件"),
+            ProductSPU(spu_id="P-002", name="CR-scan下壳", category="塑胶件"),
+            ProductSPU(spu_id="S-001", name="Seal双轴转台-底座", category="塑胶件"),
+        ]
+    )
+    session.flush()
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="P-001", material_name="CR-scan上壳", warehouse_code="WH1", warehouse_name="主仓", base_qty=2, qty=2),
+            ProductInventorySnapshot(material_code="P-002", material_name="CR-scan下壳", warehouse_code="WH2", warehouse_name="备仓", base_qty=0, qty=0),
+            ProductInventorySnapshot(material_code="S-001", material_name="Seal双轴转台-底座", warehouse_code="WH1", warehouse_name="主仓", base_qty=4, qty=4),
+        ]
+    )
+    session.commit()
+
+    result = list_inventory_type_items(session, material_type="CR-scan", parent_category="塑胶件", threshold=1, page=1, page_size=10)
+
+    assert result["total"] == 2
+    assert result["summary"]["material_count"] == 2
+    assert result["summary"]["warehouse_count"] == 2
+    assert result["summary"]["base_qty"] == 2
+    assert result["summary"]["zero_stock_count"] == 1
+    assert [item["material_code"] for item in result["items"]] == ["P-001", "P-002"]
+    assert {item["warehouse_name"] for item in result["items"]} == {"主仓", "备仓"}
+
+    searched = list_inventory_type_items(session, material_type="CR-scan", parent_category="塑胶件", q="备仓", page=1, page_size=10)
+    assert searched["total"] == 1
+    assert searched["items"][0]["material_code"] == "P-002"
+
+    zero_only = list_inventory_type_items(session, material_type="CR-scan", parent_category="塑胶件", stock_status="zero", page=1, page_size=10)
+    assert zero_only["total"] == 1
+    assert zero_only["summary"]["zero_stock_count"] == 1
+
+
 def test_system_enable_requires_model_bot_and_department_config():
     from backend.app.main import config, update_mail_config
     from backend.app.schemas import MailRuntimeConfigUpdate
@@ -203,7 +715,7 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert "Dify API Key" in exc.value.detail
     assert "bot邮箱密码" in exc.value.detail
     assert "生产部门主送邮箱" in exc.value.detail
-    assert session.get(SystemConfig, "bot_enabled").value == "false"
+    assert session.get(SystemConfig, "bot_enabled").value == "true"
 
     configure_department(session)
     model = session.query(ModelProviderConfig).one()
@@ -239,7 +751,7 @@ def test_system_enable_rejects_invalid_department_main_email():
     assert exc.value.status_code == 400
     assert "生产部门主送邮箱格式不合法" in exc.value.detail
     assert "销售直属领导" in exc.value.detail
-    assert session.get(SystemConfig, "bot_enabled").value == "false"
+    assert session.get(SystemConfig, "bot_enabled").value == "true"
 
 
 def test_department_upsert_rejects_invalid_main_email():
@@ -283,6 +795,302 @@ def test_delete_department_hides_it_and_disables_system_when_last_recipient():
     assert all(row["id"] != department.id for row in list_departments(page=1, page_size=10, session=session)["items"])
     audit = session.query(AuditEvent).filter_by(event_type="ProductionDepartmentDeleted").one()
     assert audit.actor == "admin"
+
+
+def test_logistics_department_crud_matches_production_email_shape():
+    from backend.app.main import create_or_update_logistics_department, delete_logistics_department, list_logistics_departments
+    from backend.app.schemas import DepartmentUpsert
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+
+    default = session.query(LogisticsDepartment).filter_by(department_code="default").one()
+    assert default.department_name == "默认物流部门"
+
+    result = create_or_update_logistics_department(
+        DepartmentUpsert(
+            department_code="wuhan-logistics",
+            department_name="武汉仓物流部",
+            mail_to=["logistics@jimuyida.com"],
+            mail_cc=["ops@jimuyida.com"],
+        ),
+        session,
+    )
+    assert result["ok"] is True
+
+    listing = list_logistics_departments(q="物流", page=1, page_size=10, session=session)
+    row = next(item for item in listing["items"] if item["department_code"] == "wuhan-logistics")
+    assert row["department_name"] == "武汉仓物流部"
+    assert row["mail_to"] == ["logistics@jimuyida.com"]
+    assert row["mail_cc"] == ["ops@jimuyida.com"]
+
+    deleted = delete_logistics_department(row["id"], Request(), session)
+
+    assert deleted["ok"] is True
+    assert session.get(LogisticsDepartment, row["id"]).status == "Deleted"
+    assert all(item["id"] != row["id"] for item in list_logistics_departments(page=1, page_size=10, session=session)["items"])
+    audit = session.query(AuditEvent).filter_by(event_type="LogisticsDepartmentDeleted").one()
+    assert audit.actor == "admin"
+
+
+def test_logistics_department_upsert_rejects_invalid_main_email():
+    from backend.app.main import create_or_update_logistics_department
+    from backend.app.schemas import DepartmentUpsert
+
+    session = make_session()
+
+    with pytest.raises(Exception) as exc:
+        create_or_update_logistics_department(DepartmentUpsert(department_code="bad", department_name="坏邮箱", mail_to=["bad-email"], mail_cc=[]), session)
+
+    assert exc.value.status_code == 400
+    assert "主送邮箱格式不合法" in exc.value.detail
+
+
+def create_ecommerce_order_mail(session, order_no="EC-001"):
+    return create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject=f"独立站订单需求 - 测试客户 - {order_no}",
+        body_text="\n".join(
+            [
+                "客户名称：测试客户",
+                "产品：物料编码：1050600001，物料名称：树脂大卫头像(带纸盒)",
+                "数量：1",
+                "期望交期：2026-06-11",
+                f"订单号：{order_no}",
+                "物流发货方式：顺丰",
+                "客户收件信息：陈女士 18818881234 深圳市南山区",
+            ]
+        ),
+    )
+
+
+def test_ecommerce_order_routes_to_logistics_first():
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    mail = create_ecommerce_order_mail(session)
+
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert task.task_no.startswith("LT-")
+    assert session.query(LogisticsTask).count() == 1
+    assert session.query(ProductionTask).count() == 0
+    logistics_task = session.query(LogisticsTask).one()
+    assert logistics_task.status == "LogisticsIssued"
+    assert session.query(FulfillmentItem).filter_by(logistics_task_id=logistics_task.id, status="Pending").count() == 1
+    issue = session.query(OutboundMailJob).filter_by(mail_type="LogisticsTaskIssue").one()
+    assert as_list(issue.to_json) == ["logistics@jimuyida.com"]
+    ack = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
+    assert logistics_task.task_no in ack.body
+    assert "物流核查任务" in ack.body
+
+
+def test_logistics_stock_confirmation_closes_ecommerce_order():
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    task = create_task_from_mail(session, create_ecommerce_order_mail(session, "EC-002"))
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    reply = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject=f"Re: [物流核查单][{task.task_no}] 库存满足",
+        body_text="库存满足：是\n已发货\n发货单号：SF123456",
+    )
+    result = process_inbound_mail(session, reply)
+    session.commit()
+
+    session.refresh(task)
+    assert result is not None
+    assert task.status == "Closed"
+    assert task.closed_reason == "LogisticsShipped"
+    assert task.requirement.status == "Closed"
+    assert session.query(FulfillmentItem).filter_by(logistics_task_id=task.id, status="Shipped").count() == 1
+    notice = session.query(OutboundMailJob).filter_by(mail_type="LogisticsShipped").one()
+    assert as_list(notice.to_json) == ["sales@jimuyida.com"]
+
+    from backend.app.main import logistics_task_workflow
+
+    workflow = logistics_task_workflow(task.id, session)
+    assert "production" not in {step["key"] for step in workflow["steps"]}
+
+
+def test_logistics_shortage_creates_production_task():
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    task = create_task_from_mail(session, create_ecommerce_order_mail(session, "EC-003"))
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    reply = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject=f"Re: [物流核查单][{task.task_no}] 缺货",
+        body_text="库存满足：否\n缺失物料：树脂大卫头像(带纸盒) 缺货 1 件",
+    )
+    result = process_inbound_mail(session, reply)
+    session.commit()
+
+    session.refresh(task)
+    assert result is not None
+    assert task.status == "ProductionRequested"
+    assert task.production_task_id is not None
+    production_task = session.get(ProductionTask, task.production_task_id)
+    assert production_task is not None
+    assert production_task.status == "TaskIssued"
+    assert session.query(FulfillmentItem).filter_by(logistics_task_id=task.id, status="NeedProduction").count() == 1
+    assert session.query(OutboundMailJob).filter_by(mail_type="TaskIssue", related_task_id=production_task.id).count() == 1
+
+    from backend.app.main import logistics_task_workflow
+
+    workflow = logistics_task_workflow(task.id, session)
+    assert "production" in {step["key"] for step in workflow["steps"]}
+
+
+def test_mail_and_outbound_serializers_infer_logistics_task_links():
+    from backend.app.main import serialize_mail, serialize_outbound_mail
+
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    source_mail = create_ecommerce_order_mail(session, "EC-LINK-001")
+    task = create_task_from_mail(session, source_mail)
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    reply = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject=f"Re: [物流核查单][{task.task_no}] 库存满足",
+        body_text="库存满足：是\n已发货\n发货单号：SF-LINK",
+    )
+    process_inbound_mail(session, reply)
+    session.commit()
+
+    source_payload = serialize_mail(source_mail, session)
+    reply_payload = serialize_mail(reply, session)
+    ack_job = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
+    issue_job = session.query(OutboundMailJob).filter_by(mail_type="LogisticsTaskIssue").one()
+
+    assert source_payload["related_task_type"] == "logistics"
+    assert source_payload["related_task_no"] == task.task_no
+    assert reply_payload["related_task_type"] == "logistics"
+    assert reply_payload["related_task_no"] == task.task_no
+    assert serialize_outbound_mail(ack_job, session)["related_task_no"] == task.task_no
+    assert serialize_outbound_mail(issue_job, session)["related_task_type"] == "logistics"
+
+
+def test_logistics_task_workflow_and_manual_close_match_task_controls():
+    from backend.app.main import logistics_task_workflow, manual_close_logistics_task
+    from backend.app.schemas import TaskManualCloseRequest
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    task = create_task_from_mail(session, create_ecommerce_order_mail(session, "EC-MANUAL-001"))
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    workflow = logistics_task_workflow(task.id, session)
+    assert workflow["task"]["task_no"] == task.task_no
+    assert any(step["key"] == "issue" for step in workflow["steps"])
+    assert workflow["trace"]["nodes"]
+
+    result = manual_close_logistics_task(task.id, TaskManualCloseRequest(note="测试关闭"), Request(), session)
+    session.refresh(task)
+
+    assert result["closed"] is True
+    assert task.status == "Closed"
+    assert task.closed_reason == "ManualForceClosed"
+    assert task.requirement.status == "Closed"
+    assert session.query(FulfillmentItem).filter_by(logistics_task_id=task.id, status="Closed").count() == 1
+    mail_types = {row["mail_type"] for row in result["outbound_jobs"]}
+    assert {"LogisticsManualClosedSales", "LogisticsManualClosedLogistics"} <= mail_types
+
+
+def test_manual_close_logistics_after_shortage_does_not_close_active_production_requirement():
+    from backend.app.main import manual_close_logistics_task
+    from backend.app.schemas import TaskManualCloseRequest
+
+    class Request:
+        class State:
+            username = "admin"
+
+        state = State()
+
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    task = create_task_from_mail(session, create_ecommerce_order_mail(session, "EC-MANUAL-PROD-001"))
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    reply = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject=f"Re: [物流核查单][{task.task_no}] 缺货",
+        body_text="库存满足：否\n缺失物料：树脂大卫头像(带纸盒) 缺货 1 件",
+    )
+    process_inbound_mail(session, reply)
+    session.commit()
+    session.refresh(task)
+    assert task.production_task_id is not None
+    production_task = session.get(ProductionTask, task.production_task_id)
+    assert production_task.status == "TaskIssued"
+
+    manual_close_logistics_task(task.id, TaskManualCloseRequest(note="只关闭物流跟进"), Request(), session)
+    session.refresh(task)
+    session.refresh(production_task)
+
+    assert task.status == "Closed"
+    assert production_task.status == "TaskIssued"
+    assert production_task.requirement.status == "TaskCreated"
+
+
+def test_clear_task_records_removes_linked_logistics_and_production_tasks():
+    from backend.app.main import clear_task_records
+
+    session = make_session()
+    configure_department(session)
+    configure_logistics_department(session)
+    task = create_task_from_mail(session, create_ecommerce_order_mail(session, "EC-CLEAR-001"))
+    session.commit()
+    assert isinstance(task, LogisticsTask)
+
+    reply = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject=f"Re: [物流核查单][{task.task_no}] 缺货",
+        body_text="库存满足：否\n缺失物料：树脂大卫头像(带纸盒) 缺货 1 件",
+    )
+    process_inbound_mail(session, reply)
+    session.commit()
+
+    detail = clear_task_records(session)
+    session.commit()
+
+    assert detail["logistics_task_count"] == 1
+    assert detail["task_count"] == 1
+    assert session.query(LogisticsTask).count() == 0
+    assert session.query(ProductionTask).count() == 0
+    assert session.query(OrderRequirement).count() == 0
 
 
 def test_dashboard_includes_period_analytics_for_workbench_charts():
@@ -3016,7 +3824,8 @@ def test_custom_initial_review_rule_rejects_sales_order():
 def test_product_price_review_rejects_below_map_price():
     session = make_session()
     configure_department(session)
-    spu = create_spu(session, "SPU-G100", "G100 展示柜")
+    spu = create_spu(session, "SPU-G100", "G100 展示柜", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-G100", material_name="G100 展示柜", warehouse_code="WH", warehouse_name="成品仓", base_qty=10, qty=10))
     session.flush()
     sku = create_sku(session, spu.id, "G100")
     session.flush()
@@ -3055,10 +3864,323 @@ def test_product_price_review_rejects_below_map_price():
     assert session.query(ProductionTask).count() == 0
 
 
+def test_order_product_extraction_matches_finished_aliases_only():
+    session = make_session()
+    finished = create_spu(session, "1300100211", "三维扫描仪 JMK1 RTK(4规）", category="成品")
+    material = create_spu(session, "1021900207", "线材", category="电子料")
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="1300100211", material_name="三维扫描仪 JMK1 RTK(4规）", warehouse_code="WH", warehouse_name="成品仓", base_qty=5, qty=5),
+            ProductInventorySnapshot(material_code="1021900207", material_name="线材", warehouse_code="WH", warehouse_name="材料仓", base_qty=100, qty=100),
+        ]
+    )
+    session.flush()
+    create_sku(session, finished.id, "1300100211")
+    session.add(ProductSKU(spu_uuid=material.id, sku_id="1021900207", status="Active"))
+    session.commit()
+
+    by_full_name = extract_order_products_from_text(session, "客户下单：三维扫描仪 JMK1 RTK(4规） 数量 1 单价 999元")
+    by_model = extract_order_products_from_text(session, "客户下单：JMK1 RTK 数量 1 单价 999元")
+    by_material = extract_order_products_from_text(session, "客户下单：1021900207 线材 数量 1 单价 1元")
+
+    assert [item["sku_id"] for item in by_full_name] == ["1300100211"]
+    assert by_full_name[0]["match_source"] == "product_alias"
+    assert [item["sku_id"] for item in by_model] == ["1300100211"]
+    assert by_material == []
+
+
+def test_product_price_parser_accepts_common_order_price_formats():
+    assert parse_price_to_cents("USD 999") == 99900
+    assert parse_price_to_cents("$999.50") == 99950
+    assert parse_price_to_cents("999美元") == 99900
+    assert parse_price_to_cents("RMB999/台") == 99900
+    assert parse_price_to_cents("999分") == 999
+
+
+def test_order_product_extraction_reads_currency_and_unit_price_formats():
+    session = make_session()
+    spu = create_spu(session, "SPU-PRICE-FMT", "格式价格成品", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-PRICE-FMT", material_name="格式价格成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1))
+    session.flush()
+    create_sku(session, spu.id, "SKU-PRICE-FMT")
+    session.commit()
+
+    cases = [
+        ("客户下单：SKU-PRICE-FMT 数量 1 单价 USD 999", 99900),
+        ("客户下单：SKU-PRICE-FMT 数量 1 单价：$999.50", 99950),
+        ("客户下单：SKU-PRICE-FMT 数量 1 单价：999美元", 99900),
+        ("客户下单：SKU-PRICE-FMT 数量 1 单价：999/台", 99900),
+    ]
+    for text, expected in cases:
+        items = extract_order_products_from_text(session, text)
+        assert items[0]["unit_price"] == expected
+
+
+def test_product_review_preview_api_uses_real_review_chain():
+    from backend.app.main import preview_product_review_api
+
+    session = make_session()
+    spu = create_spu(session, "SPU-G300", "G300 展示柜", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-G300", material_name="G300 展示柜", warehouse_code="WH", warehouse_name="成品仓", base_qty=8, qty=8))
+    session.flush()
+    sku = create_sku(session, spu.id, "G300")
+    session.flush()
+    set_channel_pricing(session, sku.id, "default", tier_a_price=12000, map_price=10000)
+    session.commit()
+
+    result = preview_product_review_api({"text": "客户下单 G300 展示柜 数量 1 单价 90 元", "channel": "default"}, session)
+
+    assert result["ok"] is True
+    assert result["summary"]["matched_count"] == 1
+    assert result["items"][0]["sku_id"] == "G300"
+    assert result["items"][0]["sku_uuid"] == sku.id
+    assert result["items"][0]["spu_id"] == "SPU-G300"
+    assert result["items"][0]["product_name"] == "G300 展示柜"
+    assert result["items"][0]["pricing_configured"] is True
+    assert result["items"][0]["review"]["status"] == "Exception"
+    assert any("低于最低限价" in flag for flag in result["summary"]["risk_flags"])
+
+
+def test_product_review_preview_suggests_candidates_when_unmatched():
+    from backend.app.main import preview_product_review_api
+
+    session = make_session()
+    spu = create_spu(session, "SPU-JMK-RTK", "三维扫描仪 JMK1 RTK(4规）", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-JMK-RTK", material_name="三维扫描仪 JMK1 RTK(4规）", warehouse_code="WH", warehouse_name="成品仓", base_qty=2, qty=2))
+    session.flush()
+    create_sku(session, spu.id, "SKU-JMK-RTK")
+    session.commit()
+
+    result = preview_product_review_api({"text": "客户下单：JMK1RT 数量 1 单价 999 元", "channel": "default"}, session)
+
+    assert result["items"] == []
+    assert result["summary"]["matched_count"] == 0
+    assert result["summary"]["suggestion_count"] >= 1
+    assert result["suggestions"][0]["spu_id"] == "SPU-JMK-RTK"
+    assert result["suggestions"][0]["suggested_alias"] == "JMK1RT"
+
+
+def test_product_review_preview_marks_missing_pricing_for_quick_fix():
+    from backend.app.main import preview_product_review_api
+
+    session = make_session()
+    spu = create_spu(session, "SPU-NOPRICE", "无价格成品", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-NOPRICE", material_name="无价格成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1))
+    session.flush()
+    sku = create_sku(session, spu.id, "SKU-NOPRICE")
+    session.commit()
+
+    result = preview_product_review_api({"text": "客户下单：SKU-NOPRICE 数量 1 单价 99 元", "channel": "default"}, session)
+
+    assert result["items"][0]["sku_uuid"] == sku.id
+    assert result["items"][0]["pricing_configured"] is False
+    assert any("未配置价格规则" in flag for flag in result["summary"]["risk_flags"])
+
+
+def test_product_review_readiness_lists_pre_review_blockers():
+    from backend.app.main import list_promotions_api, product_review_readiness_api
+
+    session = make_session()
+    priced_spu = create_spu(session, "SPU-READY-OK", "已配置成品", category="成品")
+    missing_spu = create_spu(session, "SPU-READY-MISS", "缺价格成品", category="成品")
+    duplicate_a = create_spu(session, "SPU-READY-DUP-A", "重复别名A", category="成品")
+    duplicate_b = create_spu(session, "SPU-READY-DUP-B", "重复别名B", category="成品")
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="SPU-READY-OK", material_name="已配置成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="SPU-READY-MISS", material_name="缺价格成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="SPU-READY-DUP-A", material_name="重复别名A", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="SPU-READY-DUP-B", material_name="重复别名B", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+        ]
+    )
+    session.flush()
+    priced_sku = create_sku(session, priced_spu.id, "SKU-READY-OK")
+    create_sku(session, missing_spu.id, "SKU-READY-MISS")
+    dup_a_sku = create_sku(session, duplicate_a.id, "SKU-READY-DUP-A")
+    dup_b_sku = create_sku(session, duplicate_b.id, "SKU-READY-DUP-B")
+    session.flush()
+    set_channel_pricing(session, priced_sku.id, "default", map_price=10000)
+    set_channel_pricing(session, dup_a_sku.id, "default", map_price=10000)
+    set_channel_pricing(session, dup_b_sku.id, "default", map_price=10000)
+    update_spu_review_aliases(session, duplicate_a.id, ["通用别名"])
+    update_spu_review_aliases(session, duplicate_b.id, ["通用别名"])
+    session.add(PromotionRule(name="未绑定促销", channel="default", discount_type="percentage", discount_value=10, is_active=True))
+    session.commit()
+
+    result = product_review_readiness_api(channel="default", limit=20, session=session)
+    listed_promotions = list_promotions_api(q="", page=1, page_size=10, session=session)
+    listed_by_name = list_promotions_api(q="未绑定促销", page=1, page_size=10, session=session)
+    listed_by_status = list_promotions_api(q="未绑定", page=1, page_size=10, session=session)
+    issue_types = {item["issue_type"] for item in result["issues"]}
+
+    assert result["summary"]["finished_sku_count"] == 4
+    assert result["summary"]["missing_price_count"] == 1
+    assert result["summary"]["duplicate_alias_count"] == 1
+    assert result["summary"]["invalid_promotion_count"] == 1
+    assert result["summary"]["blocker_count"] == 3
+    assert {"missing_price", "duplicate_alias", "missing_alias", "invalid_promotion"} <= issue_types
+    assert any(item.get("sku_uuid") and item["action"] == "configure_pricing" for item in result["issues"])
+    assert listed_promotions["items"][0]["name"] == "未绑定促销"
+    assert listed_promotions["items"][0]["binding_status"] == "unbound"
+    assert listed_promotions["items"][0]["binding_valid"] is False
+    assert listed_by_name["items"][0]["id"] == listed_promotions["items"][0]["id"]
+    assert listed_by_status["items"][0]["id"] == listed_promotions["items"][0]["id"]
+
+
+def test_manual_review_aliases_feed_order_product_extraction():
+    from backend.app.main import list_channel_pricing_api, list_products_sku_api, list_products_spu_api
+
+    session = make_session()
+    spu = create_spu(session, "SPU-ALIAS-001", "三维扫描仪 ALPHA(4规）", category="成品")
+    material = create_spu(session, "MAT-ALIAS-001", "旗舰扫描套装包装材料", category="包装盒")
+    material.extended_info_json = json.dumps({"review_aliases": ["旗舰扫描套装"]}, ensure_ascii=False)
+    session.add(ProductInventorySnapshot(material_code="SPU-ALIAS-001", material_name="三维扫描仪 ALPHA(4规）", warehouse_code="WH", warehouse_name="成品仓", base_qty=3, qty=3))
+    session.add(ProductInventorySnapshot(material_code="MAT-ALIAS-001", material_name="旗舰扫描套装包装材料", warehouse_code="WH", warehouse_name="材料仓", base_qty=30, qty=30))
+    session.flush()
+    sku = create_sku(session, spu.id, "SKU-ALIAS-001")
+    session.add(ProductSKU(spu_uuid=material.id, sku_id="MAT-ALIAS-001", status="Active"))
+    session.flush()
+    set_channel_pricing(session, sku.id, "default", map_price=99900)
+    session.commit()
+
+    assert extract_order_products_from_text(session, "客户下单：旗舰扫描套装 数量 1 单价 999元") == []
+
+    update_spu_review_aliases(session, spu.id, ["旗舰扫描套装", "旗舰扫描套装", "成品"])
+    session.commit()
+    extracted = extract_order_products_from_text(session, "客户下单：旗舰扫描套装 数量 1 单价 999元")
+    listed = list_products_spu_api(q="SPU-ALIAS", page=1, page_size=10, session=session)
+    listed_by_alias = list_products_spu_api(q="旗舰扫描套装", page=1, page_size=10, session=session)
+    sku_listed_by_alias = list_products_sku_api(spu_id=None, spu_uuid=None, q="旗舰扫描套装", page=1, page_size=10, session=session)
+    pricing_listed_by_alias = list_channel_pricing_api(sku_id=None, sku_uuid=None, q="旗舰扫描套装", page=1, page_size=10, session=session)
+
+    assert [item["sku_id"] for item in extracted] == ["SKU-ALIAS-001"]
+    assert extracted[0]["match_alias"] == "旗舰扫描套装"
+    assert listed["items"][0]["review_aliases"] == ["旗舰扫描套装"]
+    assert [item["spu_id"] for item in listed_by_alias["items"]] == ["SPU-ALIAS-001"]
+    assert [item["sku_id"] for item in sku_listed_by_alias["items"]] == ["SKU-ALIAS-001"]
+    assert [item["sku_id"] for item in pricing_listed_by_alias["items"]] == ["SKU-ALIAS-001"]
+
+
+def test_promotion_rules_bind_to_finished_sku_and_do_not_apply_cross_sku():
+    session = make_session()
+    promo_spu = create_spu(session, "SPU-PROMO-A", "活动成品A", category="成品")
+    other_spu = create_spu(session, "SPU-PROMO-B", "活动成品B", category="成品")
+    material_spu = create_spu(session, "MAT-PROMO", "活动材料", category="包装盒")
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="SPU-PROMO-A", material_name="活动成品A", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="SPU-PROMO-B", material_name="活动成品B", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="MAT-PROMO", material_name="活动材料", warehouse_code="WH", warehouse_name="材料仓", base_qty=1, qty=1),
+        ]
+    )
+    session.flush()
+    promo_sku = create_sku(session, promo_spu.id, "SKU-PROMO-A")
+    other_sku = create_sku(session, other_spu.id, "SKU-PROMO-B")
+    material_sku = ProductSKU(spu_uuid=material_spu.id, sku_id="SKU-PROMO-MAT", status="Active")
+    session.add(material_sku)
+    session.flush()
+    set_channel_pricing(session, promo_sku.id, "default", map_price=10000)
+    set_channel_pricing(session, other_sku.id, "default", map_price=10000)
+
+    create_promotion_rule(session, name="618活动", sku_uuid=promo_sku.id, discount_type="percentage", discount_value=10)
+    with pytest.raises(ValueError, match="成品库存"):
+        create_promotion_rule(session, name="材料活动", sku_uuid=material_sku.id, discount_type="percentage", discount_value=10)
+    session.commit()
+
+    promotions, total = get_promotions(session)
+    applied = review_order_products(session, [{"sku_id": "SKU-PROMO-A", "unit_price": 12000, "promotion_applied": ["618活动"]}])
+    mismatched = review_order_products(session, [{"sku_id": "SKU-PROMO-B", "unit_price": 12000, "promotion_applied": ["618活动"]}])
+
+    assert total == 1
+    assert promotions[0].sku_uuid == promo_sku.id
+    assert applied[0]["review"]["status"] == "Pass"
+    assert mismatched[0]["review"]["status"] == "Exception"
+    assert any("促销不适用于 SKU SKU-PROMO-B" in flag for flag in mismatched[0]["review"]["risk_flags"])
+
+
+def test_product_review_uses_bound_promotion_discount_for_min_price():
+    session = make_session()
+    percent_spu = create_spu(session, "SPU-PROMO-PCT", "比例促销成品", category="成品")
+    fixed_spu = create_spu(session, "SPU-PROMO-FIX", "固定促销成品", category="成品")
+    session.add_all(
+        [
+            ProductInventorySnapshot(material_code="SPU-PROMO-PCT", material_name="比例促销成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+            ProductInventorySnapshot(material_code="SPU-PROMO-FIX", material_name="固定促销成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1),
+        ]
+    )
+    session.flush()
+    percent_sku = create_sku(session, percent_spu.id, "SKU-PROMO-PCT")
+    fixed_sku = create_sku(session, fixed_spu.id, "SKU-PROMO-FIX")
+    session.flush()
+    set_channel_pricing(session, percent_sku.id, "default", map_price=10000)
+    set_channel_pricing(session, fixed_sku.id, "default", map_price=10000)
+    create_promotion_rule(session, name="九折活动", sku_uuid=percent_sku.id, discount_type="percentage", discount_value=10)
+    create_promotion_rule(session, name="减10元", sku_uuid=fixed_sku.id, discount_type="fixed_amount", discount_value=1000)
+    session.commit()
+
+    no_promo = review_order_products(session, [{"sku_id": "SKU-PROMO-PCT", "unit_price": 9500}])
+    percent_pass = review_order_products(session, [{"sku_id": "SKU-PROMO-PCT", "unit_price": 9000, "promotion_applied": ["九折活动"]}])
+    percent_low = review_order_products(session, [{"sku_id": "SKU-PROMO-PCT", "unit_price": 8900, "promotion_applied": ["九折活动"]}])
+    fixed_pass = review_order_products(session, [{"sku_id": "SKU-PROMO-FIX", "unit_price": 9000, "promotion_applied": ["减10元"]}])
+
+    assert no_promo[0]["review"]["status"] == "Exception"
+    assert percent_pass[0]["review"]["status"] == "Pass"
+    assert fixed_pass[0]["review"]["status"] == "Pass"
+    assert percent_low[0]["review"]["status"] == "Exception"
+    assert any("低于促销最低价" in flag for flag in percent_low[0]["review"]["risk_flags"])
+
+
+def test_duplicate_active_promotion_rules_block_review_and_readiness():
+    from backend.app.main import product_review_readiness_api
+
+    session = make_session()
+    spu = create_spu(session, "SPU-PROMO-DUP", "重复促销成品", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-PROMO-DUP", material_name="重复促销成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1))
+    session.flush()
+    sku = create_sku(session, spu.id, "SKU-PROMO-DUP")
+    session.flush()
+    set_channel_pricing(session, sku.id, "default", map_price=10000)
+    update_spu_review_aliases(session, spu.id, ["重复促销成品"])
+    create_promotion_rule(session, name="重复活动", sku_uuid=sku.id, discount_type="percentage", discount_value=10)
+    create_promotion_rule(session, name="重复活动", sku_uuid=sku.id, discount_type="percentage", discount_value=20)
+    session.commit()
+
+    readiness = product_review_readiness_api(channel="default", limit=20, session=session)
+    reviewed = review_order_products(session, [{"sku_id": "SKU-PROMO-DUP", "unit_price": 9000, "promotion_applied": ["重复活动"]}])
+
+    assert readiness["summary"]["duplicate_promotion_count"] == 1
+    assert any(item["issue_type"] == "duplicate_promotion" for item in readiness["issues"])
+    assert reviewed[0]["review"]["status"] == "Exception"
+    assert any("促销规则重复" in flag for flag in reviewed[0]["review"]["risk_flags"])
+
+
+def test_product_rule_validation_rejects_invalid_amounts_and_time_ranges():
+    session = make_session()
+    spu = create_spu(session, "SPU-RULE-VALID", "规则校验成品", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-RULE-VALID", material_name="规则校验成品", warehouse_code="WH", warehouse_name="成品仓", base_qty=1, qty=1))
+    session.flush()
+    sku = create_sku(session, spu.id, "SKU-RULE-VALID")
+    session.flush()
+    start = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    invalid_cases = [
+        (lambda: set_channel_pricing(session, sku.id, "default", map_price=-1), "底价"),
+        (lambda: set_channel_pricing(session, sku.id, "default", map_price=10000, promo_start_time=start, promo_end_time=end), "开始时间"),
+        (lambda: create_promotion_rule(session, name="超额折扣", sku_uuid=sku.id, discount_type="percentage", discount_value=120), "比例折扣"),
+        (lambda: create_promotion_rule(session, name="零元减免", sku_uuid=sku.id, discount_type="fixed_amount", discount_value=0), "固定减免"),
+        (lambda: create_promotion_rule(session, name="时间倒挂", sku_uuid=sku.id, discount_type="percentage", discount_value=10, start_time=start, end_time=end), "开始时间"),
+    ]
+    for action, message in invalid_cases:
+        with pytest.raises(ValueError, match=message):
+            action()
+
+
 def test_product_price_review_allows_price_at_or_above_map_price_without_llm(monkeypatch):
     session = make_session()
     configure_department(session)
-    spu = create_spu(session, "SPU-G200", "G200 展示柜")
+    spu = create_spu(session, "SPU-G200", "G200 展示柜", category="成品")
+    session.add(ProductInventorySnapshot(material_code="SPU-G200", material_name="G200 展示柜", warehouse_code="WH", warehouse_name="成品仓", base_qty=10, qty=10))
     session.flush()
     sku = create_sku(session, spu.id, "G200")
     session.flush()
@@ -4769,7 +5891,113 @@ def test_initial_review_config_syncs_workflow_review_rules_as_custom_rules():
     assert workflow_rule["is_workflow_rule"] is True
     assert workflow_rule["workflow_name"] == "带规则流程"
     assert workflow_rule["id"].startswith("workflow:")
-    assert any(rule.get("name") == "特批编码校验" for rule in execution_config["rules"])
+    assert not any(rule.get("name") == "特批编码校验" for rule in execution_config["rules"])
+
+
+def test_workflow_review_rules_do_not_block_unmatched_mail_as_global_rules():
+    session = make_session()
+    import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "sample_gift_flow",
+                "workflow_name": "样机赠送流程",
+                "match": {"any_keywords": ["样机赠送"]},
+                "routing": {"to_names": ["zhangyan@jimuyida.com"]},
+                "subject_template": "[样机赠送][{{task_no}}]",
+                "body_template": "流程类型：{{workflow_name}}",
+                "required_fields": [],
+                "required_attachments": [],
+                "review_rules": [
+                    {
+                        "id": "sample-approval",
+                        "name": "样机审批校验",
+                        "field": "source_text",
+                        "operator": "contains",
+                        "value": "样机审批",
+                        "message": "请补充样机审批信息",
+                        "enabled": True,
+                    }
+                ],
+            }
+        ],
+        actor="tester",
+        auto_publish=True,
+    )
+    initial_review_config(session, include_workflow_rules=True)
+    session.commit()
+
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="生产订单需求 - 普通订单",
+        body_text="\n".join(
+            [
+                "客户名称：普通客户",
+                "产品：普通产品A",
+                "数量：30台",
+                "期望交期：2026-10-10",
+                "订单号：SO-WF-NO-MATCH-001",
+            ]
+        ),
+    )
+    task = create_task_from_mail(session, mail)
+    session.commit()
+
+    assert task is not None
+    assert workflow_binding_for_requirement(session, task.requirement_id) is None
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0
+
+
+def test_save_workflow_version_rules_dedupes_review_rules_by_signature():
+    session = make_session()
+    result = import_structured_workflow_rules(
+        session,
+        rules=[
+            {
+                "workflow_code": "dedupe_review_flow",
+                "workflow_name": "规则去重流程",
+                "match": {"any_keywords": ["规则去重流程"]},
+                "routing": {"to_names": ["zhangyan@jimuyida.com"]},
+                "subject_template": "[规则去重][{{task_no}}]",
+                "body_template": "流程类型：{{workflow_name}}",
+                "required_fields": [],
+                "required_attachments": [],
+                "review_rules": [],
+            }
+        ],
+        actor="tester",
+        auto_publish=False,
+    )
+    version_id = result["created_versions"][0]["id"]
+    version = session.get(WorkflowVersion, version_id)
+    rules = loads(version.compiled_rules_json, {})
+    rules["review_rules"] = [
+        {
+            "id": "local-rule",
+            "name": "流程复核建议",
+            "field": "source_text",
+            "operator": "contains",
+            "value": "渠道备货",
+            "message": "请编辑并启用该流程专属初审规则",
+            "enabled": True,
+        },
+        {
+            "id": f"workflow:{version_id}:local-rule",
+            "name": "流程复核建议",
+            "field": "source_text",
+            "operator": "contains",
+            "value": "渠 道 备 货",
+            "message": "请编辑并启用该流程专属初审规则",
+            "enabled": True,
+        },
+    ]
+
+    saved = save_workflow_version_rules(session, version_id, compiled_rules=rules, actor="tester", activate=False)
+    saved_rules = loads(saved.compiled_rules_json, {})
+
+    assert len(saved_rules["review_rules"]) == 1
+    assert saved_rules["review_rules"][0]["id"] == "local-rule"
 
 
 def test_deleted_workflow_review_rule_is_not_restored_by_sync():
@@ -5138,6 +6366,65 @@ def test_workflow_material_details_are_extracted_and_rendered_in_task_mail():
     assert "物料编码：MAT-A001" in version.body
     assert "物料名称：示例产品A" in version.body
     assert "数量：120套" in version.body
+
+
+def test_one_mail_with_multiple_material_items_creates_multiple_tasks():
+    session = make_session()
+    configure_department(session)
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="客户深圳易搭有限公司下单需求",
+        body_text="\n".join(
+            [
+                "客户名称：深圳易搭有限公司",
+                "物料详情描述：",
+                "1.物料编码：1300100257，物料名称：三维扫描仪 FOX(4规)（国内版）   数量：1",
+                "2.物料编码：1050600001，物料名称：树脂大卫头像(带纸盒) 数量：1",
+                "",
+                "出货时间要求：2026-06-11",
+                "订单号：12345678902222333",
+                "物流发货方式：顺丰",
+                "出货仓：武汉仓",
+                "交付要求：正常交付",
+                "客户收件信息：",
+                "收件人：陈女士",
+                "电话：18818881234",
+                "地址：广东省深圳市南山区李宁中心，0000",
+            ]
+        ),
+    )
+
+    first_task = create_task_from_mail(session, mail)
+    session.commit()
+
+    tasks = (
+        session.query(ProductionTask)
+        .join(OrderRequirement, OrderRequirement.id == ProductionTask.requirement_id)
+        .filter(OrderRequirement.source_mail_id == mail.id)
+        .order_by(ProductionTask.created_at, ProductionTask.id)
+        .all()
+    )
+    assert first_task is not None
+    assert first_task.id == tasks[0].id
+    assert len(tasks) == 2
+    assert mail.related_task_id == tasks[0].id
+    assert [task.requirement.quantity_text for task in tasks] == ["1", "1"]
+    assert "1300100257" in tasks[0].requirement.product_summary
+    assert "三维扫描仪 FOX" in tasks[0].requirement.product_summary
+    assert "1050600001" in tasks[1].requirement.product_summary
+    assert "树脂大卫头像" in tasks[1].requirement.product_summary
+
+    issue_jobs = session.query(OutboundMailJob).filter_by(mail_type="TaskIssue").order_by(OutboundMailJob.created_at).all()
+    assert len(issue_jobs) == 2
+    assert "1300100257" in issue_jobs[0].body
+    assert "1050600001" not in issue_jobs[0].body
+    assert "1050600001" in issue_jobs[1].body
+    assert "1300100257" not in issue_jobs[1].body
+
+    ack = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
+    assert tasks[0].task_no in ack.body
+    assert tasks[1].task_no in ack.body
 
 
 def test_imported_workflow_without_primary_contact_mapping_routes_to_internal_exception():
