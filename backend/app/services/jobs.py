@@ -10,7 +10,9 @@ from backend.app.config import settings
 from backend.app.models import MailMessage, ProcessingJob, now_utc
 from backend.app.services.crm_sync import run_crm_sales_order_sync
 from backend.app.services.erp.material_sync import sync_erp_materials
+from backend.app.services.exception_diagnosis import diagnose_exception_case
 from backend.app.services.jsonutil import loads
+from backend.app.services.order_middle_platform import DuplicateEventException, process_crm_order_parsed_event, process_oms_push_notice, process_oms_status_update
 from backend.app.services.workflow import process_inbound_mail
 
 
@@ -22,6 +24,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
         for row in (
             session.query(ProcessingJob.id)
             .filter_by(status="Pending")
+            .filter(or_(ProcessingJob.next_retry_at.is_(None), ProcessingJob.next_retry_at <= now_utc()))
             .order_by(ProcessingJob.created_at)
             .limit(limit)
             .all()
@@ -53,21 +56,23 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
         job = session.get(ProcessingJob, job_id)
         if job is None:
             continue
-        duplicate = (
-            session.query(ProcessingJob)
-            .filter(
-                ProcessingJob.id != job.id,
-                ProcessingJob.job_type == job.job_type,
-                ProcessingJob.payload_json == job.payload_json,
-                ProcessingJob.status.in_(["Running", "Completed"]),
-                or_(
-                    ProcessingJob.created_at < job.created_at,
-                    and_(ProcessingJob.created_at == job.created_at, ProcessingJob.id < job.id),
-                ),
+        duplicate = None
+        if job.job_type != "OMS_PUSH_NOTICE":
+            duplicate = (
+                session.query(ProcessingJob)
+                .filter(
+                    ProcessingJob.id != job.id,
+                    ProcessingJob.job_type == job.job_type,
+                    ProcessingJob.payload_json == job.payload_json,
+                    ProcessingJob.status.in_(["Running", "Completed"]),
+                    or_(
+                        ProcessingJob.created_at < job.created_at,
+                        and_(ProcessingJob.created_at == job.created_at, ProcessingJob.id < job.id),
+                    ),
+                )
+                .order_by(ProcessingJob.created_at, ProcessingJob.id)
+                .first()
             )
-            .order_by(ProcessingJob.created_at, ProcessingJob.id)
-            .first()
-        )
         if duplicate is not None:
             job.status = "Completed"
             job.error_message = f"Skipped duplicate processing job {duplicate.id}"
@@ -87,6 +92,23 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
             elif job.job_type == "sync_crm_sales_orders":
                 payload = loads(job.payload_json, {})
                 run_crm_sales_order_sync(session, trigger=str(payload.get("source") or "job"))
+            elif job.job_type == "CRM_ORDER_PARSED":
+                try:
+                    process_crm_order_parsed_event(session, loads(job.payload_json, {}))
+                except DuplicateEventException as exc:
+                    job.error_message = str(exc)
+                    job.status = "Completed"
+                    clear_processing_lock(job)
+                    completed += 1
+                    job.updated_at = now_utc()
+                    session.commit()
+                    continue
+            elif job.job_type == "OMS_PUSH_NOTICE":
+                process_oms_push_notice(session, loads(job.payload_json, {}))
+            elif job.job_type == "OMS_STATUS_SYNC":
+                process_oms_status_update(session, loads(job.payload_json, {}))
+            elif job.job_type == "DIAGNOSE_EXCEPTION":
+                diagnose_exception_case(session, str(payload.get("exception_id") or ""))
             else:
                 raise RuntimeError(f"unknown job type: {job.job_type}")
             job.status = "Completed"

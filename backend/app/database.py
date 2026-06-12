@@ -95,6 +95,7 @@ def ensure_runtime_schema() -> None:
             {
                 "locked_by": "VARCHAR(128)",
                 "locked_until": _datetime_type(),
+                "next_retry_at": _datetime_type(),
                 "started_at": _datetime_type(),
             },
         )
@@ -110,6 +111,51 @@ def ensure_runtime_schema() -> None:
             "promotion_rules",
             {
                 "sku_uuid": "VARCHAR(36)",
+            },
+        )
+    if "delivery_notices" in tables:
+        _ensure_columns(
+            "delivery_notices",
+            {
+                "oms_method": "VARCHAR(64) DEFAULT 'wms.order.create' NOT NULL",
+                "oms_order_no": "VARCHAR(128)",
+                "owner_code": "VARCHAR(128)",
+                "warehouse_code": "VARCHAR(128)",
+                "shop_code": "VARCHAR(128)",
+                "logistic_code": "VARCHAR(128)",
+                "split_preview_json": "TEXT DEFAULT '{}' NOT NULL",
+                "confirmed_by": "VARCHAR(128)",
+                "confirmed_at": _datetime_type(),
+            },
+        )
+    if "crm_sales_orders" in tables:
+        _ensure_columns(
+            "crm_sales_orders",
+            {
+                "latest_snapshot_id": "VARCHAR(36)",
+                "scope_status": "VARCHAR(32) DEFAULT 'InScope' NOT NULL",
+                "scope_ignore_reason": "TEXT",
+                "receipt_phone": "VARCHAR(64)",
+            },
+        )
+    if "exception_cases" in tables:
+        _ensure_columns(
+            "exception_cases",
+            {
+                "assignee": "VARCHAR(128)",
+                "resolution_note": "TEXT",
+                "due_at": _datetime_type(),
+                "resolved_at": _datetime_type(),
+                "reopened_at": _datetime_type(),
+                "last_actor": "VARCHAR(128)",
+                "updated_at": _datetime_type(),
+            },
+        )
+    if "production_tasks" in tables:
+        _ensure_columns(
+            "production_tasks",
+            {
+                "version": "INTEGER DEFAULT 0 NOT NULL",
             },
         )
 

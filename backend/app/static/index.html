@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>商务生产任务单智能体 MVP</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-6" />
+    <title>商务订单中台智能体 MVP</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260612-4" />
   </head>
   <body>
     <section id="login-screen" class="login-screen" hidden>
       <form id="login-form" class="login-panel">
         <span class="mark">J</span>
         <h1>商务部小J</h1>
-        <p>商务生产任务单工作台</p>
+        <p>CRM 订单中台与履约工作台</p>
         <label>用户名 <input name="username" value="admin" autocomplete="username" /></label>
         <label>密码 <input name="password" type="password" placeholder="默认 admin" autocomplete="current-password" /></label>
         <button type="submit" class="button">登录</button>
@@ -23,26 +23,41 @@
         <span class="mark">J</span>
         <div>
           <strong>商务部小J</strong>
-          <small>生产任务单工作台</small>
+          <small>订单中台工作台</small>
         </div>
       </div>
-      <nav>
-        <a href="#dashboard" data-page-link="dashboard">工作台</a>
-        <a href="#tasks" data-page-link="tasks">任务</a>
-        <a href="#logistics-tasks" data-page-link="logistics-tasks">物流任务</a>
-        <a href="#workflows" data-page-link="workflows">流程</a>
-        <a href="#review-rules" data-page-link="review-rules">初审规则</a>
-        <a href="#integration" data-page-link="integration">接入</a>
-        <a href="#departments" data-page-link="departments">生产邮箱</a>
-        <a href="#logistics-departments" data-page-link="logistics-departments">物流邮箱</a>
-        <a href="#products" data-page-link="products">物料管理</a>
-        <a href="#crm-orders" data-page-link="crm-orders">订单管理</a>
-        <a href="#reports" data-page-link="reports">周报</a>
-        <a href="#mails" data-page-link="mails">邮件</a>
-        <a href="#outbound" data-page-link="outbound">外发</a>
-        <a href="#exceptions" data-page-link="exceptions">异常</a>
-        <a href="#ops" data-page-link="ops">运维</a>
-        <a href="#skill-lab" data-page-link="skill-lab">技能实验室</a>
+      <nav aria-label="主导航">
+        <div class="nav-group">
+          <span class="nav-group-label">总览</span>
+          <a href="#dashboard" data-page-link="dashboard"><span>Agent 概览</span><small>全局水位</small></a>
+          <a href="#exceptions" data-page-link="exceptions"><span>异常接管</span><small>阻断与高危</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">订单履约</span>
+          <a href="#crm-orders" data-page-link="crm-orders"><span>CRM 订单</span><small>同步与预审</small></a>
+          <a href="#logistics-tasks" data-page-link="logistics-tasks"><span>发货执行</span><small>物流与库存</small></a>
+          <a href="#tasks" data-page-link="tasks"><span>生产任务</span><small>历史邮件流</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">规则与主数据</span>
+          <a href="#products" data-page-link="products"><span>物料中心</span><small>SKU / 库存</small></a>
+          <a href="#workflows" data-page-link="workflows"><span>流程编排</span><small>路由与模板</small></a>
+          <a href="#review-rules" data-page-link="review-rules"><span>预审规则</span><small>字段与防呆</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">集成运维</span>
+          <a href="#integration" data-page-link="integration"><span>系统接入</span><small>CRM / OMS / 邮箱</small></a>
+          <a href="#outbound" data-page-link="outbound"><span>通知队列</span><small>邮件外发</small></a>
+          <a href="#mails" data-page-link="mails"><span>邮件留痕</span><small>入库与分类</small></a>
+          <a href="#ops" data-page-link="ops"><span>队列审计</span><small>Job / 附件 / 备份</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">组织配置</span>
+          <a href="#departments" data-page-link="departments"><span>生产通知</span><small>部门邮箱</small></a>
+          <a href="#logistics-departments" data-page-link="logistics-departments"><span>物流通知</span><small>部门邮箱</small></a>
+          <a href="#reports" data-page-link="reports"><span>经营周报</span><small>摘要与导出</small></a>
+          <a href="#skill-lab" data-page-link="skill-lab"><span>技能实验室</span><small>Agent 扩展</small></a>
+        </div>
       </nav>
     </aside>
 
@@ -60,13 +75,47 @@
       </header>
       <div id="notice-trail" class="notice-trail" role="status" aria-live="polite"></div>
 
-      <section class="page is-active" data-page="dashboard" data-title="工作台" data-subtitle="核心状态、队列水位和待处理风险。">
+      <section class="page is-active" data-page="dashboard" data-title="Agent 概览" data-subtitle="从 CRM 感知、预审阻断、OMS 履约到通知队列，一屏查看自动化链路。">
+        <section class="agent-overview">
+          <div class="agent-overview-copy">
+            <small>一期主链路</small>
+            <h2>CRM 审批订单进入中台，预审通过后生成发货通知；异常由人工接管。</h2>
+            <p>管理人员看订单与异常，运维人员看队列与接入。左侧菜单已按这个工作方式重新分组。</p>
+          </div>
+          <div class="agent-flow-cards" aria-label="订单中台流程导航">
+            <a href="#crm-orders" class="flow-card">
+              <small>1 感知</small>
+              <strong>CRM 订单同步</strong>
+              <span>发现新订单、查重、识别变更/撤销</span>
+            </a>
+            <a href="#review-rules" class="flow-card">
+              <small>2 认知</small>
+              <strong>完整预审</strong>
+              <span>字段、附件、SKU、金额、库存防呆</span>
+            </a>
+            <a href="#logistics-tasks" class="flow-card">
+              <small>3 执行</small>
+              <strong>发货履约</strong>
+              <span>发货预览、OMS 下推、重试补偿</span>
+            </a>
+            <a href="#exceptions" class="flow-card is-hot">
+              <small>4 接管</small>
+              <strong>异常处理</strong>
+              <span>阻断原因、责任人、处理建议</span>
+            </a>
+            <a href="#ops" class="flow-card">
+              <small>5 监控</small>
+              <strong>队列审计</strong>
+              <span>Job、水位、附件解析与备份</span>
+            </a>
+          </div>
+        </section>
         <div id="dashboard" class="metrics"></div>
         <div id="dashboard-insights" class="dashboard-insights"></div>
         <div id="system-health" class="health-panel"></div>
       </section>
 
-      <section class="page product-page" data-page="products" data-title="物料管理" data-subtitle="管理物料 SPU/SKU、渠道价格和促销规则，支撑订单自动化合规审核。">
+      <section class="page product-page" data-page="products" data-title="物料中心" data-subtitle="维护 SKU、库存、价格和别名映射，为订单预审和 OMS 下推提供主数据。">
         <div class="section-head product-section-head">
           <h2>物料中心</h2>
           <p>维护成品库存中的 SPU/SKU、渠道限价和促销规则。</p>
@@ -263,7 +312,7 @@
           <div id="products-promotions-pagination" class="pagination" data-table-pagination="productsPromotions"></div>
         </div>
       </section>
-      <section class="page skill-page" data-page="skill-lab" data-title="技能实验室" data-subtitle="通过对话让智能体学习新技能，实现业务逻辑的自主进化。">
+      <section class="page skill-page" data-page="skill-lab" data-title="技能实验室" data-subtitle="面向运维和管理员的 Agent 扩展入口，新增技能前先小范围验证。">
         <div class="section-head">
           <h2 id="skill-lab">技能实验室 (Skill Lab)</h2>
           <p>生成的技能将立即热加载到后端引擎，无需重启服务。</p>
@@ -294,7 +343,7 @@
         </div>
       </section>
 
-      <section class="page" data-page="reports" data-title="周报" data-subtitle="统计摘要、收件人和导出文件。">
+      <section class="page" data-page="reports" data-title="经营周报" data-subtitle="面向管理层的订单、任务、异常和外发摘要，可预览、入队发送或导出。">
         <div class="section-head">
           <h2>周报发送</h2>
           <p>周报邮件进入外发队列后由 SMTP 发送。</p>
@@ -312,10 +361,10 @@
         </form>
       </section>
 
-      <section class="page crm-orders-page" data-page="crm-orders" data-title="订单管理" data-subtitle="同步 CRM 销售订单，自动去重并沉淀订单、客户、金额和交付回款信息。">
+      <section class="page crm-orders-page" data-page="crm-orders" data-title="CRM 订单" data-subtitle="CRM 审批订单的入口页：同步、去重、预审、变更和撤销都从这里进入中台。">
         <div class="section-head">
-          <h2>销售订单</h2>
-          <p>按 CRM 订单 ID 或销售订单编号去重，重复同步只更新变更字段。</p>
+          <h2>订单同步与预审入口</h2>
+          <p>按 CRM 订单 ID 或销售订单编号去重；发现新快照后进入完整预审，发现变更/撤销后按流程阶段分流。</p>
         </div>
         <div id="crm-orders-summary" class="metrics compact-metrics"></div>
         <form id="crm-orders-filter-form" class="table-filter-bar clearable-filter-bar crm-orders-toolbar" data-table-filter="crmOrders">
@@ -328,62 +377,9 @@
           <div class="filter-actions">
             <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
             <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
-            <button id="crm-sync-settings-open" type="button" class="button ghost crm-sync-settings-button">同步设置</button>
+            <a href="#integration" class="button ghost crm-sync-settings-button">CRM 接入设置</a>
           </div>
         </form>
-        <div id="crm-sync-popover" class="modal-backdrop" hidden>
-          <section class="modal-panel crm-sync-settings-panel" role="dialog" aria-modal="true" aria-labelledby="crm-sync-popover-title">
-            <div class="modal-head">
-              <div>
-                <small>订单同步设置</small>
-                <h2 id="crm-sync-popover-title">CRM 订单同步</h2>
-                <small>通过已登录浏览器会话复用销售订单列表接口。</small>
-              </div>
-              <button id="crm-sync-settings-close" type="button" class="icon-button" aria-label="关闭">×</button>
-            </div>
-            <div class="crm-sync-layout">
-              <form id="crm-sync-config-form" class="form-grid compact-form crm-sync-form">
-                <label class="switch-line">
-                  <input name="crm_sync_enabled" type="checkbox" />
-                  <span>开启定时同步</span>
-                </label>
-                <label>同步间隔(秒)
-                  <input name="crm_sync_interval_seconds" type="number" min="60" step="60" />
-                </label>
-                <label>Chrome CDP 地址
-                  <input name="crm_cdp_url" placeholder="http://127.0.0.1:9333" />
-                </label>
-                <label>请求配置文件
-                  <input name="crm_fxiaoke_request_file" placeholder="/private/tmp/fxiaoke-sales-order-list-request.json" />
-                </label>
-                <label>每页条数
-                  <input name="crm_sync_page_size" type="number" min="1" max="200" />
-                </label>
-                <label>超时(秒)
-                  <input name="crm_sync_timeout_seconds" type="number" min="30" max="600" />
-                </label>
-                <label class="wide">请求配置 JSON
-                  <textarea name="crm_fxiaoke_request_json" rows="4" placeholder="可选：粘贴抓到的最小请求 JSON，留空则使用请求配置文件。"></textarea>
-                </label>
-                <div class="actions wide">
-                  <button type="submit" class="button">保存同步配置</button>
-                  <button id="crm-sync-queue" type="button" class="button ghost">入队同步</button>
-                  <button id="crm-sync-run" type="button" class="button ghost">立即同步</button>
-                </div>
-              </form>
-              <div class="crm-sync-runs">
-                <div class="inventory-list-head">
-                  <div>
-                    <h3>最近同步</h3>
-                    <p>后台 job 和手动同步都会记录在这里。</p>
-                  </div>
-                </div>
-                <div id="crm-sync-runs-list" class="list"></div>
-              </div>
-            </div>
-            <pre id="crm-sync-result" class="test-result"></pre>
-          </section>
-        </div>
         <div class="data-table product-table crm-orders-table">
           <div class="head row crm-order-row">
             <div>订单 / 客户</div>
@@ -416,10 +412,10 @@
         </form>
       </section>
 
-      <section class="page" data-page="review-rules" data-title="初审规则" data-subtitle="定义销售订单邮件进入任务草稿前的自动审查条件。">
+      <section class="page" data-page="review-rules" data-title="预审规则" data-subtitle="管理订单进入履约前的字段完整性、业务防呆和人工补充规则。">
         <div class="section-head">
-          <h2>自定义规则</h2>
-          <p>规则按顺序执行，任意一条未通过都会回复销售说明原因。</p>
+          <h2>规则与阻断条件</h2>
+          <p>一期订单完整预审由后端规则链强制执行；这里保留可配置规则，辅助历史邮件流和流程专项校验。</p>
         </div>
         <form id="initial-review-rules-filter-form" class="table-filter-bar" data-table-filter="reviewRules">
           <div class="filter-search">
@@ -439,10 +435,10 @@
         <div id="initial-review-rules-pagination" class="pagination" data-table-pagination="reviewRules"></div>
       </section>
 
-      <section class="page" data-page="workflows" data-title="流程" data-subtitle="流程列表、导入、编辑与启用。">
+      <section class="page" data-page="workflows" data-title="流程编排" data-subtitle="配置不同业务流程的必填字段、通知路由、预审规则和启用状态。">
         <div class="section-head">
-          <h2>流程列表</h2>
-          <p>查询流程版本、启用状态和路由信息。</p>
+          <h2>业务流程清单</h2>
+          <p>查看流程版本、启用状态、责任部门和通知路由，避免管理员在多个配置页之间来回找。</p>
         </div>
         <form id="workflows-filter-form" class="table-filter-bar" data-table-filter="workflows">
           <div class="filter-search">
@@ -487,10 +483,155 @@
         </div>
       </section>
 
-      <section class="page" data-page="integration" data-title="接入配置" data-subtitle="腾讯企业邮箱、队列、SMTP 和模型服务。">
+      <section class="page" data-page="integration" data-title="系统接入" data-subtitle="集中维护 CRM/OMS/ERP/邮箱/模型等外部系统连接，适合运维排查配置问题。">
+        <div class="tabs" id="integration-tabs" data-tabs="integration">
+          <button type="button" class="active" data-tab="crm">CRM 接入</button>
+          <button type="button" data-tab="oms">OMS 接入</button>
+          <button type="button" data-tab="mail">邮箱通知</button>
+          <button type="button" data-tab="erp">ERP 只读</button>
+          <button type="button" data-tab="test-mail">测试账号</button>
+          <button type="button" data-tab="model">模型接入</button>
+        </div>
+        <div class="tab-content is-active" id="integration-crm-tab">
         <div class="section-head">
-          <h2>腾讯企业邮箱与模型接入</h2>
-          <p>运行期配置不会在页面回显密钥。</p>
+          <h2>CRM 接入</h2>
+          <p>维护纷享销客销售订单同步参数；销售邮箱随 CRM 订单销售人员信息获取，不在流程节点邮箱中单独配置。</p>
+        </div>
+        <div class="crm-sync-layout integration-crm-layout">
+          <form id="crm-sync-config-form" class="form-grid compact-form crm-sync-form">
+            <label class="switch-line">
+              <input name="crm_sync_enabled" type="checkbox" />
+              <span>开启定时同步</span>
+            </label>
+            <label>CRM 账号
+              <input name="crm_username" autocomplete="off" />
+            </label>
+            <label>CRM 密码
+              <input name="crm_password" type="password" placeholder="留空不修改" autocomplete="current-password" />
+            </label>
+            <label class="wide">CRM API Key
+              <input name="crm_api_key" type="password" placeholder="账号密码方式可留空；留空不修改" autocomplete="off" />
+            </label>
+            <label>同步间隔(秒)
+              <input name="crm_sync_interval_seconds" type="number" min="60" step="60" />
+            </label>
+            <label>Chrome CDP 地址
+              <input name="crm_cdp_url" placeholder="http://127.0.0.1:9333" />
+            </label>
+            <label>请求配置文件
+              <input name="crm_fxiaoke_request_file" placeholder="/private/tmp/fxiaoke-sales-order-list-request.json" />
+            </label>
+            <label>详情请求配置文件
+              <input name="crm_fxiaoke_detail_request_file" placeholder="/private/tmp/fxiaoke-sales-order-detail-request.json" />
+            </label>
+            <label>每页条数
+              <input name="crm_sync_page_size" type="number" min="1" max="200" />
+            </label>
+            <label>超时(秒)
+              <input name="crm_sync_timeout_seconds" type="number" min="30" max="600" />
+            </label>
+            <label class="wide">请求配置 JSON
+              <textarea name="crm_fxiaoke_request_json" rows="4" placeholder="可选：粘贴抓到的最小请求 JSON，留空则使用请求配置文件。"></textarea>
+            </label>
+            <label class="wide">详情请求配置 JSON
+              <textarea name="crm_fxiaoke_detail_request_json" rows="4" placeholder="可选：粘贴单条订单详情请求 JSON，支持 {{crm_order_id}} / {{crm_order_no}} 占位符。"></textarea>
+            </label>
+            <div class="actions wide">
+              <button type="submit" class="button">保存 CRM 配置</button>
+              <button id="crm-sync-queue" type="button" class="button ghost">入队同步</button>
+              <button id="crm-sync-run" type="button" class="button ghost">立即同步</button>
+              <button id="crm-sync-test" type="button" class="button ghost">接入测试</button>
+            </div>
+          </form>
+          <div class="crm-sync-runs">
+            <div class="inventory-list-head">
+              <div>
+                <h3>最近同步</h3>
+                <p>后台 job 和手动同步都会记录在这里。</p>
+              </div>
+            </div>
+            <div id="crm-sync-runs-list" class="list"></div>
+          </div>
+        </div>
+        <pre id="crm-sync-result" class="test-result"></pre>
+        </div>
+        <div class="tab-content" id="integration-oms-tab" hidden>
+        <div class="section-head">
+          <h2>OMS 接入</h2>
+          <p>维护吉客云/OMS OpenAPI 凭证。BOT 启动要求启用真实 OMS 接入，不能依赖 mock 成功。</p>
+        </div>
+        <form id="oms-config-form" class="form-grid compact-form">
+          <label class="switch-line">
+            <input name="oms_enabled" type="checkbox" />
+            <span>启用 OMS 接入</span>
+          </label>
+          <label class="switch-line">
+            <input name="oms_mock_success" type="checkbox" />
+            <span>开发 mock 成功</span>
+          </label>
+          <label class="switch-line">
+            <input name="oms_auto_confirm_delivery_notice" type="checkbox" />
+            <span>低风险发货通知自动确认</span>
+          </label>
+          <label>OpenAPI 网关
+            <input name="oms_jackyun_gateway_url" placeholder="https://open.jackyun.com/open/openapi/do" />
+          </label>
+          <label>AppKey
+            <input name="oms_jackyun_app_key" autocomplete="off" />
+          </label>
+          <label>AppSecret
+            <input name="oms_jackyun_app_secret" type="password" placeholder="留空不修改" autocomplete="current-password" />
+          </label>
+          <label>接口版本
+            <input name="oms_jackyun_version" placeholder="1.0" />
+          </label>
+          <label>Content Type
+            <input name="oms_jackyun_content_type" placeholder="json" />
+          </label>
+          <label>超时(秒)
+            <input name="oms_jackyun_timeout_seconds" type="number" min="3" max="120" />
+          </label>
+          <label>货主编码
+            <input name="oms_owner_code" />
+          </label>
+          <label>仓库编码
+            <input name="oms_warehouse_code" />
+          </label>
+          <label>店铺编码
+            <input name="oms_shop_code" />
+          </label>
+          <label>物流公司编码
+            <input name="oms_logistic_code" />
+          </label>
+          <label>订单类型
+            <input name="oms_order_type" />
+          </label>
+          <label>创建接口
+            <select name="oms_create_order_method">
+              <option value="wms.order.create">wms.order.create</option>
+              <option value="wms-ods.order.create">wms-ods.order.create</option>
+            </select>
+          </label>
+          <label>重试基数秒
+            <input name="oms_retry_base_delay_seconds" type="number" min="1" />
+          </label>
+          <label>重试倍数
+            <input name="oms_retry_multiplier" type="number" min="1" max="10" />
+          </label>
+          <label>最大重试次数
+            <input name="oms_max_retries" type="number" min="1" max="20" />
+          </label>
+          <div class="actions wide">
+            <button type="submit" class="button">保存 OMS 配置</button>
+            <button id="test-oms-connection" type="button" class="button ghost">测试 OMS 连接</button>
+          </div>
+        </form>
+        <pre id="oms-test-result" class="test-result"></pre>
+        </div>
+        <div class="tab-content" id="integration-mail-tab" hidden>
+        <div class="section-head">
+          <h2>邮箱、模型与基础运行配置</h2>
+          <p>密钥不会在页面回显；保存后由 worker、通知队列和 Agent 能力共同使用。</p>
         </div>
         <div class="actions toolbar">
           <button id="test-model" type="button" class="button ghost">测试模型</button>
@@ -524,6 +665,8 @@
           </label>
           <button type="submit" class="button">保存邮箱配置</button>
         </form>
+        </div>
+        <div class="tab-content" id="integration-erp-tab" hidden>
         <div class="section-head">
           <h2>金蝶云星空 ERP 只读接入</h2>
           <p>当前阶段只测试登录鉴权，不保存、提交或审核 ERP 单据。</p>
@@ -581,6 +724,8 @@
           <button type="submit" class="button">查询库存</button>
         </form>
         <pre id="erp-inventory-result" class="test-result"></pre>
+        </div>
+        <div class="tab-content" id="integration-test-mail-tab" hidden>
         <form id="e2e-mail-form" class="form-grid compact-form">
           <label>销售测试邮箱 <input name="e2e_sales_email" value="bot.sales@jimuyida.com" /></label>
           <label>销售邮箱密码 <input name="e2e_sales_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
@@ -590,6 +735,8 @@
           <button id="run-e2e-mail" type="button" class="button ghost">运行端到端测试</button>
         </form>
         <pre id="e2e-mail-result" class="test-result"></pre>
+        </div>
+        <div class="tab-content" id="integration-model-tab" hidden>
         <form id="model-form" class="form-grid compact-form">
           <label>模型标题 <input name="title" /></label>
           <label>服务类型 <input name="provider" /></label>
@@ -614,9 +761,10 @@
             <button type="submit" class="button">发送测试</button>
           </form>
         </div>
+        </div>
       </section>
 
-      <section class="page" data-page="departments" data-title="生产邮箱" data-subtitle="生产部门主送、抄送和启用状态。">
+      <section class="page" data-page="departments" data-title="生产通知" data-subtitle="维护生产部门的主送、抄送和启用状态，作为任务通知的组织通讯录。">
         <div class="section-head">
           <h2>生产部门邮箱</h2>
           <p>任务单下达使用当前启用的生产部门邮箱。</p>
@@ -642,7 +790,7 @@
         <div id="departments-pagination" class="pagination" data-table-pagination="departments"></div>
       </section>
 
-      <section class="page" data-page="logistics-departments" data-title="物流邮箱" data-subtitle="物流部门主送、抄送和启用状态。">
+      <section class="page" data-page="logistics-departments" data-title="物流通知" data-subtitle="维护物流部门通知地址，支撑发货异常、库存核查和履约协同。">
         <div class="section-head">
           <h2>物流部门邮箱</h2>
           <p>物流通知和后续物流流程使用当前启用的物流部门邮箱。</p>
@@ -668,7 +816,7 @@
         <div id="logistics-departments-pagination" class="pagination" data-table-pagination="logisticsDepartments"></div>
       </section>
 
-      <section class="page" data-page="mails" data-title="邮件" data-subtitle="入库邮件、分类结果和任务关联。">
+      <section class="page" data-page="mails" data-title="邮件留痕" data-subtitle="查看入库邮件、分类结果、附件和任务关联；邮件只作为通知与留痕渠道。">
         <div class="section-head">
           <h2>邮件入库</h2>
           <p>原始 EML 和附件会保存在本地存储目录。</p>
@@ -688,7 +836,7 @@
         <div id="mails-pagination" class="pagination" data-table-pagination="mails"></div>
       </section>
 
-      <section class="page" data-page="tasks" data-title="任务" data-subtitle="分页、搜索、过滤和工作流查看。">
+      <section class="page" data-page="tasks" data-title="生产任务" data-subtitle="历史邮件流和生产任务单视图，保留用于查询、追踪和过渡期处理。">
         <div class="section-head">
           <h2>任务列表</h2>
           <p>查询任务流转状态和历史记录。</p>
@@ -712,7 +860,7 @@
         <div id="task-pagination" class="pagination"></div>
       </section>
 
-      <section class="page" data-page="logistics-tasks" data-title="物流任务" data-subtitle="物流库存核查、发货闭环和缺货转生产状态。">
+      <section class="page" data-page="logistics-tasks" data-title="发货执行" data-subtitle="关注库存核查、发货闭环和缺货转生产，是 OMS 履约视图的过渡入口。">
         <div class="section-head">
           <h2>物流任务列表</h2>
           <p>查看电商/独立站订单的物流优先处理结果。</p>
@@ -746,10 +894,10 @@
         </form>
       </section>
 
-      <section class="page" data-page="outbound" data-title="外发" data-subtitle="待发送、已发送和失败重试。">
+      <section class="page" data-page="outbound" data-title="通知队列" data-subtitle="查看待发送、已发送和失败重试的通知邮件，预审失败提醒也会进入这里。">
         <div class="section-head">
-          <h2>外发队列</h2>
-          <p>失败邮件可重新加入队列。</p>
+          <h2>邮件外发与失败重试</h2>
+          <p>预审失败、异常告警、周报和业务通知都会进入队列；失败邮件可重新加入队列。</p>
         </div>
         <div id="outbound-diagnostics" class="diagnostics-panel"></div>
         <form id="outbound-filter-form" class="table-filter-bar outbound-filter-bar" data-table-filter="outbound">
@@ -771,10 +919,10 @@
         <div id="outbound-pagination" class="pagination" data-table-pagination="outbound"></div>
       </section>
 
-      <section class="page" data-page="exceptions" data-title="异常" data-subtitle="缺字段、路由、附件和答复异常。">
+      <section class="page" data-page="exceptions" data-title="异常接管" data-subtitle="集中处理预审阻断、CRM 变更/撤销、OMS 下推失败和人工待确认事项。">
         <div class="section-head">
-          <h2>异常队列</h2>
-          <p>异常处理后流程可回到任务草稿。</p>
+          <h2>阻断与高危事项</h2>
+          <p>管理人员看责任和处理建议；运维人员看证据、状态和可重放条件。</p>
         </div>
         <form id="exceptions-filter-form" class="table-filter-bar clearable-filter-bar" data-table-filter="exceptions">
           <div class="filter-search">
@@ -797,7 +945,7 @@
         <div id="exceptions-pagination" class="pagination" data-table-pagination="exceptions"></div>
       </section>
 
-      <section class="page" data-page="ops" data-title="运维" data-subtitle="入库队列、附件解析、清理、备份和审计。">
+      <section class="page" data-page="ops" data-title="队列审计" data-subtitle="运维查看 ProcessingJob、附件解析、清理、备份和审计日志，定位系统卡点。">
         <div class="section-head">
           <h2>入库队列</h2>
           <p>队列执行邮件识别、解析和任务单生成。</p>
@@ -1064,6 +1212,17 @@
           <button id="crm-order-detail-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <div id="crm-order-detail-summary" class="crm-order-detail-summary"></div>
+        <section class="crm-order-flow-section">
+          <div class="crm-order-flow-head">
+            <div>
+              <h3>当前流程</h3>
+              <p id="crm-order-flow-current">正在读取中台流程...</p>
+            </div>
+            <div id="crm-order-flow-badge" class="status-pill is-muted">未进入中台</div>
+          </div>
+          <div id="crm-order-flow" class="crm-order-flow"></div>
+          <div id="crm-order-flow-evidence" class="crm-order-flow-evidence"></div>
+        </section>
         <div class="crm-order-detail-grid">
           <section>
             <h3>订单信息</h3>
@@ -1262,6 +1421,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260611-6"></script>
+    <script src="/static/app.js?v=20260612-5"></script>
   </body>
 </html>

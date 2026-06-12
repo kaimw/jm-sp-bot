@@ -57,6 +57,18 @@ class AdminPasswordRequest(BaseModel):
 
 class ExceptionResolveRequest(BaseModel):
     note: str = ""
+    actor: str = "operator"
+
+
+class ExceptionAssignRequest(BaseModel):
+    assignee: str
+    note: str = ""
+    actor: str = "operator"
+
+
+class ExceptionReopenRequest(BaseModel):
+    note: str = ""
+    actor: str = "operator"
 
 
 class ExceptionRequirementPatchRequest(BaseModel):
@@ -129,12 +141,44 @@ class ErpRuntimeConfigUpdate(BaseModel):
 
 class CrmRuntimeConfigUpdate(BaseModel):
     crm_sync_enabled: bool | None = None
+    crm_username: str | None = None
+    crm_password: str | None = None
+    crm_api_key: str | None = None
     crm_sync_interval_seconds: int | None = None
     crm_cdp_url: str | None = None
     crm_fxiaoke_request_file: str | None = None
     crm_fxiaoke_request_json: str | None = None
+    crm_fxiaoke_detail_request_file: str | None = None
+    crm_fxiaoke_detail_request_json: str | None = None
     crm_sync_page_size: int | None = None
     crm_sync_timeout_seconds: int | None = None
+
+
+class OmsRuntimeConfigUpdate(BaseModel):
+    oms_enabled: bool | None = None
+    oms_mock_success: bool | None = None
+    oms_auto_confirm_delivery_notice: bool | None = None
+    oms_inventory_review_enabled: bool | None = None
+    oms_inventory_missing_blocks: bool | None = None
+    oms_retry_base_delay_seconds: int | None = None
+    oms_retry_multiplier: int | None = None
+    oms_max_retries: int | None = None
+    oms_jackyun_gateway_url: str | None = None
+    oms_jackyun_app_key: str | None = None
+    oms_jackyun_app_secret: str | None = None
+    oms_jackyun_version: str | None = None
+    oms_jackyun_content_type: str | None = None
+    oms_jackyun_timeout_seconds: int | None = None
+    oms_owner_code: str | None = None
+    oms_warehouse_code: str | None = None
+    oms_shop_code: str | None = None
+    oms_logistic_code: str | None = None
+    oms_order_type: str | None = None
+    oms_create_order_method: str | None = None
+
+
+class DeliveryNoticeConfirmRequest(BaseModel):
+    confirmed_by: str = "operator"
 
 
 class ErpBillQueryRequest(BaseModel):

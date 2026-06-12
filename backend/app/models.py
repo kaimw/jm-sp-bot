@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -178,6 +178,7 @@ class ProcessingJob(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     locked_by: Mapped[str | None] = mapped_column(String(128))
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
@@ -363,6 +364,7 @@ class ProductionTask(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     manual_takeover: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     closed_reason: Mapped[str | None] = mapped_column(String(128))
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
@@ -440,6 +442,13 @@ class ExceptionCase(Base):
     severity: Mapped[str] = mapped_column(String(32), default="Medium", nullable=False)
     detail: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="Open", nullable=False)
+    assignee: Mapped[str | None] = mapped_column(String(128))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_actor: Mapped[str | None] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
@@ -500,6 +509,7 @@ class CrmSalesOrder(Base):
     __table_args__ = (
         UniqueConstraint("source_system", "crm_order_id", name="uq_crm_order_source_id"),
         UniqueConstraint("source_system", "crm_order_no", name="uq_crm_order_source_no"),
+        UniqueConstraint("source_system", "crm_order_id", "payload_hash", name="uq_crm_order_hash"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -527,12 +537,16 @@ class CrmSalesOrder(Base):
     shipment_status: Mapped[str | None] = mapped_column(String(64))
     invoice_status: Mapped[str | None] = mapped_column(String(64))
     receipt_contact: Mapped[str | None] = mapped_column(String(128))
+    receipt_phone: Mapped[str | None] = mapped_column(String(64))
     receipt_address: Mapped[str | None] = mapped_column(Text)
     delivery_date: Mapped[str | None] = mapped_column(String(32))
     remark: Mapped[str | None] = mapped_column(Text)
     attachment_files_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    latest_snapshot_id: Mapped[str | None] = mapped_column(String(36))
+    scope_status: Mapped[str] = mapped_column(String(32), default="InScope", nullable=False)
+    scope_ignore_reason: Mapped[str | None] = mapped_column(Text)
     sync_status: Mapped[str] = mapped_column(String(32), default="Synced", nullable=False)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -541,6 +555,52 @@ class CrmSalesOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
     items: Mapped[list["CrmOrderItem"]] = relationship(back_populates="order")
+    snapshots: Mapped[list["CrmOrderSnapshot"]] = relationship(back_populates="order")
+    attachments: Mapped[list["OrderAttachment"]] = relationship(back_populates="crm_order")
+
+
+class CrmOrderSnapshot(Base):
+    __tablename__ = "crm_order_snapshots"
+    __table_args__ = (UniqueConstraint("source_system", "crm_order_id", "payload_hash", name="uq_crm_snapshot_hash"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    crm_sales_order_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("crm_sales_orders.id"))
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_order_no: Mapped[str | None] = mapped_column(String(128))
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    is_latest: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    parse_status: Mapped[str] = mapped_column(String(32), default="Parsed", nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    order: Mapped[CrmSalesOrder | None] = relationship(back_populates="snapshots")
+
+
+class OrderAttachment(Base):
+    __tablename__ = "order_attachments"
+    __table_args__ = (UniqueConstraint("source_system", "crm_order_id", "payload_hash", "fingerprint", name="uq_order_attachment_snapshot_file"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    crm_sales_order_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("crm_sales_orders.id"))
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_order_no: Mapped[str | None] = mapped_column(String(128))
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    attachment_type: Mapped[str | None] = mapped_column(String(64))
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_url: Mapped[str | None] = mapped_column(Text)
+    source_file_id: Mapped[str | None] = mapped_column(String(128))
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    parse_status: Mapped[str] = mapped_column(String(32), default="Registered", nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    crm_order: Mapped[CrmSalesOrder | None] = relationship(back_populates="attachments")
 
 
 class CrmOrderItem(Base):
@@ -567,6 +627,85 @@ class CrmOrderItem(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
     order: Mapped[CrmSalesOrder | None] = relationship(back_populates="items")
+
+
+class MiddlePlatformOrder(Base):
+    __tablename__ = "middle_platform_orders"
+    __table_args__ = (
+        UniqueConstraint("source_system", "crm_order_id", name="uq_middle_order_source_id"),
+        UniqueConstraint("order_no", name="uq_middle_order_no"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    order_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(64), default="fxiaoke", nullable=False)
+    crm_sales_order_id: Mapped[str] = mapped_column(String(36), ForeignKey("crm_sales_orders.id"), nullable=False)
+    crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    crm_order_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    customer_name: Mapped[str | None] = mapped_column(String(255))
+    sales_user_name: Mapped[str | None] = mapped_column(String(128))
+    currency: Mapped[str | None] = mapped_column(String(16))
+    order_amount: Mapped[float | None] = mapped_column(Numeric(15, 2))
+    status: Mapped[str] = mapped_column(String(32), default="CRM_APPROVED", nullable=False)
+    validation_summary_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    crm_order: Mapped[CrmSalesOrder] = relationship()
+    items: Mapped[list["MiddlePlatformOrderItem"]] = relationship(back_populates="order")
+    delivery_notices: Mapped[list["DeliveryNotice"]] = relationship(back_populates="order")
+
+
+class MiddlePlatformOrderItem(Base):
+    __tablename__ = "middle_platform_order_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    order_id: Mapped[str] = mapped_column(String(36), ForeignKey("middle_platform_orders.id"), nullable=False)
+    sku_code: Mapped[str | None] = mapped_column(String(128))
+    product_name: Mapped[str | None] = mapped_column(String(255))
+    quantity: Mapped[float | None] = mapped_column(Numeric(15, 2))
+    unit_price: Mapped[float | None] = mapped_column(Numeric(15, 2))
+    line_amount: Mapped[float | None] = mapped_column(Numeric(15, 2))
+    raw_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    order: Mapped[MiddlePlatformOrder] = relationship(back_populates="items")
+
+
+class DeliveryNotice(Base):
+    __tablename__ = "delivery_notices"
+    __table_args__ = (UniqueConstraint("notice_no", name="uq_delivery_notice_no"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    notice_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(36), ForeignKey("middle_platform_orders.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Created", nullable=False)
+    oms_idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    oms_method: Mapped[str] = mapped_column(String(64), default="wms.order.create", nullable=False)
+    oms_order_no: Mapped[str | None] = mapped_column(String(128))
+    owner_code: Mapped[str | None] = mapped_column(String(128))
+    warehouse_code: Mapped[str | None] = mapped_column(String(128))
+    shop_code: Mapped[str | None] = mapped_column(String(128))
+    logistic_code: Mapped[str | None] = mapped_column(String(128))
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    split_preview_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confirmed_by: Mapped[str | None] = mapped_column(String(128))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    order: Mapped[MiddlePlatformOrder] = relationship(back_populates="delivery_notices")
 
 
 class CrmSyncRun(Base):

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CRM Event Contract Generator"
+  short_description: "Generate asynchronous CRM event contracts"
+  default_prompt: "Use $crm-event-contract-generator when implementing CrmOrderParsedEvent schemas, producers, consumers, payload_hash idempotency, or duplicate event handling."

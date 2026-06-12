@@ -14,7 +14,7 @@ from pathlib import Path
 from io import StringIO
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session, object_session
@@ -25,8 +25,10 @@ from backend.app.models import (
     AuditEvent,
     AttachmentAsset,
     BackupJob,
+    CrmOrderSnapshot,
     CrmSalesOrder,
     CrmSyncRun,
+    OrderAttachment,
     ExceptionCase,
     ExtractionEvidence,
     FulfillmentItem,
@@ -37,6 +39,8 @@ from backend.app.models import (
     MailWorkflowMatch,
     MailTemplate,
     ModelProviderConfig,
+    DeliveryNotice,
+    MiddlePlatformOrder,
     OrderRequirement,
     OutboundMailJob,
     ProcessingJob,
@@ -59,12 +63,15 @@ from backend.app.schemas import (
     ErpBillQueryRequest,
     ErpRuntimeConfigUpdate,
     ExceptionRequirementPatchRequest,
+    ExceptionAssignRequest,
+    ExceptionReopenRequest,
     ExceptionResolveRequest,
     InitialReviewConfigUpdate,
     LoginRequest,
     MailRuntimeConfigUpdate,
     ModelChatTestRequest,
     ModelProviderUpdate,
+    OmsRuntimeConfigUpdate,
     OutboundBulkCancelRequest,
     ProductionFeedbackRequest,
     ProductionQuestionRequest,
@@ -82,15 +89,18 @@ from backend.app.schemas import (
     ProductSPUCreate,
     ProductSKUCreate,
     ChannelPricingUpdate,
+    DeliveryNoticeConfirmRequest,
     PromotionRuleCreate,
     PromotionRuleUpdate,
 )
+from backend.app.services.crm_attachment_cache import local_storage_ref
 from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_INTERVAL_SECONDS
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token
 from backend.app.services.bootstrap import seed_defaults, set_config
 from backend.app.services.crm_sync import (
     crm_order_summary,
     queue_crm_order_sync,
+    run_crm_integration_test,
     run_crm_sales_order_sync,
     serialize_sync_run,
 )
@@ -108,6 +118,7 @@ from backend.app.services.erp.business_queries import (
 )
 from backend.app.services.erp.kingdee_client import execute_bill_query_from_config, normalize_kingdee_server_url, test_kingdee_connection_from_config
 from backend.app.services.erp.material_sync import sync_erp_materials
+from backend.app.services.exception_diagnosis import diagnose_exception_case, enqueue_exception_diagnosis
 from backend.app.services.initial_review import (
     DEFAULT_REQUIRED_FIELDS,
     FIELD_LABELS,
@@ -124,6 +135,17 @@ from backend.app.services.mail_worker import configured_mail_worker_interval_sec
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
+from backend.app.services.order_middle_platform import (
+    confirm_delivery_notice,
+    enqueue_crm_order_parsed_event,
+    enqueue_oms_push,
+    list_middle_orders,
+    order_dashboard,
+    process_crm_order_parsed_event,
+    process_oms_status_update,
+    serialize_middle_order,
+)
+from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
 from backend.app.services.pdf import simple_pdf
 from backend.app.services.workflow_rules import (
     activate_workflow_version,
@@ -205,13 +227,23 @@ from backend.app.services.products import (
 from backend.app.services.skills.registry import registry
 from backend.app.services.skills.factory import SkillFactory
 
-app = FastAPI(title="商务生产任务单智能体 MVP")
-
 PUBLIC_API_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/auth/me"}
 logger = logging.getLogger(__name__)
 mail_worker_task: asyncio.Task | None = None
 EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 LOGISTICS_TASK_NO_PATTERN = re.compile(r"LT-\d{8}-\d{4}", re.IGNORECASE)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app_: FastAPI):
+    await startup()
+    try:
+        yield
+    finally:
+        await shutdown()
+
+
+app = FastAPI(title="商务生产任务单智能体 MVP", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -262,13 +294,14 @@ def distinct_values(session: Session, column) -> list[str]:
     ]
 
 
-@app.on_event("startup")
 async def startup() -> None:
     init_db()
     with SessionLocal() as session:
         seed_defaults(session)
-        set_config(session, "bot_enabled", "true", is_secret=False)
         backfill_mail_received_at(session)
+        readiness = runtime_startup_readiness(session)
+        if not readiness["ready"]:
+            set_config(session, "bot_enabled", "false", is_secret=False)
         session.commit()
     # 加载动态生成的技能
     registry.load_dynamic_skills()
@@ -278,7 +311,6 @@ async def startup() -> None:
         mail_worker_task = asyncio.create_task(mail_auto_worker_loop())
 
 
-@app.on_event("shutdown")
 async def shutdown() -> None:
     if mail_worker_task is not None:
         mail_worker_task.cancel()
@@ -584,6 +616,25 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
     if not (str(incoming_password or "").strip() or (saved_password is not None and str(saved_password.value or "").strip())):
         missing.append("bot邮箱密码")
 
+    if not system_config_bool(session, "crm_sync_enabled", False):
+        missing.append("CRM同步未启用")
+    crm_username = system_config_value(session, "crm_username", overrides).strip()
+    crm_password = system_config_value(session, "crm_password", overrides).strip()
+    crm_api_key = system_config_value(session, "crm_api_key", overrides).strip()
+    if not crm_api_key and not (crm_username and crm_password):
+        missing.append("CRM账号密码或API Key")
+
+    if not system_config_bool(session, "oms_enabled", False):
+        missing.append("OMS接入未启用")
+    if system_config_bool(session, "oms_mock_success", True):
+        missing.append("OMS真实下推未启用")
+    oms_app_key = system_config_value(session, "oms_jackyun_app_key", overrides).strip()
+    oms_app_secret = system_config_value(session, "oms_jackyun_app_secret", overrides).strip()
+    if not oms_app_key:
+        missing.append("OMS AppKey")
+    if not oms_app_secret:
+        missing.append("OMS AppSecret")
+
     departments = session.query(ProductionDepartment).filter_by(status="Active").all()
     production_main_recipients: list[str] = []
     invalid_production_main_recipients: list[str] = []
@@ -597,6 +648,26 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
         missing.append(f"生产部门主送邮箱格式不合法：{', '.join(invalid_production_main_recipients)}")
 
     return {"ready": not missing, "missing": missing}
+
+
+def system_config_value(session: Session, key: str, overrides: dict | None = None, default: str = "") -> str:
+    overrides = overrides or {}
+    if key in overrides and overrides[key] not in (None, ""):
+        return str(overrides[key])
+    row = session.get(SystemConfig, key)
+    if row is None or row.value is None:
+        return default
+    return str(row.value)
+
+
+def disable_bot_when_not_ready(session: Session) -> dict:
+    readiness = runtime_startup_readiness(session)
+    bot_disabled = False
+    if system_config_bool(session, "bot_enabled", False) and not readiness["ready"]:
+        set_config(session, "bot_enabled", "false", is_secret=False)
+        bot_disabled = True
+        readiness = runtime_startup_readiness(session)
+    return {"readiness": readiness, "bot_disabled": bot_disabled}
 
 
 def system_config_bool(session: Session, key: str, default: bool = False) -> bool:
@@ -746,6 +817,8 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
     if values.get("bot_enabled") is True:
         readiness = runtime_startup_readiness(session, values)
         if not readiness["ready"]:
+            set_config(session, "bot_enabled", "false", is_secret=False)
+            session.commit()
             raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
     secret_keys = {"bot_email_password", "baidu_map_ak", "e2e_sales_password", "e2e_production_password"}
     for key, value in values.items():
@@ -800,13 +873,70 @@ def update_crm_config(payload: CrmRuntimeConfigUpdate, session: Session = Depend
         if timeout < 30 or timeout > 600:
             raise HTTPException(status_code=400, detail="CRM 同步超时需在 30-600 秒之间")
         values["crm_sync_timeout_seconds"] = timeout
-    secret_keys = {"crm_fxiaoke_request_json"}
+    secret_keys = {"crm_password", "crm_api_key", "crm_fxiaoke_request_json", "crm_fxiaoke_detail_request_json"}
     for key, value in values.items():
         if value is None:
             continue
+        if key in secret_keys and str(value).strip() in {"", "***"}:
+            continue
         set_config(session, key, str(value), is_secret=key in secret_keys)
+    disable_bot_when_not_ready(session)
     session.commit()
     return config(session)
+
+
+@app.put("/api/config/oms")
+def update_oms_config(payload: OmsRuntimeConfigUpdate, session: Session = Depends(get_session)) -> dict:
+    values = payload.model_dump(exclude_unset=True)
+    int_bounds = {
+        "oms_retry_base_delay_seconds": (1, 86400),
+        "oms_retry_multiplier": (1, 10),
+        "oms_max_retries": (1, 20),
+        "oms_jackyun_timeout_seconds": (3, 120),
+    }
+    for key, (minimum, maximum) in int_bounds.items():
+        if key in values and values[key] not in (None, ""):
+            try:
+                value = int(values[key])
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"{key} 必须是数字") from exc
+            if value < minimum or value > maximum:
+                raise HTTPException(status_code=400, detail=f"{key} 需在 {minimum}-{maximum} 之间")
+            values[key] = value
+    if "oms_create_order_method" in values and values["oms_create_order_method"] not in (None, ""):
+        method = str(values["oms_create_order_method"]).strip()
+        if method not in {"wms.order.create", "wms-ods.order.create"}:
+            raise HTTPException(status_code=400, detail="发货单创建接口仅支持 wms.order.create 或 wms-ods.order.create")
+        values["oms_create_order_method"] = method
+    secret_keys = {"oms_jackyun_app_secret"}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if key in secret_keys and str(value).strip() in {"", "***"}:
+            continue
+        set_config(session, key, str(value), is_secret=key in secret_keys)
+    disable_bot_when_not_ready(session)
+    session.commit()
+    return config(session)
+
+
+@app.post("/api/oms/jackyun/test-connection")
+def test_jackyun_connection(session: Session = Depends(get_session)) -> dict:
+    try:
+        client = jackyun_client_from_session(session)
+        result = client.search_skus({"pageNo": 1, "pageSize": 1})
+        return {
+            "ok": bool(result.get("ok")),
+            "endpoint": client.config.gateway_url,
+            "method": "erp-goods.goods.sku.search",
+            "code": result.get("code"),
+            "sub_code": result.get("sub_code"),
+            "message": result.get("message"),
+        }
+    except JackyunConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/erp/test-connection")
@@ -2901,11 +3031,82 @@ def exception_detail(exception_id: str, session: Session = Depends(get_session))
 @app.post("/api/exceptions/{exception_id}/resolve")
 def resolve_exception(exception_id: str, payload: ExceptionResolveRequest, session: Session = Depends(get_session)) -> dict:
     try:
-        case = resolve_exception_case(session, exception_id, payload.note)
+        case = resolve_exception_case(session, exception_id, payload.note, actor=payload.actor)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()
     return serialize_exception(case)
+
+
+@app.post("/api/exceptions/{exception_id}/assign")
+def assign_exception(exception_id: str, payload: ExceptionAssignRequest, session: Session = Depends(get_session)) -> dict:
+    case = session.get(ExceptionCase, exception_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="exception not found")
+    assignee = payload.assignee.strip()
+    if not assignee:
+        raise HTTPException(status_code=400, detail="assignee required")
+    case.assignee = assignee
+    if case.status == "Open":
+        case.status = "Assigned"
+    case.last_actor = payload.actor
+    case.updated_at = now_utc()
+    session.add(
+        AuditEvent(
+            event_type="ExceptionAssigned",
+            actor=payload.actor,
+            related_object_type="ExceptionCase",
+            related_object_id=case.id,
+            detail=dumps({"assignee": assignee, "note": payload.note}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_exception(case)
+
+
+@app.post("/api/exceptions/{exception_id}/reopen")
+def reopen_exception(exception_id: str, payload: ExceptionReopenRequest, session: Session = Depends(get_session)) -> dict:
+    case = session.get(ExceptionCase, exception_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="exception not found")
+    case.status = "Open"
+    case.resolution_note = None
+    case.reopened_at = now_utc()
+    case.resolved_at = None
+    case.last_actor = payload.actor
+    case.updated_at = now_utc()
+    session.add(
+        AuditEvent(
+            event_type="ExceptionReopened",
+            actor=payload.actor,
+            related_object_type="ExceptionCase",
+            related_object_id=case.id,
+            detail=dumps({"note": payload.note}),
+            created_at=now_utc(),
+        )
+    )
+    session.commit()
+    return serialize_exception(case)
+
+
+@app.post("/api/exceptions/{exception_id}/diagnose")
+def diagnose_exception(exception_id: str, request: Request, async_job: bool = False, session: Session = Depends(get_session)) -> dict:
+    case = session.get(ExceptionCase, exception_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="exception not found")
+    actor = getattr(request.state, "username", "operator")
+    try:
+        if async_job:
+            job = enqueue_exception_diagnosis(session, case, source=actor)
+            session.commit()
+            return {"queued": True, "job_id": job.id, "exception_id": case.id}
+        diagnosis = diagnose_exception_case(session, case.id, actor=actor)
+        session.commit()
+        return {"diagnosis": diagnosis, "exception": serialize_exception(case)}
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/exceptions/{exception_id}/apply-requirement-patch")
@@ -3707,6 +3908,7 @@ def serialize_crm_order(row: CrmSalesOrder, *, include_raw: bool = False) -> dic
         "shipment_status": row.shipment_status,
         "invoice_status": row.invoice_status,
         "receipt_contact": row.receipt_contact,
+        "receipt_phone": row.receipt_phone,
         "receipt_address": row.receipt_address,
         "delivery_date": row.delivery_date,
         "remark": row.remark,
@@ -3721,6 +3923,325 @@ def serialize_crm_order(row: CrmSalesOrder, *, include_raw: bool = False) -> dic
     if include_raw:
         data["raw"] = loads(row.raw_json, {})
     return data
+
+
+def serialize_order_attachment(row: OrderAttachment) -> dict:
+    cached_ref = local_storage_ref(row)
+    has_download = bool(cached_ref or row.file_url)
+    return {
+        "id": row.id,
+        "file_name": row.file_name,
+        "file_url": row.file_url,
+        "download_url": f"/api/crm/order-attachments/{row.id}/download" if has_download else "",
+        "is_cached": bool(cached_ref),
+        "source_file_id": row.source_file_id,
+        "attachment_type": row.attachment_type,
+        "parse_status": row.parse_status,
+        "has_download": has_download,
+        "source_system": row.source_system,
+        "captured_at": row.captured_at.isoformat() if row.captured_at else None,
+    }
+
+
+def crm_order_attachment_payload(session: Session, row: CrmSalesOrder) -> list[dict]:
+    records = (
+        session.query(OrderAttachment)
+        .filter(
+            OrderAttachment.source_system == row.source_system,
+            OrderAttachment.crm_order_id == row.crm_order_id,
+            OrderAttachment.payload_hash == row.payload_hash,
+        )
+        .order_by(OrderAttachment.created_at.desc())
+        .all()
+    )
+    if records:
+        deduped_by_key: dict[str, dict] = {}
+        for item in records:
+            key = "|".join([str(item.source_file_id or "").strip().lower(), str(item.file_name or "").strip().lower()])
+            current = deduped_by_key.get(key)
+            payload = serialize_order_attachment(item)
+            if current is not None and (current.get("has_download") or not payload.get("has_download")):
+                continue
+            deduped_by_key[key] = payload
+        return list(deduped_by_key.values())
+    fallback_names = []
+    seen_names = set()
+    for name in as_list(row.attachment_files_json):
+        key = str(name or "").strip().lower()
+        if not key or key in seen_names:
+            continue
+        seen_names.add(key)
+        fallback_names.append(name)
+    return [
+        {
+            "id": "",
+            "file_name": name,
+            "file_url": None,
+            "source_file_id": None,
+            "attachment_type": None,
+            "parse_status": "NameOnly",
+            "has_download": False,
+            "source_system": row.source_system,
+            "captured_at": row.synced_at.isoformat() if row.synced_at else None,
+        }
+        for name in fallback_names
+    ]
+
+
+def serialize_crm_order_snapshot(row: CrmOrderSnapshot) -> dict:
+    return {
+        "id": row.id,
+        "crm_order_id": row.crm_order_id,
+        "crm_order_no": row.crm_order_no,
+        "payload_hash": row.payload_hash,
+        "version": row.version,
+        "is_latest": row.is_latest,
+        "parse_status": row.parse_status,
+        "captured_at": row.captured_at.isoformat() if row.captured_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def crm_order_snapshot_payload(session: Session, row: CrmSalesOrder) -> list[dict]:
+    return [
+        serialize_crm_order_snapshot(snapshot)
+        for snapshot in (
+            session.query(CrmOrderSnapshot)
+            .filter(CrmOrderSnapshot.source_system == row.source_system, CrmOrderSnapshot.crm_order_id == row.crm_order_id)
+            .order_by(CrmOrderSnapshot.version.desc(), CrmOrderSnapshot.created_at.desc())
+            .limit(20)
+            .all()
+        )
+    ]
+
+
+def serialize_crm_order_with_flow(session: Session, row: CrmSalesOrder) -> dict:
+    data = serialize_crm_order(row, include_raw=True)
+    attachments = crm_order_attachment_payload(session, row)
+    has_downloadable_attachment = any(item.get("has_download") for item in attachments)
+    raw = loads(row.raw_json, {})
+    detail_synced = raw.get("detail_sync_status") == "Synced" or bool(raw.get("detail_raw"))
+    detail_failed = raw.get("detail_sync_status") == "Failed"
+    data["attachments"] = attachments
+    data["snapshots"] = crm_order_snapshot_payload(session, row)
+    data["crm_detail_status"] = "detail_available" if detail_synced else ("detail_failed" if detail_failed else "list_only")
+    if detail_synced:
+        data["crm_detail_message"] = "已同步 CRM 订单详情" + ("，附件可下载" if has_downloadable_attachment else "，但 CRM 未返回附件下载地址")
+    elif detail_failed:
+        data["crm_detail_message"] = f"CRM 订单详情同步失败：{raw.get('detail_sync_error') or '未知错误'}"
+    else:
+        data["crm_detail_message"] = "当前只同步了 CRM 列表字段；销售、收货、备注、附件下载地址需拉取单条订单详情接口。"
+    middle_order = (
+        session.query(MiddlePlatformOrder)
+        .filter(MiddlePlatformOrder.source_system == row.source_system, MiddlePlatformOrder.crm_order_id == row.crm_order_id)
+        .order_by(MiddlePlatformOrder.created_at.desc())
+        .first()
+    )
+    if middle_order is None:
+        data["flow"] = {
+            "middle_order": None,
+            "steps": crm_order_flow_steps(row, None),
+            "crm_snapshots": data["snapshots"],
+            "exceptions": [],
+            "audit_events": [],
+            "processing_jobs": crm_order_processing_jobs(session, row, None),
+        }
+        return data
+
+    exceptions = (
+        session.query(ExceptionCase)
+        .filter(ExceptionCase.detail.ilike(f"%{middle_order.order_no}%"))
+        .order_by(ExceptionCase.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    audit_events = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.related_object_type == "MiddlePlatformOrder", AuditEvent.related_object_id == middle_order.id)
+        .order_by(AuditEvent.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    data["flow"] = {
+        "middle_order": serialize_middle_order(middle_order, include_detail=True),
+        "steps": crm_order_flow_steps(row, middle_order),
+        "crm_snapshots": data["snapshots"],
+        "exceptions": [
+            {
+                "id": item.id,
+                "exception_type": item.exception_type,
+                "severity": item.severity,
+                "status": item.status,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "summary": exception_summary(item),
+            }
+            for item in exceptions
+        ],
+        "audit_events": [
+            {
+                "id": item.id,
+                "event_type": item.event_type,
+                "actor": item.actor,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "detail": loads(item.detail, {}),
+            }
+            for item in audit_events
+        ],
+        "processing_jobs": crm_order_processing_jobs(session, row, middle_order),
+    }
+    return data
+
+
+def crm_order_flow_steps(row: CrmSalesOrder, middle_order: MiddlePlatformOrder | None) -> list[dict]:
+    if middle_order is None:
+        return [
+            {"key": "crm", "label": "CRM 同步", "status": "done", "description": "CRM 订单已同步到本地镜像", "time": row.synced_at.isoformat() if row.synced_at else None},
+            {"key": "imported", "label": "进入中台", "status": "pending", "description": "尚未生成中台订单"},
+            {"key": "validation", "label": "完整预审", "status": "pending", "description": "等待投递中台事件"},
+            {"key": "notice", "label": "发货预览", "status": "pending", "description": "预审通过后生成"},
+            {"key": "oms", "label": "OMS 下推", "status": "pending", "description": "发货通知确认后执行"},
+            {"key": "fulfillment", "label": "履约归档", "status": "pending", "description": "OMS 回写后更新"},
+        ]
+    status = middle_order.status
+    notice = latest_order_notice(middle_order)
+    return [
+        {"key": "crm", "label": "CRM 同步", "status": "done", "description": "CRM 订单已同步并查重", "time": row.synced_at.isoformat() if row.synced_at else None},
+        {"key": "imported", "label": "进入中台", "status": step_status(status, ["CRM_APPROVED"], ["IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED", "DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED", "CANCELLED"]), "description": f"中台订单号：{middle_order.order_no}", "time": middle_order.imported_at.isoformat() if middle_order.imported_at else middle_order.created_at.isoformat()},
+        {"key": "validation", "label": "完整预审", "status": validation_step_status(status), "description": validation_step_description(middle_order), "time": middle_order.validated_at.isoformat() if middle_order.validated_at else None},
+        {"key": "notice", "label": "发货预览", "status": delivery_notice_step_status(status, notice), "description": delivery_notice_step_description(notice), "time": notice.created_at.isoformat() if notice and notice.created_at else None},
+        {"key": "oms", "label": "OMS 下推", "status": oms_step_status(status, notice), "description": oms_step_description(status, notice), "time": notice.pushed_at.isoformat() if notice and notice.pushed_at else None},
+        {"key": "fulfillment", "label": "履约归档", "status": fulfillment_step_status(status), "description": fulfillment_step_description(status), "time": middle_order.updated_at.isoformat() if status in {"PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED", "CANCELLED"} and middle_order.updated_at else None},
+    ]
+
+
+def latest_order_notice(order: MiddlePlatformOrder) -> DeliveryNotice | None:
+    return sorted(order.delivery_notices, key=lambda item: item.created_at, reverse=True)[0] if order.delivery_notices else None
+
+
+def step_status(current: str, pending: list[str], done: list[str]) -> str:
+    if current == "CANCELLED":
+        return "cancelled"
+    if current in done:
+        return "done"
+    if current in pending:
+        return "pending"
+    return "active"
+
+
+def validation_step_status(status: str) -> str:
+    if status == "VALIDATION_BLOCKED":
+        return "blocked"
+    if status == "CANCELLED":
+        return "cancelled"
+    if status in {"VALIDATING", "IMPORTED"}:
+        return "active"
+    if status in {"VALIDATED", "DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
+        return "done"
+    return "pending"
+
+
+def validation_step_description(order: MiddlePlatformOrder) -> str:
+    summary = loads(order.validation_summary_json, {})
+    failed = [item for item in summary.get("results", []) if not item.get("passed")]
+    if failed:
+        return failed[0].get("reason") or "预审存在阻断项"
+    if order.status in {"VALIDATED", "DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
+        return "预审已通过"
+    return "等待或正在执行完整预审"
+
+
+def delivery_notice_step_status(status: str, notice: DeliveryNotice | None) -> str:
+    if status == "CANCELLED":
+        return "cancelled"
+    if notice is None:
+        return "pending" if status in {"CRM_APPROVED", "IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED"} else "active"
+    if notice.status in {"Stale", "Cancelled", "Blocked"}:
+        return "blocked" if notice.status != "Cancelled" else "cancelled"
+    if status in {"DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
+        return "done"
+    return "active"
+
+
+def delivery_notice_step_description(notice: DeliveryNotice | None) -> str:
+    if notice is None:
+        return "尚未生成发货通知"
+    return f"{notice.notice_no} · {notice.status}"
+
+
+def oms_step_status(status: str, notice: DeliveryNotice | None) -> str:
+    if status == "CANCELLED":
+        return "cancelled"
+    if status in {"OMS_BLOCKED"}:
+        return "blocked"
+    if status in {"OMS_PENDING", "OMS_RETRYING"}:
+        return "active"
+    if status in {"OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
+        return "done"
+    if notice and notice.status in {"Blocked", "Retrying"}:
+        return "blocked" if notice.status == "Blocked" else "active"
+    return "pending"
+
+
+def oms_step_description(status: str, notice: DeliveryNotice | None) -> str:
+    if notice is None:
+        return "等待发货通知确认"
+    if notice.oms_order_no:
+        return f"OMS 单号：{notice.oms_order_no}"
+    if status in {"OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED"}:
+        return notice.last_error or notice.status
+    return "确认后下推 OMS"
+
+
+def fulfillment_step_status(status: str) -> str:
+    if status == "CANCELLED":
+        return "cancelled"
+    if status in {"PICKING"}:
+        return "active"
+    if status in {"SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
+        return "done"
+    return "pending"
+
+
+def fulfillment_step_description(status: str) -> str:
+    mapping = {
+        "PICKING": "OMS/仓库执行中",
+        "SHIPPED": "已发货",
+        "FULFILLMENT_ARCHIVED": "一期履约已归档",
+        "CLOSED": "流程已关闭",
+        "CANCELLED": "订单已取消",
+    }
+    return mapping.get(status, "等待 OMS 履约状态")
+
+
+def crm_order_processing_jobs(session: Session, row: CrmSalesOrder, middle_order: MiddlePlatformOrder | None) -> list[dict]:
+    notice_ids = {notice.id for notice in middle_order.delivery_notices} if middle_order is not None else set()
+    jobs = session.query(ProcessingJob).order_by(ProcessingJob.created_at.desc()).limit(200).all()
+    matched = []
+    for job in jobs:
+        payload = loads(job.payload_json, {})
+        if payload.get("crm_sales_order_id") == row.id or payload.get("crm_order_id") == row.crm_order_id or payload.get("notice_id") in notice_ids:
+            matched.append(
+                {
+                    "id": job.id,
+                    "job_type": job.job_type,
+                    "status": job.status,
+                    "attempt_count": job.attempt_count,
+                    "error_message": job.error_message,
+                    "created_at": job.created_at.isoformat() if job.created_at else None,
+                    "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+                }
+            )
+        if len(matched) >= 20:
+            break
+    return matched
+
+
+def exception_summary(row: ExceptionCase) -> str:
+    detail = loads(row.detail, {})
+    exception = detail.get("exception") if isinstance(detail, dict) else {}
+    if isinstance(exception, dict):
+        return str(exception.get("summary") or exception.get("likely_reason") or "")[:240]
+    return ""
 
 
 def serialize_fulfillment_item(row: FulfillmentItem) -> dict:
@@ -3839,6 +4360,7 @@ def serialize_evidence(row: ExtractionEvidence) -> dict:
 
 def serialize_exception(row: ExceptionCase) -> dict:
     detail = loads(row.detail, {})
+    sla_status = exception_sla_status(row)
     return {
         "id": row.id,
         "related_task_id": row.related_task_id,
@@ -3847,8 +4369,29 @@ def serialize_exception(row: ExceptionCase) -> dict:
         "detail": detail,
         "detail_text": row.detail,
         "status": row.status,
+        "assignee": row.assignee,
+        "resolution_note": row.resolution_note,
+        "due_at": row.due_at.isoformat() if row.due_at else None,
+        "sla_status": sla_status,
+        "resolved_at": row.resolved_at.isoformat() if row.resolved_at else None,
+        "reopened_at": row.reopened_at.isoformat() if row.reopened_at else None,
+        "last_actor": row.last_actor,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "created_at": row.created_at.isoformat(),
     }
+
+
+def exception_sla_status(row: ExceptionCase) -> str:
+    if row.status in {"Resolved", "Closed"}:
+        return "resolved"
+    if row.due_at is None:
+        return "none"
+    now = now_utc()
+    if row.due_at <= now:
+        return "overdue"
+    if row.due_at <= now + timedelta(hours=4):
+        return "due_soon"
+    return "normal"
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -3980,7 +4523,20 @@ def get_crm_order(order_id: str, session: Session = Depends(get_session)) -> dic
     row = session.get(CrmSalesOrder, order_id)
     if row is None:
         raise HTTPException(status_code=404, detail="CRM 订单不存在")
-    return serialize_crm_order(row, include_raw=True)
+    return serialize_crm_order_with_flow(session, row)
+
+
+@app.get("/api/crm/order-attachments/{attachment_id}/download")
+def download_crm_order_attachment(attachment_id: str, session: Session = Depends(get_session)):
+    row = session.get(OrderAttachment, attachment_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="附件不存在")
+    cached_ref = local_storage_ref(row)
+    if cached_ref:
+        return FileResponse(cached_ref, filename=row.file_name)
+    if row.file_url:
+        return RedirectResponse(row.file_url)
+    raise HTTPException(status_code=404, detail="附件暂无下载地址，请重新同步 CRM 订单详情")
 
 
 @app.get("/api/crm/sync/summary")
@@ -3999,6 +4555,116 @@ def run_crm_sync_now(session: Session = Depends(get_session)) -> dict:
     try:
         return run_crm_sales_order_sync(session, trigger="manual")
     except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/crm/sync/test-connection")
+def test_crm_sync_connection(session: Session = Depends(get_session)) -> dict:
+    try:
+        return run_crm_integration_test(session)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v2/order-dashboard")
+def v2_order_dashboard(session: Session = Depends(get_session)) -> dict:
+    return order_dashboard(session)
+
+
+@app.get("/api/v2/orders")
+def v2_list_orders(
+    q: str = "",
+    status: str = "",
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    return list_middle_orders(session, q=q, status=status, page=page, page_size=page_size)
+
+
+@app.get("/api/v2/orders/{order_id}")
+def v2_get_order(order_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(MiddlePlatformOrder, order_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+    return serialize_middle_order(row, include_detail=True)
+
+
+@app.post("/api/crm/orders/{order_id}/queue-v2")
+def queue_crm_order_to_v2(order_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(CrmSalesOrder, order_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="CRM 订单不存在")
+    job = enqueue_crm_order_parsed_event(session, row, trace_id=f"manual-{uuid.uuid4()}")
+    session.commit()
+    return {"queued": True, "job_id": job.id, "job_type": job.job_type}
+
+
+@app.post("/api/crm/orders/{order_id}/process-v2")
+def process_crm_order_to_v2(order_id: str, session: Session = Depends(get_session)) -> dict:
+    row = session.get(CrmSalesOrder, order_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="CRM 订单不存在")
+    try:
+        job = enqueue_crm_order_parsed_event(session, row, trace_id=f"manual-{uuid.uuid4()}")
+        payload = job.payload_json
+        result = process_crm_order_parsed_event(session, loads(payload, {}))
+        job.status = "Completed"
+        job.error_message = None
+        job.updated_at = now_utc()
+        session.commit()
+        return result
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v2/delivery-notices/{notice_id}/replay-oms")
+def replay_v2_delivery_notice(notice_id: str, session: Session = Depends(get_session)) -> dict:
+    notice = session.get(DeliveryNotice, notice_id)
+    if notice is None:
+        raise HTTPException(status_code=404, detail="发货通知不存在")
+    if notice.confirmed_at is None:
+        raise HTTPException(status_code=400, detail="发货通知未确认，请先确认拆单预览")
+    job = enqueue_oms_push(session, notice)
+    session.commit()
+    return {"queued": True, "job_id": job.id, "notice_id": notice.id}
+
+
+@app.post("/api/v2/delivery-notices/{notice_id}/confirm")
+def confirm_v2_delivery_notice(
+    notice_id: str,
+    payload: DeliveryNoticeConfirmRequest,
+    session: Session = Depends(get_session),
+) -> dict:
+    notice = session.get(DeliveryNotice, notice_id)
+    if notice is None:
+        raise HTTPException(status_code=404, detail="发货通知不存在")
+    try:
+        job = confirm_delivery_notice(session, notice, confirmed_by=payload.confirmed_by or "operator", trace_id=f"confirm-{uuid.uuid4()}")
+        session.commit()
+        return {"confirmed": True, "job_id": job.id, "notice_id": notice.id}
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v2/delivery-notices/{notice_id}/sync-oms-status")
+def sync_v2_delivery_notice_oms_status(
+    notice_id: str,
+    payload: dict,
+    session: Session = Depends(get_session),
+) -> dict:
+    notice = session.get(DeliveryNotice, notice_id)
+    if notice is None:
+        raise HTTPException(status_code=404, detail="发货通知不存在")
+    status_payload = {**payload, "notice_id": notice.id, "trace_id": str(payload.get("trace_id") or f"oms-status-{uuid.uuid4()}")}
+    try:
+        result = process_oms_status_update(session, status_payload)
+        session.commit()
+        return result
+    except Exception as exc:
+        session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

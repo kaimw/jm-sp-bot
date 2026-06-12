@@ -1935,6 +1935,7 @@ async function refreshConfig() {
   fillForm("#runtime-mail-form", data.configs || {});
   fillForm("#erp-config-form", data.configs || {});
   fillForm("#crm-sync-config-form", data.configs || {});
+  fillForm("#oms-config-form", data.configs || {});
   fillForm("#e2e-mail-form", data.configs || {});
   if (data.model) {
     fillForm("#model-form", data.model);
@@ -1945,10 +1946,16 @@ async function refreshConfig() {
   if (baiduMapAk) baiduMapAk.value = "";
   const erpAppSec = $("#erp-config-form [name=erp_app_sec]");
   if (erpAppSec) erpAppSec.value = "";
-  const crmRequestFile = $("#crm-sync-config-form [name=crm_fxiaoke_request_file]");
-  if (crmRequestFile && !crmRequestFile.value) crmRequestFile.value = "/private/tmp/fxiaoke-sales-order-list-request.json";
+  const crmPassword = $("#crm-sync-config-form [name=crm_password]");
+  if (crmPassword) crmPassword.value = "";
+  const crmApiKey = $("#crm-sync-config-form [name=crm_api_key]");
+  if (crmApiKey) crmApiKey.value = "";
   const crmRequestJson = $("#crm-sync-config-form [name=crm_fxiaoke_request_json]");
   if (crmRequestJson) crmRequestJson.value = "";
+  const crmDetailRequestJson = $("#crm-sync-config-form [name=crm_fxiaoke_detail_request_json]");
+  if (crmDetailRequestJson) crmDetailRequestJson.value = "";
+  const omsAppSecret = $("#oms-config-form [name=oms_jackyun_app_secret]");
+  if (omsAppSecret) omsAppSecret.value = "";
   document.querySelectorAll("#e2e-mail-form input[type=password]").forEach((input) => {
     input.value = "";
   });
@@ -2069,15 +2076,197 @@ function detailField(label, value) {
   return `<div><small>${h(label)}</small><strong>${h(text)}</strong></div>`;
 }
 
-function renderCrmAttachments(files = []) {
-  if (!Array.isArray(files) || !files.length) return "无";
-  return files
-    .map((item) => {
-      if (typeof item === "string") return item;
-      return item.file_name || item.name || item.filename || item.url || JSON.stringify(item);
-    })
-    .filter(Boolean)
-    .join("、") || "无";
+function detailFieldHtml(label, html) {
+  return `<div><small>${h(label)}</small><strong>${html || "未记录"}</strong></div>`;
+}
+
+function listOnlyValue(value, crmDetailStatus) {
+  if (value !== null && value !== undefined && value !== "") return value;
+  if (crmDetailStatus === "list_only") return "CRM 列表接口未返回，需同步订单详情";
+  return "未记录";
+}
+
+function renderCrmAttachments(attachments = [], fallbackFiles = []) {
+  const source = Array.isArray(attachments) && attachments.length
+    ? attachments
+    : (Array.isArray(fallbackFiles) ? fallbackFiles.map((name) => ({ file_name: name, has_download: false, parse_status: "NameOnly" })) : []);
+  const normalized = [];
+  const seen = new Set();
+  source.forEach((item) => {
+    const name = typeof item === "string" ? item : (item.file_name || item.name || item.filename || item.url || "未命名附件");
+    const id = typeof item === "object" ? item.source_file_id || item.file_id || "" : "";
+    const key = `${String(id).trim().toLowerCase()}|${String(name).trim().toLowerCase()}`;
+    if (!key.trim() || seen.has(key)) return;
+    seen.add(key);
+    normalized.push(item);
+  });
+  if (!normalized.length) return "无";
+  return `
+    <div class="crm-attachment-list">
+      ${normalized.map((item) => {
+        const name = typeof item === "string" ? item : (item.file_name || item.name || item.filename || item.url || "未命名附件");
+        const url = typeof item === "object" ? item.download_url || item.file_url || item.url || "" : "";
+        const status = typeof item === "object" ? item.parse_status || "" : "";
+        return `
+          <div class="crm-attachment-item">
+            <span>${h(name)}</span>
+            ${
+              url
+                ? `<a class="button ghost compact-action" href="${h(url)}" target="_blank" rel="noopener noreferrer">查看/下载</a>`
+                : `<small>${status === "NameOnly" ? "仅有文件名，需同步订单详情后下载" : "暂无下载地址"}</small>`
+            }
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderCrmSnapshots(snapshots = []) {
+  if (!Array.isArray(snapshots) || !snapshots.length) {
+    return `<p class="muted-line">暂无详情快照</p>`;
+  }
+  return snapshots.slice(0, 6).map((snapshot) => `
+    <p>
+      <strong>V${h(snapshot.version || "-")}</strong>
+      ${snapshot.is_latest ? " · 当前" : ""}
+      · ${h(snapshot.parse_status || "")}
+      <br />
+      <small>${h(String(snapshot.payload_hash || "").slice(0, 12))} · ${h(formatTime(snapshot.captured_at))}</small>
+    </p>
+  `).join("");
+}
+
+function flowStatusText(status) {
+  return {
+    done: "完成",
+    active: "进行中",
+    blocked: "阻断",
+    pending: "等待",
+    cancelled: "取消",
+  }[status] || status || "等待";
+}
+
+function middleOrderStatusLabel(status) {
+  return {
+    CRM_APPROVED: "CRM 已审批",
+    IMPORTED: "已进入中台",
+    VALIDATING: "预审中",
+    VALIDATION_BLOCKED: "预审阻断",
+    VALIDATED: "预审通过",
+    DELIVERY_NOTICE_READY: "发货预览待确认",
+    OMS_PENDING: "OMS 待推送",
+    OMS_RETRYING: "OMS 重试中",
+    OMS_BLOCKED: "OMS 阻断",
+    OMS_ACCEPTED: "OMS 已接收",
+    PICKING: "拣货/出库中",
+    SHIPPED: "已发货",
+    FULFILLMENT_ARCHIVED: "一期履约归档",
+    SIGNED: "已签收",
+    FINANCE_CHECKING: "财务核验中",
+    FINANCE_EXCEPTION: "财务异常",
+    CLOSED: "已关闭",
+    CANCELLED: "已取消",
+  }[status] || status || "未进入中台";
+}
+
+function flowBadgeClass(status) {
+  if (status === "CANCELLED") return "status-pill is-muted";
+  if (["VALIDATION_BLOCKED", "OMS_BLOCKED", "FINANCE_EXCEPTION"].includes(status)) return "status-pill is-danger";
+  if (["OMS_PENDING", "OMS_RETRYING", "PICKING", "VALIDATING"].includes(status)) return "status-pill is-warn";
+  if (status) return "status-pill is-active";
+  return "status-pill is-muted";
+}
+
+function renderCrmOrderFlow(flow = {}) {
+  const order = flow.middle_order;
+  const currentNode = $("#crm-order-flow-current");
+  const badge = $("#crm-order-flow-badge");
+  const flowNode = $("#crm-order-flow");
+  const evidenceNode = $("#crm-order-flow-evidence");
+  if (!currentNode || !badge || !flowNode || !evidenceNode) return;
+
+  if (!order) {
+    currentNode.textContent = "该 CRM 订单已同步，但尚未进入中台预审流程。";
+    badge.className = "status-pill is-muted";
+    badge.textContent = "未进入中台";
+  } else {
+    currentNode.textContent = `${middleOrderStatusLabel(order.status)} · 中台订单 ${order.order_no}`;
+    badge.className = flowBadgeClass(order.status);
+    badge.textContent = middleOrderStatusLabel(order.status);
+  }
+
+  flowNode.innerHTML = (flow.steps || [])
+    .map((step) => `
+      <div class="flow-step is-${h(step.status || "pending")}">
+        <div class="flow-step-dot"></div>
+        <div>
+          <div class="flow-step-title">
+            <strong>${h(step.label)}</strong>
+            <span>${h(flowStatusText(step.status))}</span>
+          </div>
+          <p>${h(step.description || "")}</p>
+          ${step.time ? `<small>${h(formatTime(step.time))}</small>` : ""}
+        </div>
+      </div>
+    `)
+    .join("");
+
+  const notices = order?.delivery_notices || [];
+  const exceptions = flow.exceptions || [];
+  const jobs = flow.processing_jobs || [];
+  const audits = flow.audit_events || [];
+  const snapshots = flow.crm_snapshots || [];
+  evidenceNode.innerHTML = `
+    <div>
+      <h4>CRM 快照</h4>
+      ${renderCrmSnapshots(snapshots)}
+    </div>
+    <div>
+      <h4>发货通知</h4>
+      ${
+        notices.length
+          ? notices.map((notice) => `<p><strong>${h(notice.notice_no)}</strong> · ${h(notice.status)}${notice.oms_order_no ? ` · OMS ${h(notice.oms_order_no)}` : ""}</p>`).join("")
+          : `<p class="muted-line">暂无发货通知</p>`
+      }
+    </div>
+    <div>
+      <h4>异常</h4>
+      ${
+        exceptions.length
+          ? exceptions.map((item) => `<p><strong>${h(item.exception_type)}</strong> · ${h(item.status)} · ${h(item.summary || item.severity || "")}</p>`).join("")
+          : `<p class="muted-line">暂无异常</p>`
+      }
+    </div>
+    <div>
+      <h4>队列</h4>
+      ${
+        jobs.length
+          ? jobs.map((job) => `<p><strong>${h(job.job_type)}</strong> · ${h(job.status)} · ${h(formatTime(job.updated_at || job.created_at))}</p>`).join("")
+          : `<p class="muted-line">暂无关联队列</p>`
+      }
+    </div>
+    <div>
+      <h4>审计</h4>
+      ${
+        audits.length
+          ? audits.slice(0, 5).map((event) => `<p><strong>${h(event.event_type)}</strong> · ${h(formatTime(event.created_at))}</p>`).join("")
+          : `<p class="muted-line">暂无中台审计</p>`
+      }
+    </div>
+  `;
+}
+
+function renderCrmOmsExtractionAlert(row) {
+  const extraction = row?.raw?.oms_field_extraction || {};
+  if (!extraction.manual_review_required) return "";
+  const errors = Array.isArray(extraction.validation_errors) ? extraction.validation_errors : [];
+  return `
+    <div class="crm-extraction-alert">
+      <strong>需人工审查确认</strong>
+      <span>${h(errors.length ? errors.join("、") : "收货联系人、联系方式电话或收货地址未通过自动校验")}</span>
+    </div>
+  `;
 }
 
 async function openCrmOrderDetail(orderId) {
@@ -2086,6 +2275,7 @@ async function openCrmOrderDetail(orderId) {
   $("#crm-order-detail-title").textContent = "订单详情";
   $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 正在加载";
   $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">正在读取订单详情...</div>`;
+  renderCrmOrderFlow({});
   $("#crm-order-detail-fields").innerHTML = "";
   $("#crm-order-detail-delivery").innerHTML = "";
   $("#crm-order-detail-raw").textContent = "";
@@ -2093,7 +2283,7 @@ async function openCrmOrderDetail(orderId) {
   try {
     const row = await api(`/api/crm/orders/${orderId}`);
     $("#crm-order-detail-title").textContent = row.crm_order_no || row.crm_order_id || "订单详情";
-    $("#crm-order-detail-meta").textContent = `${row.source_system || "CRM"} · 同步时间 ${row.synced_at ? formatTime(row.synced_at) : "未同步"}`;
+    $("#crm-order-detail-meta").textContent = `${row.source_system || "CRM"} · 同步时间 ${row.synced_at ? formatTime(row.synced_at) : "未同步"} · ${row.crm_detail_message || ""}`;
     $("#crm-order-detail-summary").innerHTML = [
       ["订单金额", formatAmountHtml(row.order_amount, row.currency), row.currency || "CNY"],
       ["已回款", formatAmountHtml(row.received_amount, row.currency), "CRM 回款金额"],
@@ -2102,13 +2292,14 @@ async function openCrmOrderDetail(orderId) {
     ]
       .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${value}</strong><small>${h(hint)}</small></div>`)
       .join("");
+    renderCrmOrderFlow(row.flow || {});
     $("#crm-order-detail-fields").innerHTML = [
       detailField("CRM 订单 ID", row.crm_order_id),
       detailField("销售订单编号", row.crm_order_no),
       detailField("客户名称", row.customer_name),
       detailField("客户 ID", row.customer_id),
       detailField("商机", row.opportunity_name),
-      detailField("销售", row.sales_user_name),
+      detailField("销售", listOnlyValue(row.sales_user_name, row.crm_detail_status)),
       detailField("部门", row.owner_department),
       detailField("下单日期", row.order_date),
       detailField("结算方式", row.settlement_method),
@@ -2117,19 +2308,22 @@ async function openCrmOrderDetail(orderId) {
       detailField("商品金额", formatAmount(row.product_amount, row.currency)),
     ].join("");
     $("#crm-order-detail-delivery").innerHTML = [
+      renderCrmOmsExtractionAlert(row),
       detailField("物流状态", row.logistics_status),
-      detailField("发货状态", row.shipment_status),
-      detailField("开票状态", row.invoice_status),
-      detailField("收货联系人", row.receipt_contact),
-      detailField("收货地址", row.receipt_address),
-      detailField("交付日期", row.delivery_date),
-      detailField("附件", renderCrmAttachments(row.attachment_files)),
-      detailField("备注", row.remark),
+      detailField("发货状态", listOnlyValue(row.shipment_status, row.crm_detail_status)),
+      detailField("开票状态", listOnlyValue(row.invoice_status, row.crm_detail_status)),
+      detailField("收货联系人", listOnlyValue(row.receipt_contact, row.crm_detail_status)),
+      detailField("联系方式电话", listOnlyValue(row.receipt_phone, row.crm_detail_status)),
+      detailField("收货地址", listOnlyValue(row.receipt_address, row.crm_detail_status)),
+      detailField("交付日期", listOnlyValue(row.delivery_date, row.crm_detail_status)),
+      detailFieldHtml("附件", renderCrmAttachments(row.attachments, row.attachment_files)),
+      detailField("备注", listOnlyValue(row.remark, row.crm_detail_status)),
     ].join("");
     $("#crm-order-detail-raw").textContent = JSON.stringify(row.raw || row, null, 2);
   } catch (error) {
     $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 读取失败";
     $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">读取失败：${h(error.message || "未知错误")}</div>`;
+    renderCrmOrderFlow({});
     $("#crm-order-detail-raw").textContent = "";
   }
 }
@@ -2199,6 +2393,7 @@ function formatBytes(value) {
 function summarizeExceptionDetail(detail) {
   if (!detail || typeof detail !== "object") return "";
   const parts = [];
+  if (detail.exception?.summary) parts.push(String(detail.exception.summary));
   if (detail.message) parts.push(String(detail.message));
   if (detail.action_hint) parts.push(`处理建议：${detail.action_hint}`);
   if (detail.source_mail_id) parts.push(`来源邮件：${detail.source_mail_id}`);
@@ -2210,6 +2405,44 @@ function summarizeExceptionDetail(detail) {
   if (detail.risk_flags?.length) parts.push(`风险：${detail.risk_flags.join("、")}`);
   if (detail.requirement_id) parts.push(`需求：${detail.requirement_id}`);
   return parts.join("；") || JSON.stringify(detail);
+}
+
+function exceptionDiagnosis(detail = {}) {
+  return detail && typeof detail === "object" ? detail.ai_diagnosis || null : null;
+}
+
+function exceptionMaterials(detail = {}) {
+  const validation = detail && typeof detail === "object" ? detail.validation || {} : {};
+  return Array.isArray(validation.missing_materials) ? validation.missing_materials : [];
+}
+
+function slaPillClass(status) {
+  if (status === "overdue") return "is-danger";
+  if (status === "due_soon") return "is-warn";
+  if (status === "resolved") return "is-active";
+  return "is-muted";
+}
+
+function statusPillClass(status) {
+  if (status === "Resolved" || status === "Closed") return "is-active";
+  if (status === "Assigned") return "is-warn";
+  if (status === "Open") return "is-danger";
+  return "is-muted";
+}
+
+function renderExceptionActions(row) {
+  const id = h(row.id);
+  const isClosed = ["Resolved", "Closed"].includes(row.status);
+  return `
+    <button class="button ghost" data-action="assign-exception" data-id="${id}">分派</button>
+    <button class="button ghost" data-action="diagnose-exception" data-id="${id}">诊断</button>
+    ${
+      isClosed
+        ? `<button class="button ghost" data-action="reopen-exception" data-id="${id}">重开</button>`
+        : `<button class="button ghost" data-action="resolve-exception" data-id="${id}">关闭</button>`
+    }
+    <button class="button ghost" data-action="patch-exception" data-id="${id}">补字段</button>
+  `;
 }
 
 function formatTime(value) {
@@ -2320,19 +2553,49 @@ async function refreshExceptions() {
   $("#exceptions-list").innerHTML =
     rows
       .map(
-        (row) => `
-        <div class="row">
-          <div><strong>${h(row.exception_type)}</strong><br /><small>${h(row.id)}</small></div>
-          <div><small>级别</small><br />${h(row.severity)}</div>
-          <div><small>状态</small><br />${h(row.status)}</div>
-          <div>
-            <small>${h(summarizeExceptionDetail(row.detail))}</small>
-            <div class="actions row-actions">
-              <button class="button ghost" data-action="patch-exception" data-id="${h(row.id)}">补字段</button>
-              <button class="button ghost" data-action="resolve-exception" data-id="${h(row.id)}">关闭</button>
+        (row) => {
+          const diagnosis = exceptionDiagnosis(row.detail);
+          const materials = exceptionMaterials(row.detail);
+          return `
+          <div class="row exception-row">
+            <div>
+              <strong>${h(row.exception_type)}</strong><br />
+              <small>${h(row.id)}</small><br />
+              <span class="status-pill ${statusPillClass(row.status)}">${h(row.status)}</span>
+              <span class="status-pill ${slaPillClass(row.sla_status)}">SLA ${h(row.sla_status || "none")}</span>
             </div>
-          </div>
-        </div>`
+            <div>
+              <small>级别 / 负责人</small><br />
+              <strong>${h(row.severity)}</strong><br />
+              <small>${h(row.assignee || "未分派")}</small>
+            </div>
+            <div>
+              <small>截止 / 更新</small><br />
+              <small>${h(formatTime(row.due_at) || "未设置")}</small><br />
+              <small>${h(formatTime(row.updated_at || row.created_at))}</small>
+            </div>
+            <div>
+              <small>${h(summarizeExceptionDetail(row.detail))}</small>
+              ${
+                materials.length
+                  ? `<div class="exception-materials">${materials.slice(0, 4).map((item) => `<span>${h(item)}</span>`).join("")}</div>`
+                  : ""
+              }
+              ${
+                diagnosis
+                  ? `<div class="exception-diagnosis">
+                      <strong>${h(diagnosis.summary || "诊断建议")}</strong>
+                      <small>责任建议：${h(diagnosis.suggested_owner || "-")} · 置信度 ${h(diagnosis.confidence ?? "-")}</small>
+                      <ul>${(diagnosis.recommended_actions || []).slice(0, 3).map((item) => `<li>${h(item)}</li>`).join("")}</ul>
+                    </div>`
+                  : `<div class="exception-diagnosis is-empty"><small>暂无诊断，点击“诊断”生成处理建议</small></div>`
+              }
+              <div class="actions row-actions">
+                ${renderExceptionActions(row)}
+              </div>
+            </div>
+          </div>`;
+        }
       )
       .join("") || `<div class="row"><div>暂无异常</div></div>`;
   renderListPagination("#exceptions-pagination", "exceptions", data);
@@ -2344,12 +2607,13 @@ async function loadTemplate() {
   $("#template-form [name=body_template]").value = template.body_template;
 }
 
-function renderCrmOrderSummary(summary = {}) {
+function renderCrmOrderSummary(summary = {}, v2Summary = {}) {
   const node = $("#crm-orders-summary");
   if (!node) return;
   const lastRun = summary.last_run || {};
   const labels = [
     ["订单总数", h(summary.total_orders || 0), "已去重入库的 CRM 销售订单"],
+    ["中台订单", h(v2Summary.total_orders || 0), `STP ${h(v2Summary.stp_rate || 0)}% · 异常 ${h(v2Summary.open_exceptions || 0)}`],
     ["订单金额", formatAmountHtml(summary.total_order_amount, "CNY"), "当前库内销售订单金额合计"],
     ["已回款", formatAmountHtml(summary.total_received_amount, "CNY"), "CRM 已回款金额合计"],
     ["待回款", formatAmountHtml(summary.total_receivable_amount, "CNY"), "订单金额减已回款的估算值"],
@@ -2379,12 +2643,13 @@ function renderCrmSyncRuns(runs = []) {
 }
 
 async function refreshCrmOrders() {
-  const [listPayload, summary] = await Promise.all([
+  const [listPayload, summary, v2Summary] = await Promise.all([
     api(`/api/crm/orders?${queryFromState(tableStates.crmOrders)}`),
     api("/api/crm/sync/summary"),
+    api("/api/v2/order-dashboard"),
   ]);
   const data = normalizeListPayload(listPayload, tableStates.crmOrders);
-  renderCrmOrderSummary(data.summary || summary || {});
+  renderCrmOrderSummary(data.summary || summary || {}, v2Summary || {});
   renderCrmSyncRuns((summary && summary.runs) || []);
   setSelectOptions("#crm-orders-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.crmOrders.status);
   const rows = data.items || [];
@@ -2392,7 +2657,7 @@ async function refreshCrmOrders() {
     ? rows
         .map(
           (row) => `
-            <div class="row crm-order-row">
+            <div class="row crm-order-row clickable-row" data-crm-order-id="${h(row.id)}" role="button" tabindex="0" aria-label="查看订单 ${h(row.crm_order_no || row.crm_order_id || "详情")} 的完整流程">
               <div>
                 <strong>${h(row.crm_order_no || row.crm_order_id || "未编号")}</strong><br />
                 <small>${h(row.customer_name || "未识别客户")}</small>
@@ -2412,6 +2677,8 @@ async function refreshCrmOrders() {
               <div>
                 <small>${h(row.synced_at ? formatTime(row.synced_at) : "")}</small><br />
                 <button class="button ghost compact-action" type="button" data-action="view-crm-order" data-id="${h(row.id)}">详情</button>
+                <button class="button ghost compact-action" type="button" data-action="queue-crm-v2" data-id="${h(row.id)}">入中台</button>
+                <button class="button ghost compact-action" type="button" data-action="process-crm-v2" data-id="${h(row.id)}">立即预审</button>
               </div>
             </div>
           `
@@ -2449,6 +2716,25 @@ async function refreshAll() {
     refreshCrmOrders(),
   ]);
 }
+
+$("#crm-orders-list")?.addEventListener("click", async (event) => {
+  if (event.target.closest("button, a, input, select, textarea")) return;
+  const row = event.target.closest("[data-crm-order-id]");
+  if (!row) return;
+  await guardedAction(["CRM 订单", "查看完整流程"], async () => {
+    await openCrmOrderDetail(row.dataset.crmOrderId);
+  });
+});
+
+$("#crm-orders-list")?.addEventListener("keydown", async (event) => {
+  if (!["Enter", " "].includes(event.key)) return;
+  const row = event.target.closest("[data-crm-order-id]");
+  if (!row) return;
+  event.preventDefault();
+  await guardedAction(["CRM 订单", "查看完整流程"], async () => {
+    await openCrmOrderDetail(row.dataset.crmOrderId);
+  });
+});
 
 const defaultTableStates = JSON.parse(JSON.stringify(tableStates));
 const tableRefreshers = {
@@ -3116,7 +3402,10 @@ async function saveCrmConfig() {
   const formNode = $("#crm-sync-config-form");
   const form = new FormData(formNode);
   const values = Object.fromEntries(form.entries());
+  if (!values.crm_password) delete values.crm_password;
+  if (!values.crm_api_key) delete values.crm_api_key;
   if (!values.crm_fxiaoke_request_json) delete values.crm_fxiaoke_request_json;
+  if (!values.crm_fxiaoke_detail_request_json) delete values.crm_fxiaoke_detail_request_json;
   values.crm_sync_enabled = formNode.elements.crm_sync_enabled.checked;
   await api("/api/config/crm", {
     method: "PUT",
@@ -3128,48 +3417,36 @@ $("#crm-sync-config-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
     await saveCrmConfig();
-    toast("CRM 同步配置已保存");
+    toast("CRM 接入配置已保存");
     await refreshAll();
   } catch (error) {
-    notifyError(error, ["订单管理", "CRM 配置保存失败"]);
+    notifyError(error, ["系统接入", "CRM 接入配置保存失败"]);
   }
 });
 
-function openCrmSyncPopover() {
-  const popover = $("#crm-sync-popover");
-  if (!popover) return;
-  popover.hidden = false;
+async function saveOmsConfig() {
+  const formNode = $("#oms-config-form");
+  const form = new FormData(formNode);
+  const values = Object.fromEntries(form.entries());
+  if (!values.oms_jackyun_app_secret) delete values.oms_jackyun_app_secret;
+  values.oms_enabled = formNode.elements.oms_enabled.checked;
+  values.oms_mock_success = formNode.elements.oms_mock_success.checked;
+  values.oms_auto_confirm_delivery_notice = formNode.elements.oms_auto_confirm_delivery_notice.checked;
+  await api("/api/config/oms", {
+    method: "PUT",
+    body: JSON.stringify(values),
+  });
 }
 
-function closeCrmSyncPopover() {
-  const popover = $("#crm-sync-popover");
-  if (!popover) return;
-  popover.hidden = true;
-}
-
-$("#crm-sync-settings-open")?.addEventListener("click", (event) => {
+$("#oms-config-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const popover = $("#crm-sync-popover");
-  if (!popover) return;
-  if (popover.hidden) openCrmSyncPopover();
-  else closeCrmSyncPopover();
-});
-
-$("#crm-sync-settings-close")?.addEventListener("click", closeCrmSyncPopover);
-
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeCrmSyncPopover();
-});
-
-document.addEventListener("click", (event) => {
-  const popover = $("#crm-sync-popover");
-  const button = $("#crm-sync-settings-open");
-  if (!popover || popover.hidden) return;
-  if (event.target.id === "crm-sync-popover") {
-    closeCrmSyncPopover();
-    return;
+  try {
+    await saveOmsConfig();
+    toast("OMS 接入配置已保存");
+    await refreshAll();
+  } catch (error) {
+    notifyError(error, ["系统接入", "OMS 接入配置保存失败"]);
   }
-  if (button?.contains(event.target)) return;
 });
 
 async function runCrmSyncAction(endpoint, pendingText) {
@@ -3185,7 +3462,7 @@ async function runCrmSyncAction(endpoint, pendingText) {
     toast(result.message || "CRM 同步已触发");
     await refreshCrmOrders();
   } catch (error) {
-    notifyError(error, ["订单管理", "CRM 同步失败"]);
+    notifyError(error, ["系统接入", "CRM 同步失败"]);
     if (resultNode) resultNode.textContent = messageFromError(error);
   }
 }
@@ -3196,6 +3473,32 @@ $("#crm-sync-queue")?.addEventListener("click", async () => {
 
 $("#crm-sync-run")?.addEventListener("click", async () => {
   await runCrmSyncAction("/api/crm/sync/run", "正在直接同步 CRM 订单，可能需要几十秒...");
+});
+
+$("#crm-sync-test")?.addEventListener("click", async () => {
+  await runCrmSyncAction("/api/crm/sync/test-connection", "正在执行 CRM 接入测试，验证列表、详情、附件和发货字段映射...");
+});
+
+$("#test-oms-connection")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const resultNode = $("#oms-test-result");
+  button.disabled = true;
+  if (resultNode) {
+    resultNode.classList.add("show");
+    resultNode.textContent = "正在保存配置并测试 OMS OpenAPI...";
+  }
+  try {
+    await saveOmsConfig();
+    const result = await api("/api/oms/jackyun/test-connection", { method: "POST" });
+    if (resultNode) resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(result.ok ? "OMS 连接成功" : "OMS 连接失败");
+    await refreshConfig();
+  } catch (error) {
+    notifyError(error, ["系统接入", "OMS 连接测试失败"]);
+    if (resultNode) resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $("#test-erp-connection").addEventListener("click", async (event) => {
@@ -3753,9 +4056,36 @@ $("#exceptions-list").addEventListener("click", async (event) => {
     if (note === null) return;
     await api(`/api/exceptions/${id}/resolve`, {
       method: "POST",
-      body: JSON.stringify({ note }),
+      body: JSON.stringify({ note, actor: "operator" }),
     });
     toast("异常已关闭");
+  }
+  if (action === "assign-exception") {
+    const assignee = window.prompt("分派给", "");
+    if (assignee === null) return;
+    if (!assignee.trim()) {
+      toast("请输入负责人");
+      return;
+    }
+    const note = window.prompt("分派备注", "") || "";
+    await api(`/api/exceptions/${id}/assign`, {
+      method: "POST",
+      body: JSON.stringify({ assignee, note, actor: "operator" }),
+    });
+    toast("异常已分派");
+  }
+  if (action === "diagnose-exception") {
+    await api(`/api/exceptions/${id}/diagnose`, { method: "POST" });
+    toast("诊断已生成");
+  }
+  if (action === "reopen-exception") {
+    const note = window.prompt("重开原因", "需要继续处理");
+    if (note === null) return;
+    await api(`/api/exceptions/${id}/reopen`, {
+      method: "POST",
+      body: JSON.stringify({ note, actor: "operator" }),
+    });
+    toast("异常已重开");
   }
   if (action === "patch-exception") {
     const customer_name = window.prompt("客户名称，留空则不修改", "");
@@ -4636,21 +4966,33 @@ async function refreshProductsPromotions() {
   renderListPagination("#products-promotions-pagination", "productsPromotions", data);
 }
 
-// Product Tab Logic
-$("#products-tabs")?.addEventListener("click", (e) => {
-  if (e.target.tagName !== "BUTTON") return;
-  const tabName = e.target.dataset.tab;
-  document.querySelectorAll("#products-tabs button").forEach(b => b.classList.toggle("active", b === e.target));
-  document.querySelectorAll("[id^='products-'][id$='-tab']").forEach(el => el.hidden = true);
-  document.querySelectorAll("[id^='products-'][id$='-tab']").forEach(el => el.classList.remove("is-active"));
-  const activeTab = $(`#products-${tabName}-tab`);
+function activateScopedTab(prefix, tabsNode, activeButton) {
+  const tabName = activeButton.dataset.tab;
+  tabsNode.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button === activeButton));
+  document.querySelectorAll(`[id^='${prefix}-'][id$='-tab']`).forEach((el) => {
+    el.hidden = true;
+    el.classList.remove("is-active");
+  });
+  const activeTab = $(`#${prefix}-${tabName}-tab`);
   if (activeTab) {
     activeTab.hidden = false;
     activeTab.classList.add("is-active");
   }
+  return tabName;
+}
+
+// Product Tab Logic
+$("#products-tabs")?.addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  const tabName = activateScopedTab("products", e.currentTarget, e.target);
   if (tabName === "review") {
     guardedAction(["物料中心", "预审体检"], async () => refreshProductReviewReadiness());
   }
+});
+
+$("#integration-tabs")?.addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  activateScopedTab("integration", e.currentTarget, e.target);
 });
 
 // Product Modals
@@ -4787,6 +5129,26 @@ document.addEventListener("click", async (e) => {
     e.preventDefault();
     await guardedAction(["订单管理", "查看订单详情"], async () => {
       await openCrmOrderDetail(target.dataset.id);
+    });
+  }
+
+  if (target.dataset.action === "queue-crm-v2") {
+    e.preventDefault();
+    await guardedAction(["订单管理", "V2 入中台"], async () => {
+      const result = await api(`/api/crm/orders/${target.dataset.id}/queue-v2`, { method: "POST" });
+      toast(`已投递中台事件：${result.job_id}`);
+      await refreshCrmOrders();
+    });
+  }
+
+  if (target.dataset.action === "process-crm-v2") {
+    e.preventDefault();
+    await guardedAction(["订单管理", "V2 立即预审"], async () => {
+      const result = await api(`/api/crm/orders/${target.dataset.id}/process-v2`, { method: "POST" });
+      toast(`中台状态：${result.status}`);
+      await refreshCrmOrders();
+      await refreshExceptions();
+      await refreshJobs();
     });
   }
 });

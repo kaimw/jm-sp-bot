@@ -1,0 +1,4 @@
+interface:
+  display_name: "Validation Rule Engine Implementer"
+  short_description: "Implement strategy-based order validation rules"
+  default_prompt: "Use $validation-rule-engine-implementer when adding order validation rules, ValidationResult outputs, CRITICAL blocker handling, or ExceptionCase persistence."

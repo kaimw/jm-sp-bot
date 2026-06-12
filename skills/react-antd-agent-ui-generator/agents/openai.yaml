@@ -1,0 +1,4 @@
+interface:
+  display_name: "React AntD Agent UI Generator"
+  short_description: "Generate AI-assisted Ant Design operator UI"
+  default_prompt: "Use $react-antd-agent-ui-generator when building React Ant Design agent UI with read-only Descriptions, TanStack Query, Alerts, and suggested_actions intent buttons."

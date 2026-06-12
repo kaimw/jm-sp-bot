@@ -112,6 +112,8 @@ from backend.app.services.workflow_rules import (
     workflow_binding_for_requirement,
     workflow_version_diff,
 )
+from backend.app.main import assign_exception, reopen_exception, resolve_exception, serialize_exception
+from backend.app.schemas import ExceptionAssignRequest, ExceptionReopenRequest, ExceptionResolveRequest
 from backend.app.models import now_utc
 from backend.app.main import self_maintenance_action_detail
 from scripts.maintenance_runner import CommandResult, create_handoff_package, validate_code_plan_action
@@ -146,6 +148,17 @@ def configure_department(session):
 def configure_logistics_department(session):
     department = session.query(LogisticsDepartment).filter_by(department_code="default").one()
     department.mail_to_json = dumps(["logistics@jimuyida.com"])
+    session.commit()
+
+
+def configure_crm_oms_access(session):
+    set_config(session, "crm_sync_enabled", "true", is_secret=False)
+    set_config(session, "crm_username", "crm-user", is_secret=False)
+    set_config(session, "crm_password", "crm-secret", is_secret=True)
+    set_config(session, "oms_enabled", "true", is_secret=False)
+    set_config(session, "oms_mock_success", "false", is_secret=False)
+    set_config(session, "oms_jackyun_app_key", "oms-app-key", is_secret=False)
+    set_config(session, "oms_jackyun_app_secret", "oms-app-secret", is_secret=True)
     session.commit()
 
 
@@ -707,6 +720,12 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert "Dify API Key" in readiness["missing"]
     assert "bot邮箱密码" in readiness["missing"]
     assert "生产部门主送邮箱" in readiness["missing"]
+    assert "CRM同步未启用" in readiness["missing"]
+    assert "CRM账号密码或API Key" in readiness["missing"]
+    assert "OMS接入未启用" in readiness["missing"]
+    assert "OMS真实下推未启用" in readiness["missing"]
+    assert "OMS AppKey" in readiness["missing"]
+    assert "OMS AppSecret" in readiness["missing"]
 
     with pytest.raises(Exception) as exc:
         update_mail_config(MailRuntimeConfigUpdate(bot_enabled=True), session)
@@ -715,12 +734,16 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert "Dify API Key" in exc.value.detail
     assert "bot邮箱密码" in exc.value.detail
     assert "生产部门主送邮箱" in exc.value.detail
-    assert session.get(SystemConfig, "bot_enabled").value == "true"
+    assert "CRM同步未启用" in exc.value.detail
+    assert "OMS接入未启用" in exc.value.detail
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
 
     configure_department(session)
+    configure_crm_oms_access(session)
     model = session.query(ModelProviderConfig).one()
     set_config(session, "model_api_key", "runtime-secret", is_secret=True)
     model.credential_ref = "config:model_api_key"
+    configure_crm_oms_access(session)
     session.commit()
 
     result = update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
@@ -751,7 +774,7 @@ def test_system_enable_rejects_invalid_department_main_email():
     assert exc.value.status_code == 400
     assert "生产部门主送邮箱格式不合法" in exc.value.detail
     assert "销售直属领导" in exc.value.detail
-    assert session.get(SystemConfig, "bot_enabled").value == "true"
+    assert session.get(SystemConfig, "bot_enabled").value == "false"
 
 
 def test_department_upsert_rejects_invalid_main_email():
@@ -782,6 +805,7 @@ def test_delete_department_hides_it_and_disables_system_when_last_recipient():
     model = session.query(ModelProviderConfig).one()
     set_config(session, "model_api_key", "runtime-secret", is_secret=True)
     model.credential_ref = "config:model_api_key"
+    configure_crm_oms_access(session)
     session.commit()
     update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
 
@@ -3271,6 +3295,45 @@ def test_clear_exception_and_ops_lists_require_admin_password():
     audit_result = clear_audit_events(AdminPasswordRequest(admin_password="admin"), session)
     assert audit_result["cleared"] == audit_count
     assert session.query(AuditEvent).count() == 0
+
+
+def test_exception_lifecycle_assign_resolve_reopen_tracks_sla_and_audit():
+    session = make_session()
+    case = ExceptionCase(
+        exception_type="ReviewNeedManual",
+        severity="Critical",
+        detail=dumps({"message": "缺少客户资料"}),
+        status="Open",
+        due_at=now_utc() + timedelta(hours=2),
+    )
+    session.add(case)
+    session.commit()
+
+    assigned = assign_exception(
+        case.id,
+        ExceptionAssignRequest(assignee="ops@example.com", note="请运营跟进", actor="manager"),
+        session,
+    )
+    assert assigned["status"] == "Assigned"
+    assert assigned["assignee"] == "ops@example.com"
+    assert assigned["sla_status"] == "due_soon"
+
+    resolved = resolve_exception(case.id, ExceptionResolveRequest(note="CRM 已补齐", actor="ops@example.com"), session)
+    assert resolved["status"] == "Resolved"
+    assert resolved["resolution_note"] == "CRM 已补齐"
+    assert resolved["resolved_at"]
+    assert resolved["sla_status"] == "resolved"
+
+    reopened = reopen_exception(case.id, ExceptionReopenRequest(note="附件仍缺失", actor="manager"), session)
+    assert reopened["status"] == "Open"
+    assert reopened["resolution_note"] is None
+    assert reopened["reopened_at"]
+    assert reopened["sla_status"] == "due_soon"
+
+    events = [row.event_type for row in session.query(AuditEvent).filter_by(related_object_type="ExceptionCase", related_object_id=case.id).all()]
+    assert events == ["ExceptionAssigned", "ExceptionResolved", "ExceptionReopened"]
+    serialized = serialize_exception(session.get(ExceptionCase, case.id))
+    assert serialized["last_actor"] == "manager"
 
 
 def test_sync_imap_mailbox_skips_when_bot_disabled():

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import io
 import re
+import subprocess
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from docx import Document
 from openpyxl import load_workbook
+from PIL import Image, ImageEnhance, ImageOps
 
 
 @dataclass
@@ -34,6 +37,8 @@ def parse_attachment(file_name: str, content: bytes, *, max_zip_bytes: int, max_
             return ParsedAttachment(file_name=file_name, status="Parsed", text=content.decode("utf-8", errors="replace"), archive_depth=depth)
         if suffix == ".pdf":
             return ParsedAttachment(file_name=file_name, status="Parsed", text=parse_pdf_text(content), archive_depth=depth)
+        if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+            return ParsedAttachment(file_name=file_name, status="Parsed", text=parse_image_text(content, suffix), archive_depth=depth)
         return ParsedAttachment(file_name=file_name, status="Skipped", error=f"Unsupported file type: {suffix or 'unknown'}", archive_depth=depth)
     except Exception as exc:
         return ParsedAttachment(file_name=file_name, status="Failed", error=str(exc), archive_depth=depth)
@@ -75,8 +80,12 @@ def parse_pdf_text(content: bytes) -> str:
             if text.strip():
                 parts.append(f"[page {index}]\n{text.strip()}")
         if parts:
-            return "\n\n".join(parts)
+            extracted = "\n\n".join(parts)
+            if is_meaningful_text(extracted):
+                return extracted
     except ModuleNotFoundError:
+        pass
+    except Exception:
         pass
 
     text = content.decode("latin-1", errors="ignore")
@@ -85,9 +94,86 @@ def parse_pdf_text(content: bytes) -> str:
         matches = re.findall(r"\(([^()]*)\)", text)
     decoded = [decode_pdf_literal(match).strip() for match in matches]
     result = "\n".join(item for item in decoded if item)
-    if not result:
-        raise ValueError("No extractable PDF text found.")
+    if result and is_meaningful_text(result):
+        return result
+    ocr_text = parse_pdf_by_ocr(content)
+    if ocr_text:
+        return ocr_text
     return result
+
+
+def is_meaningful_text(value: str) -> bool:
+    text = str(value or "").strip()
+    if len(text) < 20:
+        return bool(text)
+    readable = sum(1 for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+    controls = sum(1 for char in text if ord(char) < 32 and char not in "\n\r\t")
+    return readable / max(1, len(text)) >= 0.08 and controls / max(1, len(text)) <= 0.02
+
+
+def parse_image_text(content: bytes, suffix: str = ".png") -> str:
+    image = Image.open(io.BytesIO(content))
+    if image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    return run_tesseract(image, suffix=suffix)
+
+
+def parse_pdf_by_ocr(content: bytes, *, max_pages: int = 3) -> str:
+    try:
+        import fitz  # type: ignore
+    except ModuleNotFoundError:
+        return ""
+    parts: list[str] = []
+    document = fitz.open(stream=content, filetype="pdf")
+    try:
+        for page_index in range(min(max_pages, len(document))):
+            page = document.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+            image = Image.open(io.BytesIO(pixmap.tobytes("png")))
+            crop_text = parse_pdf_priority_crops(image)
+            if crop_text.strip():
+                parts.append(f"[ocr page {page_index + 1} priority crops]\n{crop_text.strip()}")
+            text = run_tesseract(image, suffix=".png", psm="6")
+            sparse_text = run_tesseract(image, suffix=".png", psm="12")
+            page_text = "\n".join(item for item in (text.strip(), sparse_text.strip()) if item)
+            if page_text.strip():
+                parts.append(f"[ocr page {page_index + 1}]\n{page_text.strip()}")
+    finally:
+        document.close()
+    return "\n\n".join(parts)
+
+
+def parse_pdf_priority_crops(image: Image.Image) -> str:
+    width, height = image.size
+    crops = [
+        image.crop((int(width * 0.03), int(height * 0.16), int(width * 0.54), int(height * 0.46))),
+        image.crop((int(width * 0.03), int(height * 0.12), int(width * 0.58), int(height * 0.52))),
+    ]
+    parts: list[str] = []
+    for crop in crops:
+        prepared = ImageEnhance.Contrast(ImageOps.grayscale(crop)).enhance(1.6)
+        if min(prepared.size) < 900:
+            prepared = prepared.resize((prepared.width * 2, prepared.height * 2))
+        for psm in ("6", "12"):
+            text = run_tesseract(prepared, suffix=".png", psm=psm)
+            if text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts)
+
+
+def run_tesseract(image: Image.Image, *, suffix: str = ".png", psm: str = "6") -> str:
+    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
+        image.save(handle.name)
+        completed = subprocess.run(
+            ["tesseract", handle.name, "stdout", "-l", "chi_sim+eng", "--psm", psm],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise ValueError((completed.stderr or "OCR failed").strip())
+    return repair_mojibake_text(completed.stdout)
 
 
 def decode_pdf_literal(value: str) -> str:

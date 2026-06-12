@@ -136,13 +136,58 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "erp_inventory_alert_threshold", "1", is_secret=False)
     ensure_config(session, "erp_inventory_last_sync_at", "", is_secret=False)
     ensure_config(session, "crm_sync_enabled", "false", is_secret=False)
+    ensure_config(session, "crm_username", "", is_secret=False)
+    ensure_config(session, "crm_password", "", is_secret=True)
+    ensure_config(session, "crm_api_key", "", is_secret=True)
     ensure_config(session, "crm_sync_interval_seconds", "3600", is_secret=False)
     ensure_config(session, "crm_cdp_url", "http://127.0.0.1:9333", is_secret=False)
     ensure_config(session, "crm_fxiaoke_request_file", "", is_secret=False)
     ensure_config(session, "crm_fxiaoke_request_json", "", is_secret=True)
+    ensure_config(session, "crm_fxiaoke_detail_request_file", "", is_secret=False)
+    ensure_config(session, "crm_fxiaoke_detail_request_json", "", is_secret=True)
     ensure_config(session, "crm_sync_page_size", "20", is_secret=False)
     ensure_config(session, "crm_sync_timeout_seconds", "120", is_secret=False)
     ensure_config(session, "crm_sales_orders_last_sync_at", "", is_secret=False)
+    ensure_config(session, "v2_crm_phase1_scope_enabled", "true", is_secret=False)
+    ensure_config(session, "v2_crm_phase1_scope_json", dumps({
+        "approved_values": ["approved", "审批通过", "已审批", "已通过", "complete", "completed", "passed"],
+        "cancelled_values": ["cancelled", "canceled", "撤销", "已撤销", "作废", "已作废", "取消", "已取消"],
+        "include_owner_departments": [],
+        "include_settlement_methods": [],
+        "include_customer_names": [],
+    }), is_secret=False)
+    ensure_config(session, "oms_enabled", "false", is_secret=False)
+    ensure_config(session, "oms_mock_success", "true", is_secret=False)
+    ensure_config(session, "oms_auto_confirm_delivery_notice", "false", is_secret=False)
+    ensure_config(session, "oms_inventory_review_enabled", "true", is_secret=False)
+    upsert_config(session, "oms_inventory_missing_blocks", "true", is_secret=False)
+    ensure_config(session, "v2_review_crm_approved_values", dumps(["approved", "审批通过", "已审批", "已通过", "complete", "completed", "passed"]), is_secret=False)
+    ensure_config(session, "v2_review_require_key_attachment", "true", is_secret=False)
+    ensure_config(session, "v2_review_customer_mapping_required", "true", is_secret=False)
+    ensure_config(session, "v2_customer_mapping_json", dumps({
+        "亚马逊北美渠道": {"customer_code": "CUST-AMAZON-NA", "customer_name": "亚马逊北美渠道"},
+        "库存不足客户": {"customer_code": "CUST-STOCK-CHECK", "customer_name": "库存不足客户"},
+        "字段缺失客户": {"customer_code": "CUST-FIELD-CHECK", "customer_name": "字段缺失客户"},
+        "缺 SKU 客户": {"customer_code": "CUST-SKU-CHECK", "customer_name": "缺 SKU 客户"},
+    }), is_secret=False)
+    ensure_config(session, "v2_validation_failure_notification_enabled", "true", is_secret=False)
+    ensure_config(session, "v2_validation_failure_to_json", "[]", is_secret=False)
+    ensure_config(session, "v2_validation_failure_cc_json", "[]", is_secret=False)
+    ensure_config(session, "oms_retry_base_delay_seconds", "60", is_secret=False)
+    ensure_config(session, "oms_retry_multiplier", "3", is_secret=False)
+    ensure_config(session, "oms_max_retries", "3", is_secret=False)
+    ensure_config(session, "oms_jackyun_gateway_url", "https://open.jackyun.com/open/openapi/do", is_secret=False)
+    ensure_config(session, "oms_jackyun_app_key", "", is_secret=False)
+    ensure_config(session, "oms_jackyun_app_secret", "", is_secret=True)
+    ensure_config(session, "oms_jackyun_version", "1.0", is_secret=False)
+    ensure_config(session, "oms_jackyun_content_type", "json", is_secret=False)
+    ensure_config(session, "oms_jackyun_timeout_seconds", "20", is_secret=False)
+    ensure_config(session, "oms_owner_code", "", is_secret=False)
+    ensure_config(session, "oms_warehouse_code", "", is_secret=False)
+    ensure_config(session, "oms_shop_code", "", is_secret=False)
+    ensure_config(session, "oms_logistic_code", "", is_secret=False)
+    ensure_config(session, "oms_order_type", "201", is_secret=False)
+    ensure_config(session, "oms_create_order_method", "wms.order.create", is_secret=False)
     if settings.baidu_map_ak:
         map_config = session.get(SystemConfig, "baidu_map_ak")
         if map_config is None or not (map_config.value or "").strip() or map_config.value == LEGACY_DEFAULT_BAIDU_MAP_AK:

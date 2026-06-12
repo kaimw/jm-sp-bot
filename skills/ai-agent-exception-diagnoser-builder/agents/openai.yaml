@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Agent Exception Diagnoser Builder"
+  short_description: "Build stateless JSON-mode exception diagnosis agents"
+  default_prompt: "Use $ai-agent-exception-diagnoser-builder when building LLM-based exception diagnosis with ContextPack, JSON mode, parse fallbacks, and stateless agent services."

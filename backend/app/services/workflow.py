@@ -3791,6 +3791,10 @@ def resolve_exception_case(session: Session, exception_id: str, note: str = "", 
     if case is None:
         raise ValueError("exception not found")
     case.status = "Resolved"
+    case.resolution_note = note
+    case.resolved_at = now_utc()
+    case.last_actor = actor
+    case.updated_at = now_utc()
     add_audit(session, "ExceptionResolved", "ExceptionCase", case.id, {"note": note}, actor)
     return case
 

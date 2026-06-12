@@ -1,0 +1,4 @@
+interface:
+  display_name: "OMS Fulfillment Retry Enforcer"
+  short_description: "Enforce safe OMS retry and dead-letter behavior"
+  default_prompt: "Use $oms-fulfillment-retry-enforcer when changing OMS push retries, backoff with jitter, order_no locking, retry limits, or dead-letter records."
