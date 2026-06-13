@@ -201,6 +201,7 @@ flowchart TD
 | `VALIDATING` | `RulesFailedCritical` | `VALIDATION_BLOCKED` | 任一规则返回 `blockerLevel=CRITICAL` 时中断责任链 |
 | `VALIDATION_BLOCKED` | `ExceptionResolvedAndRevalidate` | `VALIDATING` | 异常处理完成后重新预审，不允许直接人工改为通过 |
 | `VALIDATED` | `DeliveryNoticeCreated` | `DELIVERY_NOTICE_READY` | 已生成发货通知单 |
+| `VALIDATED` | `ArchivePhase1Fulfillment` | `FULFILLMENT_ARCHIVED` | CRM 标识为 FBA/平台自送等平台履约订单，一期不生成中台发货通知、不下推 OMS，仅保留归档与下一期财务/库存核验依据 |
 | `DELIVERY_NOTICE_READY` | `EnqueueOmsPush` | `OMS_PENDING` | 已写入 `ProcessingJob` 或 `integration_events` |
 | `OMS_PENDING` | `OmsPushSuccess` | `OMS_ACCEPTED` | OMS 返回成功且幂等键确认 |
 | `OMS_PENDING` | `FirstOmsPushFailed` | `OMS_RETRYING` | `retry_count=1`，计算下一次 `next_retry_at` |
@@ -732,22 +733,28 @@ AI 生成 DDL、ORM、迁移脚本时必须遵守以下统一规则：
 | --- | --- | --- | --- |
 | `id` | `BIGINT` | PK, NOT NULL | 内部主键 |
 | `order_no` | `VARCHAR(64)` | NOT NULL, UNIQUE | 中台订单号 |
-| `crm_order_id` | `VARCHAR(128)` | NOT NULL, UNIQUE | CRM 订单 ID，一期一 CRM 单对应一中台订单 |
+| `crm_order_id` | `VARCHAR(128)` | NULL, INDEX | CRM 订单 ID，仅对 CRM 渠道订单有效 |
 | `crm_order_no` | `VARCHAR(128)` | NULL, INDEX | CRM 订单编号 |
+| `platform_order_no` | `VARCHAR(128)` | NULL, INDEX | 电商平台原始订单号，仅对网店渠道订单有效 |
+| `shop_code` | `VARCHAR(128)` | NULL, INDEX | 店铺编码 |
+| `channel_code` | `VARCHAR(128)` | NULL, INDEX | 渠道/平台编码（如 shopify, amazon, tmall, ebay, tiktok 等） |
 | `customer_id` | `BIGINT` | NULL, INDEX | 中台客户 ID |
-| `customer_name` | `VARCHAR(255)` | NOT NULL | 客户名称 |
+| `customer_name` | `VARCHAR(255)` | NOT NULL | 客户名称（网店订单可默认为店铺名称或平台渠道客户） |
 | `sales_user_id` | `VARCHAR(64)` | NULL, INDEX | 销售 ID |
 | `sales_user_name` | `VARCHAR(128)` | NULL | 销售名称 |
 | `department` | `VARCHAR(128)` | NULL | 部门 |
-| `source_policy` | `VARCHAR(32)` | NOT NULL, DEFAULT `CRM_ONLY` | 来源策略，一期固定为 `CRM_ONLY` |
+| `source_policy` | `VARCHAR(32)` | NOT NULL, DEFAULT `CRM_ONLY` | 来源策略，支持 `CRM_ONLY` 与 `ECOMMERCE_PULL` |
 | `business_scope` | `VARCHAR(64)` | NOT NULL, INDEX | 一期纳入范围 |
 | `fulfillment_type` | `VARCHAR(64)` | NULL | 直发客户/渠道订单/备货等 |
 | `contract_no` | `VARCHAR(128)` | NULL, INDEX | 合同号 |
-| `amount` | `DECIMAL(15,2)` | NOT NULL, DEFAULT 0.00 | 订单金额 |
+| `amount` | `DECIMAL(15,2)` | NOT NULL, DEFAULT 0.00 | 订单实付总金额（含运费，扣除优惠） |
 | `currency` | `VARCHAR(16)` | NOT NULL, DEFAULT `CNY` | 币种 |
+| `buyer_memo` | `TEXT` | NULL | 买家留言/备注 |
+| `seller_memo` | `TEXT` | NULL | 卖家备注 |
+| `waybill_no` | `VARCHAR(128)` | NULL, INDEX | 物流运单追踪号（从 `wms-cross.delivery.print` 获取） |
 | `status` | `VARCHAR(32)` | NOT NULL, INDEX | 中台统一状态，代码 Enum |
 | `crm_status` | `VARCHAR(64)` | NULL | CRM 原始状态 |
-| `approval_time` | `TIMESTAMP` | NULL, INDEX | CRM 审批完成时间 |
+| `approval_time` | `TIMESTAMP` | NULL, INDEX | CRM 审批完成时间/平台支付下单时间 |
 | `validation_status` | `VARCHAR(32)` | NOT NULL, DEFAULT `PENDING` | 预审状态，代码 Enum |
 | `oms_status` | `VARCHAR(64)` | NULL, INDEX | OMS 映射状态 |
 | `finance_status` | `VARCHAR(64)` | NULL | 下一期：财务核验状态 |
@@ -764,7 +771,9 @@ AI 生成 DDL、ORM、迁移脚本时必须遵守以下统一规则：
 
 ```sql
 UNIQUE KEY uk_orders_order_no (order_no);
-UNIQUE KEY uk_orders_crm_order_id (crm_order_id);
+KEY idx_orders_crm_order_id (crm_order_id);
+KEY idx_orders_platform_order (channel_code, platform_order_no);
+KEY idx_orders_shop_status (shop_code, status);
 KEY idx_orders_status_updated (status, updated_at);
 KEY idx_orders_sales_status (sales_user_id, status);
 KEY idx_orders_customer_status (customer_id, status);
@@ -2015,3 +2024,67 @@ docs/v2-implementation-roadmap.md
 ```
 
 本文件作为 v2 改造的总设计母版。工程拆解文档必须引用本文件中的状态机、事件契约、数据模型约束和 AI 编程助手 Skills，避免分阶段编码时出现逻辑断层。
+
+## 21. 网商渠道订单接入与标准化流程设计
+
+针对天猫旗舰店、京东旗舰店、Shopify Official store、Shopify EU、Ebay DE、Ebay US、Tiktok US、Newegg US 以及 7 个 Amazon 站点店铺等线上电商及渠道备货订单，中台实施标准化的接入控制。
+
+### 21.1 核心边界约束：CRM 唯一订单源头法则 【CRITICAL】
+为了防止 AI 编程时从错误的源头拉取订单，导致中台数据不一致和财务核算混乱，系统设计中必须严格遵守以下边界约束：
+1. **中台订单源头强制唯一（CRM）**：
+   * **所有订单信息（包括普通线下订单、电商渠道大单、亚马逊/独立站备货出库单）一律统一且只能从 CRM 系统同步过来**。
+   * 中台系统**严禁直接调用吉客云（OMS）任何关于获取、同步、抓取网店交易单或销售单的 API 接口**（如 `oms.trade.fullinfoget` 或 `jackyun.tradenotsensitiveinfos.list.get` 等）。
+2. **吉客云/OMS 的下游履约定位**：
+   * 吉客云 OMS 在本系统中**仅作为下游的发货履约执行系统（WMS 侧）**。
+   * 中台在 CRM 订单审批通过并完成本地预审后，只向吉客云下推发货通知单（调用 `wms.order.create`），并异步追踪其拣货发货状态和调用跨境打印接口 `wms-cross.delivery.print`，不允许进行反向的订单拉取。
+3. **电商渠道订单的 CRM 录入规范**：
+   * 电商备货及销售订单必须先在 CRM 中录入（销售或运营在 CRM 选择对应的标准产品 SKU，并选择对应的渠道客户或网店为“客户主体”），并走完 CRM 审批流。
+   * 中台通过 CRM 数据集成接口同步该单据，将其标记为 `source_policy=CRM_ONLY`，并从中自动解析电商平台原始单号 `platform_order_no`、店铺编码 `shop_code` 和渠道平台编码 `channel_code`。
+
+### 21.2 预审规则与促销金额分摊
+1. **商品 SKU 自动映射与套件拆分 (SKU Mapping)**：预审链条中加载 SKU 映射模块。根据从 CRM 同步过来的渠道单中的 `shop_code + shop_sku_code` 查询主数据，自动转化为中台标准 SKU 编号和 ERP 物料编码。若无映射，触发 `SKU_MAPPING_MISSING` 异常，阻断发货。
+2. **促销与实付金额分摊算法 (Promotion Apportionment)**：
+   * 订单层面的平台券、店铺券、满减折减及实付运费必须按比例分摊到每一个 SKU 子项中。
+   * 订单明细中共有 $N$ 个商品行，第 $i$ 行商品的原始单价为 $P_i$，数量为 $Q_i$，则其行原始金额为 $A_i = P_i \times Q_i$。订单总原始金额 $TotalRaw = \sum_{i=1}^N A_i$。
+   * 若订单总优惠金额为 $TotalDiscount$，实付运费为 $ShippingFee$，则分摊后前 $N-1$ 行商品的净实付金额（Net Apportioned Amount）$Net\_Amount_i$ 为：
+     $$Net\_Amount_i = \text{round}\left(A_i - \frac{A_i \times TotalDiscount}{TotalRaw} + \frac{A_i \times ShippingFee}{TotalRaw}, 2\right)$$
+   * 倒挤余数校准精度：为防止除不尽产生分厘偏差，最后一行采用减法校准，保证所有分摊净实付额之和严格等于订单总实付金额：
+     $$Net\_Amount_N = \text{TotalPaidAmount} - \sum_{i=1}^{N-1} Net\_Amount_i$$
+     *（其中 $\text{TotalPaidAmount} = TotalRaw - TotalDiscount + ShippingFee$）*
+
+### 21.3 履行模式判定与分仓路由 (Fulfillment Routing)
+1. **亚马逊 FBA / 平台代发模式**：
+   * 判定规则：若从 CRM 同步过来的订单其配送方式标识为 FBA（Fulfillment by Amazon）或平台自送，中台标记 `fulfillment_type=PLATFORM_FULFILLED`。
+   * 状态流转：自动判定无需通过中台下推本地仓库，预审后直接将状态流转至 `FULFILLMENT_ARCHIVED`，跳过发货单生成。中台只保留该订单用于库存对账和下一期财务核销。
+2. **卖家自履行模式 (FBM / 自营海外仓)**：
+   * 判定规则：若标记为商家自配送，中台标记 `fulfillment_type=MERCHANT_FULFILLED`。
+   * 仓库路由：系统根据买家邮编地理分区，自动推荐发货仓库编码 `warehouse_code`（如：德区订单路由至 DE海外仓，北美订单路由至 US美东仓，其他路由至深圳总仓）。
+
+### 21.4 跨境物流面单打印接口 (`wms-cross.delivery.print`) 异步集成
+在卖家自履行（FBM）模式下，中台在订单成功推送 OMS 并开启拣货后，自动获取承运商电子面单 PDF 并回传追踪运单号。
+
+1. **接口调用时机**：发货通知单状态跃迁为 `OMS_ACCEPTED` 且仓库已开始拣货（`OmsPickingStarted` 触发）时，由后台 Worker 异步调用。
+2. **API 网关凭证**：统一使用吉客云开发平台 API。
+   * **Appkey**: `17563412`
+   * **Secret**: `ee7ead1fec2c4e26af24a0a7499ab103`
+   * **API 入口地址**: `https://open.jackyun.com/open/openapi/do`
+3. **请求与响应报文**：
+   * 传入 `deliveryNo`（ notice_no / oms_order_no ）、`printType="pdf"` 及 `needLabelCode=true`。
+   * 响应返回 `waybillNo` (追踪号) 与 `printData` (PDF 文件的 Base64 编码数据或 URL 链接)。
+4. **面单转存与运单回传**：
+   * 将 `printData` 二进制流解码并存入 OSS/S3 对象存储，在 `order_attachments` 中新建一条 `attachment_type=OutboundProof` 记录。
+   * 提取 `waybillNo`，自动调用网店平台 API（如 Shopify Fulfillment API），触发终端店铺的订单标记发货并通知买家。回传失败时生成 `OMS_STATUS_CONFLICT` 挂起异常。
+
+### 21.5 AI 编程助手 Skills：电商渠道接入与打印执行
+
+```md
+# Codex Skill: ecommerce-channel-and-print-handler
+
+Description: 专门用于生成网店渠道订单从 CRM 同步后的解析过滤、金额分摊、分仓路由以及 wms-cross.delivery.print 接口集成的代码逻辑。
+
+## CRITICAL RULES
+1. 订单源唯一性限制：严禁生成从吉客云接口直接拉取/同步电商订单的代码。中台只认来自 CRM 的销售订单。吉客云仅用于下推发货通知和拉取物流面单。
+2. 金额分摊防溢出：编写促销分摊逻辑时，必须引入差额校正算法，保证所有分摊后明细金额之和严格等于订单实付总金额，防止由于除不尽产生分钱差异。
+3. 异常捕获与死信：调用 wms-cross.delivery.print 发生网络超时或失败时，执行指数退避重试；重试3次均失败则自动转为异常工单挂起，不允许静默丢失面单。
+4. 运单号幂等性：将运单号回传给电商平台前，必须进行幂等性检查，已成功回传的运单号不可重复触发电商平台 API。
+```

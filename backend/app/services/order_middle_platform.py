@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
-import random
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,7 @@ from backend.app.models import (
     CrmSalesOrder,
     DeliveryNotice,
     ExceptionCase,
+    IntegrationEvent,
     MiddlePlatformOrder,
     MiddlePlatformOrderItem,
     OrderAttachment,
@@ -24,13 +26,18 @@ from backend.app.models import (
     ProcessingJob,
     ProductInventorySnapshot,
     ProductSKU,
+    ChannelPricing,
     SystemConfig,
+    User,
     now_utc,
 )
+from backend.app.services.auth import should_mask_financials
 from backend.app.services.exception_diagnosis import enqueue_exception_diagnosis
 from backend.app.services.address_quality import is_detailed_receipt_address
 from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
 from backend.app.services.jsonutil import dumps, loads
+from backend.app.services.storage import save_attachment
+from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
 
 
 class IllegalStateTransition(ValueError):
@@ -39,6 +46,51 @@ class IllegalStateTransition(ValueError):
 
 class DuplicateEventException(ValueError):
     pass
+
+
+def payload_fingerprint(payload: Any) -> str:
+    return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
+
+
+def record_integration_event(
+    session: Session,
+    *,
+    source_system: str,
+    event_type: str,
+    biz_key: str,
+    payload: Any,
+    trace_id: str = "",
+    status: str = "Pending",
+    retry_count: int = 0,
+    error_message: str | None = None,
+    response: Any | None = None,
+) -> IntegrationEvent:
+    payload_hash = payload_fingerprint(payload)
+    event = (
+        session.query(IntegrationEvent)
+        .filter(
+            IntegrationEvent.event_type == event_type,
+            IntegrationEvent.biz_key == biz_key,
+            IntegrationEvent.payload_hash == payload_hash,
+        )
+        .first()
+    )
+    if event is None:
+        event = IntegrationEvent(
+            trace_id=trace_id or str(uuid.uuid4()),
+            source_system=source_system,
+            event_type=event_type,
+            biz_key=biz_key,
+            payload_hash=payload_hash,
+            request_json=dumps(payload),
+        )
+        session.add(event)
+    event.status = status
+    event.retry_count = retry_count
+    event.error_message = error_message
+    event.response_json = dumps(response) if response is not None else event.response_json
+    event.updated_at = now_utc()
+    return event
 
 
 class InvalidCrmOrderParsedEvent(ValueError):
@@ -115,12 +167,14 @@ STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
     (OrderStatus.DELIVERY_NOTICE_READY, OrderEvent.ENQUEUE_OMS_PUSH): OrderStatus.OMS_PENDING,
     (OrderStatus.OMS_PENDING, OrderEvent.OMS_PUSH_SUCCESS): OrderStatus.OMS_ACCEPTED,
     (OrderStatus.OMS_PENDING, OrderEvent.FIRST_OMS_PUSH_FAILED): OrderStatus.OMS_RETRYING,
+    (OrderStatus.OMS_PENDING, OrderEvent.RETRY_REACHED_MAX_RETRIES): OrderStatus.OMS_BLOCKED,
     (OrderStatus.OMS_RETRYING, OrderEvent.RETRY_TIMER_DUE_AND_OMS_SUCCESS): OrderStatus.OMS_ACCEPTED,
     (OrderStatus.OMS_RETRYING, OrderEvent.RETRY_FAILED_BUT_UNDER_MAX_RETRIES): OrderStatus.OMS_RETRYING,
     (OrderStatus.OMS_RETRYING, OrderEvent.RETRY_REACHED_MAX_RETRIES): OrderStatus.OMS_BLOCKED,
     (OrderStatus.OMS_BLOCKED, OrderEvent.EXCEPTION_RESOLVED_AND_REPLAY): OrderStatus.OMS_PENDING,
     (OrderStatus.OMS_ACCEPTED, OrderEvent.OMS_PICKING_STARTED): OrderStatus.PICKING,
     (OrderStatus.PICKING, OrderEvent.OMS_SHIPPED): OrderStatus.SHIPPED,
+    (OrderStatus.VALIDATED, OrderEvent.ARCHIVE_PHASE1_FULFILLMENT): OrderStatus.FULFILLMENT_ARCHIVED,
     (OrderStatus.SHIPPED, OrderEvent.ARCHIVE_PHASE1_FULFILLMENT): OrderStatus.FULFILLMENT_ARCHIVED,
     (OrderStatus.FULFILLMENT_ARCHIVED, OrderEvent.LOGISTICS_SIGNED): OrderStatus.SIGNED,
     (OrderStatus.SIGNED, OrderEvent.START_FINANCE_CHECK): OrderStatus.FINANCE_CHECKING,
@@ -366,6 +420,9 @@ class KnownSkuRule:
         }
         missing = [sku for sku in sku_codes if sku not in known]
         if missing:
+            unmapped_shop_skus = [item.shop_sku_code for item in context.items if item.sku_code in missing and item.shop_sku_code]
+            if unmapped_shop_skus:
+                return ValidationResult("SKU_MAPPING_MISSING", False, BlockerLevel.CRITICAL, f"CRM 渠道 SKU 未匹配中台标准 SKU：{', '.join(unmapped_shop_skus[:10])}", unmapped_shop_skus)
             return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, f"SKU 未在主数据启用：{', '.join(missing[:10])}", missing)
         return ValidationResult(self.get_rule_code(), True)
 
@@ -587,6 +644,15 @@ def enqueue_crm_order_parsed_event(session: Session, crm_order: CrmSalesOrder, *
     job = ProcessingJob(job_type="CRM_ORDER_PARSED", payload_json=dumps(payload), status="Pending")
     session.add(job)
     session.add(AuditEvent(event_type="CrmOrderParsedEventQueued", related_object_type="CrmSalesOrder", related_object_id=crm_order.id, detail=dumps(payload)))
+    record_integration_event(
+        session,
+        source_system=crm_order.source_system.upper(),
+        event_type="CRM_ORDER_PARSED",
+        biz_key=crm_order.crm_order_id,
+        payload=payload,
+        trace_id=str(payload.get("trace_id") or ""),
+        status="Pending",
+    )
     return job
 
 
@@ -638,8 +704,11 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
 
     notice = None
     if order.status == OrderStatus.VALIDATED.value:
-        notice = create_delivery_notice(session, order)
-        transition_order(session, order, OrderEvent.DELIVERY_NOTICE_CREATED, trace_id=trace_id, detail={"notice_no": notice.notice_no})
+        if is_platform_fulfilled_order(order, crm_order):
+            archive_platform_fulfilled_order(session, order, crm_order, trace_id=trace_id)
+        else:
+            notice = create_delivery_notice(session, order)
+            transition_order(session, order, OrderEvent.DELIVERY_NOTICE_CREATED, trace_id=trace_id, detail={"notice_no": notice.notice_no})
     if order.status == OrderStatus.DELIVERY_NOTICE_READY.value:
         notice = notice or latest_delivery_notice(session, order)
         if notice is None:
@@ -688,10 +757,11 @@ def handle_crm_snapshot_changed(
         cancel_oms_push_jobs(session, order, reason="crm_snapshot_changed")
         expire_delivery_notices(session, order, reason="crm_snapshot_changed_during_oms_push")
         transition_order(session, order, OrderEvent.CRM_SNAPSHOT_CHANGED, trace_id=trace_id, detail=detail)
+        exception_type = "CRM_CHANGED_DURING_OMS_PENDING" if status == OrderStatus.OMS_PENDING else "CRM_CHANGED_DURING_OMS_RETRY"
         case = create_exception_case(
             session,
             order,
-            "CRM_CHANGED_DURING_OMS_PENDING",
+            exception_type,
             "Critical",
             "CRM 订单在 OMS 下推或重试期间发生变更，已暂停旧下推任务，需人工确认后重新生成发货预览。",
             [],
@@ -744,7 +814,6 @@ def handle_crm_cancel_confirmed(
         OrderStatus.VALIDATION_BLOCKED,
         OrderStatus.VALIDATED,
         OrderStatus.DELIVERY_NOTICE_READY,
-        OrderStatus.OMS_PENDING,
     }:
         cancel_oms_push_jobs(session, order, reason="crm_cancelled_before_oms_push")
         expire_delivery_notices(session, order, reason="crm_cancelled_before_oms_push", target_status="Cancelled")
@@ -755,6 +824,21 @@ def handle_crm_cancel_confirmed(
             "CRM_CANCELLED_BEFORE_OMS_PUSH",
             "High",
             "CRM 订单已撤销/作废，未下推 OMS 的中台流程已取消。",
+            [],
+            trace_id=trace_id,
+        )
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "exception_case_id": case.id, "cancelled": True}
+
+    if status == OrderStatus.OMS_PENDING:
+        cancel_oms_push_jobs(session, order, reason="crm_cancelled_during_oms_pending")
+        expire_delivery_notices(session, order, reason="crm_cancelled_during_oms_pending", target_status="Cancelled")
+        transition_order(session, order, OrderEvent.CANCEL_CONFIRMED, trace_id=trace_id, detail=detail)
+        case = create_exception_case(
+            session,
+            order,
+            "CRM_CANCELLED_DURING_OMS_PENDING",
+            "Critical",
+            "CRM 订单在 OMS 待推送期间撤销，已取消待推任务并终止中台流程。",
             [],
             trace_id=trace_id,
         )
@@ -906,6 +990,12 @@ def upsert_middle_platform_order(session: Session, crm_order: CrmSalesOrder) -> 
     order.crm_sales_order_id = crm_order.id
     order.crm_order_no = crm_order.crm_order_no
     order.payload_hash = crm_order.payload_hash
+    raw = loads(crm_order.raw_json, {})
+    order.source_policy = "CRM_ONLY"
+    order.platform_order_no = raw_text_from_keys(raw, ["platform_order_no", "platformOrderNo", "trade_no", "tradeNo", "external_order_no", "externalOrderNo"])
+    order.shop_code = raw_text_from_keys(raw, ["shop_code", "shopCode", "store_code", "storeCode"])
+    order.channel_code = raw_text_from_keys(raw, ["channel_code", "channelCode", "platform", "channel"])
+    order.fulfillment_type = normalized_fulfillment_type(raw)
     order.customer_name = crm_order.customer_name
     order.sales_user_name = crm_order.sales_user_name
     order.currency = crm_order.currency or "CNY"
@@ -934,14 +1024,17 @@ def sync_middle_order_items(session: Session, order: MiddlePlatformOrder, crm_or
         raw = loads(crm_order.raw_json, {})
         raw_items = raw.get("items") or raw.get("order_items") or []
         if isinstance(raw_items, list):
-            for index, raw_item in enumerate(raw_items):
+            item_payloads = apportioned_order_item_payloads(raw, [item for item in raw_items if isinstance(item, dict)])
+            for index, raw_item in enumerate(item_payloads):
                 if not isinstance(raw_item, dict):
                     continue
                 session.add(
                     MiddlePlatformOrderItem(
                         order_id=order.id,
-                        sku_code=str(raw_item.get("sku_code") or raw_item.get("sku_id") or "").strip() or None,
+                        sku_code=standard_sku_code_for_item(session, order, raw_item),
                         product_name=str(raw_item.get("product_name") or raw_item.get("name") or "").strip() or None,
+                        shop_sku_code=raw_text_from_keys(raw_item, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"]),
+                        channel_code=order.channel_code,
                         quantity=parse_decimal(raw_item.get("quantity") or raw_item.get("qty")),
                         unit_price=parse_decimal(raw_item.get("unit_price")),
                         line_amount=parse_decimal(raw_item.get("line_amount") or raw_item.get("amount")),
@@ -949,18 +1042,132 @@ def sync_middle_order_items(session: Session, order: MiddlePlatformOrder, crm_or
                     )
                 )
         return
+    raw = loads(crm_order.raw_json, {})
+    source_payloads = []
     for source in source_items:
+        source_raw = loads(source.raw_json, {})
+        source_payloads.append(
+            {
+                **source_raw,
+                "sku_code": source.sku_code,
+                "product_name": source.product_name,
+                "quantity": source.quantity,
+                "unit_price": source.unit_price,
+                "line_amount": source.line_amount,
+            }
+        )
+    for source in apportioned_order_item_payloads(raw, source_payloads):
         session.add(
             MiddlePlatformOrderItem(
                 order_id=order.id,
-                sku_code=source.sku_code,
-                product_name=source.product_name,
-                quantity=parse_decimal(source.quantity),
-                unit_price=parse_decimal(source.unit_price),
-                line_amount=parse_decimal(source.line_amount),
-                raw_json=source.raw_json,
+                sku_code=standard_sku_code_for_item(session, order, source),
+                product_name=source.get("product_name"),
+                shop_sku_code=raw_text_from_keys(source, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"]),
+                channel_code=order.channel_code,
+                quantity=parse_decimal(source.get("quantity")),
+                unit_price=parse_decimal(source.get("unit_price")),
+                line_amount=parse_decimal(source.get("line_amount")),
+                raw_json=dumps(source),
             )
         )
+
+
+def apportioned_order_item_payloads(order_raw: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payloads = [dict(item) for item in items]
+    if not payloads:
+        return payloads
+    total_discount = decimal_from_keys(order_raw, ["total_discount", "discount_amount", "promotion_discount", "order_discount_amount", "coupon_amount"]) or Decimal("0")
+    shipping_fee = decimal_from_keys(order_raw, ["shipping_fee", "freight_amount", "postage", "logistics_fee"]) or Decimal("0")
+    if total_discount == 0 and shipping_fee == 0:
+        return payloads
+    raw_amounts: list[Decimal] = []
+    for item in payloads:
+        quantity = parse_decimal(item.get("quantity") or item.get("qty")) or Decimal("0")
+        unit_price = parse_decimal(item.get("unit_price")) or Decimal("0")
+        line_amount = parse_decimal(item.get("line_amount") or item.get("amount")) or (quantity * unit_price).quantize(Decimal("0.01"))
+        raw_amounts.append(line_amount)
+    total_raw = sum(raw_amounts, Decimal("0")).quantize(Decimal("0.01"))
+    if total_raw <= 0:
+        return payloads
+    total_paid = decimal_from_keys(order_raw, ["total_paid_amount", "paid_amount", "actual_amount", "payment_amount"])
+    if total_paid is None:
+        total_paid = (total_raw - total_discount + shipping_fee).quantize(Decimal("0.01"))
+    allocated_sum = Decimal("0")
+    for index, item in enumerate(payloads):
+        if index == len(payloads) - 1:
+            net_amount = (total_paid - allocated_sum).quantize(Decimal("0.01"))
+        else:
+            ratio = raw_amounts[index] / total_raw
+            net_amount = (raw_amounts[index] - (total_discount * ratio) + (shipping_fee * ratio)).quantize(Decimal("0.01"))
+            allocated_sum += net_amount
+        apportionment = {
+            "raw_line_amount": str(raw_amounts[index]),
+            "total_raw_amount": str(total_raw),
+            "total_discount": str(total_discount.quantize(Decimal("0.01"))),
+            "shipping_fee": str(shipping_fee.quantize(Decimal("0.01"))),
+            "total_paid_amount": str(total_paid),
+            "net_line_amount": str(net_amount),
+            "method": "proportional_with_last_line_correction",
+        }
+        item["line_amount"] = str(net_amount)
+        item["apportionment"] = apportionment
+    return payloads
+
+
+def decimal_from_keys(data: dict[str, Any], keys: list[str]) -> Decimal | None:
+    for key in keys:
+        value = parse_decimal(data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def raw_text_from_keys(data: dict[str, Any], keys: list[str]) -> str | None:
+    for key in keys:
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def normalized_fulfillment_type(raw: dict[str, Any]) -> str | None:
+    if is_platform_fulfilled_raw(raw):
+        return "PLATFORM_FULFILLED"
+    text = " ".join(
+        str(raw.get(key) or "").strip().lower()
+        for key in ["fulfillment_type", "fulfillmentType", "delivery_method", "deliveryMethod", "shipping_method", "shippingMethod", "logistics_mode", "logisticsMode"]
+        if str(raw.get(key) or "").strip()
+    )
+    if any(token in text for token in ["fbm", "merchant fulfilled", "seller fulfilled", "商家自配送", "自配送", "自履约", "海外仓"]):
+        return "MERCHANT_FULFILLED"
+    return raw_text_from_keys(raw, ["fulfillment_type", "fulfillmentType"])
+
+
+def standard_sku_code_for_item(session: Session, order: MiddlePlatformOrder, item: dict[str, Any]) -> str | None:
+    direct = str(item.get("sku_code") or item.get("sku_id") or "").strip()
+    if direct:
+        return direct
+    shop_sku = raw_text_from_keys(item, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"])
+    if not shop_sku:
+        return None
+    channel_candidates = [order.channel_code, order.shop_code, "default", None]
+    for channel in channel_candidates:
+        query = session.query(ChannelPricing).join(ProductSKU, ProductSKU.id == ChannelPricing.sku_uuid).filter(
+            ChannelPricing.channel_sku_id == shop_sku,
+            ProductSKU.status == "Active",
+        )
+        if channel:
+            query = query.filter(ChannelPricing.channel == channel)
+        row = query.order_by(ChannelPricing.updated_at.desc()).first()
+        if row and row.sku and row.sku.sku_id:
+            item["sku_mapping"] = {
+                "source": "channel_pricing",
+                "shop_sku_code": shop_sku,
+                "channel": row.channel,
+                "standard_sku_code": row.sku.sku_id,
+            }
+            return row.sku.sku_id
+    return shop_sku
 
 
 def run_validation_chain(session: Session, order: MiddlePlatformOrder, rules: list[OrderValidationRule] | None = None) -> list[ValidationResult]:
@@ -977,6 +1184,88 @@ def run_validation_chain(session: Session, order: MiddlePlatformOrder, rules: li
         if result.blocker_level == BlockerLevel.CRITICAL:
             break
     return results
+
+
+def is_platform_fulfilled_order(order: MiddlePlatformOrder, crm_order: CrmSalesOrder) -> bool:
+    raw = loads(crm_order.raw_json, {})
+    if order.fulfillment_type == "PLATFORM_FULFILLED":
+        return True
+    return is_platform_fulfilled_raw(raw)
+
+
+def is_platform_fulfilled_raw(raw: dict[str, Any]) -> bool:
+    values = [
+        raw.get("fulfillment_type"),
+        raw.get("fulfillmentType"),
+        raw.get("delivery_method"),
+        raw.get("deliveryMethod"),
+        raw.get("shipping_method"),
+        raw.get("shippingMethod"),
+        raw.get("logistics_mode"),
+        raw.get("logisticsMode"),
+        raw.get("warehouse_mode"),
+        raw.get("warehouseMode"),
+        raw.get("channel_fulfillment_type"),
+        raw.get("channelFulfillmentType"),
+        raw.get("order_type"),
+        raw.get("orderType"),
+    ]
+    text = " ".join(str(value or "").strip().lower() for value in values if str(value or "").strip())
+    if not text:
+        return False
+    platform_tokens = [
+        "platform_fulfilled",
+        "platform fulfilled",
+        "platform-fulfilled",
+        "fba",
+        "fulfillment by amazon",
+        "amazon fulfillment",
+        "平台履约",
+        "平台自送",
+        "平台配送",
+        "亚马逊配送",
+        "亚马逊物流",
+    ]
+    return any(token in text for token in platform_tokens)
+
+
+def archive_platform_fulfilled_order(session: Session, order: MiddlePlatformOrder, crm_order: CrmSalesOrder, *, trace_id: str = "") -> None:
+    raw = loads(crm_order.raw_json, {})
+    evidence = {
+        "fulfillment_type": raw.get("fulfillment_type") or raw.get("fulfillmentType"),
+        "delivery_method": raw.get("delivery_method") or raw.get("deliveryMethod"),
+        "shipping_method": raw.get("shipping_method") or raw.get("shippingMethod"),
+        "logistics_mode": raw.get("logistics_mode") or raw.get("logisticsMode"),
+        "warehouse_mode": raw.get("warehouse_mode") or raw.get("warehouseMode"),
+        "channel_fulfillment_type": raw.get("channel_fulfillment_type") or raw.get("channelFulfillmentType"),
+        "order_type": raw.get("order_type") or raw.get("orderType"),
+    }
+    transition_order(
+        session,
+        order,
+        OrderEvent.ARCHIVE_PHASE1_FULFILLMENT,
+        trace_id=trace_id,
+        detail={
+            "reason": "platform_fulfilled_skip_oms",
+            "evidence": {key: value for key, value in evidence.items() if value not in (None, "")},
+        },
+    )
+    summary = loads(order.validation_summary_json, {})
+    summary["fulfillment"] = {
+        "type": "PLATFORM_FULFILLED",
+        "phase1_action": "SKIP_OMS_AND_ARCHIVE",
+        "reason": "CRM 标识为平台履约/FBA/平台自送，一期不生成中台发货通知或下推 OMS。",
+        "evidence": {key: value for key, value in evidence.items() if value not in (None, "")},
+    }
+    order.validation_summary_json = dumps(summary)
+    session.add(
+        AuditEvent(
+            event_type="PlatformFulfilledOrderArchived",
+            related_object_type="MiddlePlatformOrder",
+            related_object_id=order.id,
+            detail=dumps({"order_no": order.order_no, "crm_order_no": order.crm_order_no, "trace_id": trace_id}),
+        )
+    )
 
 
 def latest_delivery_notice(session: Session, order: MiddlePlatformOrder) -> DeliveryNotice | None:
@@ -998,6 +1287,8 @@ def create_delivery_notice(session: Session, order: MiddlePlatformOrder) -> Deli
     notice = DeliveryNotice(
         notice_no=notice_no,
         order_id=order.id,
+        notice_version=1,
+        source_snapshot_hash=order.payload_hash,
         status="Previewed",
         oms_idempotency_key=hashlib.sha256(f"{order.order_no}:{order.payload_hash}".encode("utf-8")).hexdigest(),
         oms_method=config_value(session, "oms_create_order_method", "wms.order.create") or "wms.order.create",
@@ -1168,6 +1459,7 @@ def confirm_delivery_notice(session: Session, notice: DeliveryNotice, *, confirm
     notice.status = "Confirmed"
     notice.confirmed_by = confirmed_by
     notice.confirmed_at = now_utc()
+    notice.version += 1
     notice.updated_at = now_utc()
     job = enqueue_oms_push(session, notice)
     event = OrderEvent.ENQUEUE_OMS_PUSH if order.status == OrderStatus.DELIVERY_NOTICE_READY.value else OrderEvent.EXCEPTION_RESOLVED_AND_REPLAY
@@ -1176,7 +1468,10 @@ def confirm_delivery_notice(session: Session, notice: DeliveryNotice, *, confirm
 
 
 def enqueue_oms_push(session: Session, notice: DeliveryNotice) -> ProcessingJob:
-    payload = {"notice_id": notice.id, "order_id": notice.order_id, "idempotency_key": notice.oms_idempotency_key}
+    order = session.get(MiddlePlatformOrder, notice.order_id)
+    if order is None:
+        raise RuntimeError("middle platform order not found")
+    payload = oms_push_job_payload(order, notice)
     existing = (
         session.query(ProcessingJob)
         .filter(
@@ -1191,16 +1486,49 @@ def enqueue_oms_push(session: Session, notice: DeliveryNotice) -> ProcessingJob:
     job = ProcessingJob(job_type="OMS_PUSH_NOTICE", payload_json=dumps(payload), status="Pending", next_retry_at=notice.next_retry_at)
     session.add(job)
     session.add(AuditEvent(event_type="OmsPushQueued", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps(payload)))
+    record_integration_event(
+        session,
+        source_system="OMS",
+        event_type="OMS_PUSH_NOTICE",
+        biz_key=notice.notice_no,
+        payload=payload,
+        trace_id=notice.oms_idempotency_key,
+        status="Pending",
+        retry_count=notice.retry_count,
+    )
     return job
 
 
+def oms_push_job_payload(order: MiddlePlatformOrder, notice: DeliveryNotice) -> dict[str, Any]:
+    return {
+        "delivery_notice_id": notice.id,
+        "notice_id": notice.id,
+        "order_id": notice.order_id,
+        "source_snapshot_hash": notice.source_snapshot_hash or order.payload_hash,
+        "notice_version": notice.notice_version,
+        "notice_lock_version": notice.version,
+        "oms_idempotency_key": notice.oms_idempotency_key,
+        "idempotency_key": notice.oms_idempotency_key,
+    }
+
+
 def process_oms_push_notice(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
-    notice = session.get(DeliveryNotice, payload.get("notice_id"))
+    notice = session.get(DeliveryNotice, payload.get("delivery_notice_id") or payload.get("notice_id"))
     if notice is None:
         raise RuntimeError("delivery notice not found")
     order = session.get(MiddlePlatformOrder, notice.order_id)
     if order is None:
         raise RuntimeError("middle platform order not found")
+    stale = stale_oms_push_reason(order, notice, payload)
+    if stale:
+        detail = {
+            "skipped_reason": stale,
+            "payload": payload,
+            "current_payload_hash": order.payload_hash,
+            "current_notice_version": notice.version,
+        }
+        session.add(AuditEvent(event_type="OmsPushSkipped", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps(detail)))
+        return {"notice_id": notice.id, "order_id": order.id, "status": order.status, "skipped": True, "skipped_reason": stale}
     if notice.status not in {"Confirmed", "Retrying"}:
         raise RuntimeError("发货通知未确认，不允许下推 OMS")
     if notice.next_retry_at and notice.next_retry_at > now_utc():
@@ -1215,7 +1543,41 @@ def process_oms_push_notice(session: Session, payload: dict[str, Any]) -> dict[s
     notice.updated_at = now_utc()
     event = OrderEvent.OMS_PUSH_SUCCESS if order.status == OrderStatus.OMS_PENDING.value else OrderEvent.RETRY_TIMER_DUE_AND_OMS_SUCCESS
     transition_order(session, order, event, trace_id=str(payload.get("idempotency_key") or ""), detail={"oms_result": result})
+    record_integration_event(
+        session,
+        source_system="OMS",
+        event_type="OMS_PUSH_NOTICE",
+        biz_key=notice.notice_no,
+        payload=payload,
+        trace_id=str(payload.get("idempotency_key") or ""),
+        status="Succeeded",
+        retry_count=notice.retry_count,
+        response=result,
+    )
     return {"notice_id": notice.id, "order_id": order.id, "status": order.status, "oms_result": result}
+
+
+def stale_oms_push_reason(order: MiddlePlatformOrder, notice: DeliveryNotice, payload: dict[str, Any]) -> str:
+    source_snapshot_hash = str(payload.get("source_snapshot_hash") or "").strip()
+    if source_snapshot_hash and source_snapshot_hash != order.payload_hash:
+        return "stale_payload_hash"
+    if notice.source_snapshot_hash and notice.source_snapshot_hash != order.payload_hash:
+        return "stale_payload_hash"
+    if "notice_version" in payload:
+        try:
+            expected_version = int(payload.get("notice_version"))
+        except (TypeError, ValueError):
+            return "stale_notice_version"
+        if expected_version != notice.notice_version:
+            return "stale_notice_version"
+    if "notice_lock_version" in payload:
+        try:
+            expected_lock_version = int(payload.get("notice_lock_version"))
+        except (TypeError, ValueError):
+            return "stale_notice_lock_version"
+        if expected_lock_version != notice.version:
+            return "stale_notice_lock_version"
+    return ""
 
 
 def process_oms_status_update(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1243,22 +1605,496 @@ def process_oms_status_update(session: Session, payload: dict[str, Any]) -> dict
             notice.status = "Picking"
             notice.updated_at = now_utc()
             transition_order(session, order, OrderEvent.OMS_PICKING_STARTED, trace_id=str(payload.get("trace_id") or ""), detail=raw_detail)
+            enqueue_oms_waybill_print(session, notice, trace_id=str(payload.get("trace_id") or ""))
         elif order.status in {OrderStatus.PICKING.value, OrderStatus.SHIPPED.value, OrderStatus.FULFILLMENT_ARCHIVED.value, OrderStatus.CLOSED.value}:
             session.add(AuditEvent(event_type="OmsPickingStatusObserved", related_object_type="MiddlePlatformOrder", related_object_id=order.id, detail=dumps(raw_detail)))
+            if order.status in {OrderStatus.PICKING.value, OrderStatus.SHIPPED.value}:
+                enqueue_oms_waybill_print(session, notice, trace_id=str(payload.get("trace_id") or ""))
         else:
             raise IllegalStateTransition(f"当前状态不允许同步 OMS 拣货状态：{order.status}")
     elif normalized == "shipped":
         if order.status == OrderStatus.OMS_ACCEPTED.value:
             transition_order(session, order, OrderEvent.OMS_PICKING_STARTED, trace_id=str(payload.get("trace_id") or ""), detail={**raw_detail, "auto_picking": True})
+            enqueue_oms_waybill_print(session, notice, trace_id=str(payload.get("trace_id") or ""))
         if order.status == OrderStatus.PICKING.value:
             notice.status = "Shipped"
             notice.updated_at = now_utc()
             transition_order(session, order, OrderEvent.OMS_SHIPPED, trace_id=str(payload.get("trace_id") or ""), detail=raw_detail)
+            enqueue_oms_waybill_print(session, notice, trace_id=str(payload.get("trace_id") or ""))
+            transition_order(
+                session,
+                order,
+                OrderEvent.ARCHIVE_PHASE1_FULFILLMENT,
+                trace_id=str(payload.get("trace_id") or ""),
+                detail={**raw_detail, "archive_reason": "oms_shipped"},
+            )
         elif order.status in {OrderStatus.SHIPPED.value, OrderStatus.FULFILLMENT_ARCHIVED.value, OrderStatus.CLOSED.value}:
             session.add(AuditEvent(event_type="OmsShippedStatusObserved", related_object_type="MiddlePlatformOrder", related_object_id=order.id, detail=dumps(raw_detail)))
+            if order.status == OrderStatus.SHIPPED.value:
+                enqueue_oms_waybill_print(session, notice, trace_id=str(payload.get("trace_id") or ""))
         else:
             raise IllegalStateTransition(f"当前状态不允许同步 OMS 发货状态：{order.status}")
     return {"notice_id": notice.id, "order_id": order.id, "status": order.status, "normalized_status": normalized}
+
+
+def enqueue_oms_waybill_print(session: Session, notice: DeliveryNotice, *, trace_id: str = "") -> ProcessingJob | None:
+    if notice.waybill_no:
+        return None
+    if notice.print_status in {"Pending", "Running", "Printed"}:
+        return None
+    payload = {"notice_id": notice.id, "order_id": notice.order_id, "trace_id": trace_id, "retry_count": notice.print_retry_count}
+    existing = (
+        session.query(ProcessingJob)
+        .filter(
+            ProcessingJob.job_type == "OMS_WAYBILL_PRINT",
+            ProcessingJob.payload_json == dumps(payload),
+            ProcessingJob.status.in_(["Pending", "Running"]),
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    notice.print_status = "Pending"
+    notice.print_error = None
+    notice.updated_at = now_utc()
+    job = ProcessingJob(job_type="OMS_WAYBILL_PRINT", payload_json=dumps(payload), status="Pending")
+    session.add(job)
+    session.add(AuditEvent(event_type="OmsWaybillPrintQueued", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps(payload)))
+    record_integration_event(session, source_system="OMS", event_type="OMS_WAYBILL_PRINT", biz_key=notice.notice_no, payload=payload, trace_id=trace_id, status="Pending", retry_count=notice.print_retry_count)
+    return job
+
+
+def process_oms_waybill_print(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    notice = session.get(DeliveryNotice, payload.get("notice_id"))
+    if notice is None:
+        raise RuntimeError("delivery notice not found")
+    order = session.get(MiddlePlatformOrder, notice.order_id)
+    if order is None:
+        raise RuntimeError("middle platform order not found")
+    # Acquire a PostgreSQL advisory lock on notice.notice_no to prevent concurrent prints
+    is_postgres = (session.bind.dialect.name == "postgresql") if (session.bind and hasattr(session.bind, "dialect")) else False
+    if is_postgres:
+        import hashlib
+        from sqlalchemy import text
+        hash_val = int(hashlib.sha256(notice.notice_no.encode("utf-8")).hexdigest()[:16], 16)
+        bigint_key = (hash_val & 0x7FFFFFFFFFFFFFFF) - (hash_val & 0x8000000000000000)
+        locked = session.execute(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": bigint_key}).scalar()
+        if not locked:
+            raise RuntimeError(f"Could not acquire advisory lock for notice {notice.notice_no}, printing is in progress by another worker.")
+        session.refresh(notice)
+        session.refresh(order)
+
+    if notice.waybill_no:
+        notice.print_status = "Printed"
+        notice.print_error = None
+        return {"notice_id": notice.id, "order_id": order.id, "waybill_no": notice.waybill_no, "skipped": True}
+    if order.status not in {OrderStatus.PICKING.value, OrderStatus.SHIPPED.value, OrderStatus.FULFILLMENT_ARCHIVED.value}:
+        raise RuntimeError(f"当前状态不允许打印跨境面单：{order.status}")
+    notice.print_status = "Running"
+    notice.updated_at = now_utc()
+    try:
+        result = print_oms_waybill(session, notice)
+    except Exception as exc:
+        return handle_oms_waybill_print_failure(session, notice, order, str(exc), trace_id=str(payload.get("trace_id") or ""))
+    waybill_no = extract_waybill_no(result)
+    if not waybill_no:
+        return handle_oms_waybill_print_failure(session, notice, order, "吉客云面单响应缺少 waybillNo", trace_id=str(payload.get("trace_id") or ""))
+    notice.waybill_no = waybill_no
+    notice.print_status = "Printed"
+    notice.print_error = None
+    notice.print_retry_count = 0
+    notice.updated_at = now_utc()
+    proof = save_waybill_outbound_proof(session, order, notice, result)
+    session.add(AuditEvent(event_type="OmsWaybillPrinted", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps({"waybill_no": waybill_no, "attachment_id": proof.id if proof else None})))
+    record_integration_event(session, source_system="OMS", event_type="OMS_WAYBILL_PRINT", biz_key=notice.notice_no, payload=payload, trace_id=str(payload.get("trace_id") or ""), status="Succeeded", retry_count=notice.print_retry_count, response=result)
+    platform_job = enqueue_platform_fulfillment_sync(session, order, notice, trace_id=str(payload.get("trace_id") or ""))
+    return {
+        "notice_id": notice.id,
+        "order_id": order.id,
+        "waybill_no": waybill_no,
+        "attachment_id": proof.id if proof else None,
+        "platform_fulfillment_job_id": platform_job.id if platform_job is not None else None,
+    }
+
+
+def platform_fulfillment_required(order: MiddlePlatformOrder) -> bool:
+    if not order.platform_order_no:
+        return False
+    fulfillment_type = str(order.fulfillment_type or "").strip().upper()
+    if fulfillment_type == "PLATFORM_FULFILLED":
+        return False
+    return bool(order.channel_code or order.shop_code)
+
+
+def enqueue_platform_fulfillment_sync(session: Session, order: MiddlePlatformOrder, notice: DeliveryNotice, *, trace_id: str = "") -> ProcessingJob | None:
+    if not platform_fulfillment_required(order):
+        notice.platform_fulfillment_status = "NotRequired"
+        return None
+    if not notice.waybill_no:
+        return None
+    if notice.platform_fulfillment_status == "Synced" and notice.platform_fulfillment_synced_waybill_no == notice.waybill_no:
+        return None
+    if notice.platform_fulfillment_status in {"Pending", "Running"}:
+        return None
+    payload = {
+        "notice_id": notice.id,
+        "order_id": order.id,
+        "platform_order_no": order.platform_order_no,
+        "waybill_no": notice.waybill_no,
+        "trace_id": trace_id,
+        "retry_count": notice.platform_fulfillment_retry_count,
+    }
+    existing = (
+        session.query(ProcessingJob)
+        .filter(
+            ProcessingJob.job_type == "PLATFORM_FULFILLMENT_SYNC",
+            ProcessingJob.payload_json == dumps(payload),
+            ProcessingJob.status.in_(["Pending", "Running"]),
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    notice.platform_fulfillment_status = "Pending"
+    notice.platform_fulfillment_error = None
+    notice.updated_at = now_utc()
+    job = ProcessingJob(job_type="PLATFORM_FULFILLMENT_SYNC", payload_json=dumps(payload), status="Pending")
+    session.add(job)
+    session.add(AuditEvent(event_type="PlatformFulfillmentSyncQueued", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps(payload)))
+    record_integration_event(session, source_system=str(order.channel_code or "PLATFORM").upper(), event_type="PLATFORM_FULFILLMENT_SYNC", biz_key=str(order.platform_order_no or notice.notice_no), payload=payload, trace_id=trace_id, status="Pending", retry_count=notice.platform_fulfillment_retry_count)
+    return job
+
+
+def process_platform_fulfillment_sync(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    notice = session.get(DeliveryNotice, payload.get("notice_id"))
+    if notice is None:
+        raise RuntimeError("delivery notice not found")
+    order = session.get(MiddlePlatformOrder, notice.order_id)
+    if order is None:
+        raise RuntimeError("middle platform order not found")
+    if not platform_fulfillment_required(order):
+        notice.platform_fulfillment_status = "NotRequired"
+        notice.platform_fulfillment_error = None
+        return {"notice_id": notice.id, "order_id": order.id, "skipped": True, "reason": "platform_fulfillment_not_required"}
+    if not notice.waybill_no:
+        raise RuntimeError("运单号缺失，不允许回传平台履约")
+    if notice.platform_fulfillment_status == "Synced" and notice.platform_fulfillment_synced_waybill_no == notice.waybill_no:
+        return {"notice_id": notice.id, "order_id": order.id, "skipped": True, "reason": "already_synced", "waybill_no": notice.waybill_no}
+    notice.platform_fulfillment_status = "Running"
+    notice.updated_at = now_utc()
+    try:
+        result = push_platform_fulfillment(session, order, notice)
+    except Exception as exc:
+        return handle_platform_fulfillment_sync_failure(session, notice, order, str(exc), trace_id=str(payload.get("trace_id") or ""))
+    notice.platform_fulfillment_status = "Synced"
+    notice.platform_fulfillment_error = None
+    notice.platform_fulfillment_retry_count = 0
+    notice.platform_fulfillment_synced_at = now_utc()
+    notice.platform_fulfillment_synced_waybill_no = notice.waybill_no
+    notice.updated_at = now_utc()
+    session.add(
+        AuditEvent(
+            event_type="PlatformFulfillmentSynced",
+            related_object_type="DeliveryNotice",
+            related_object_id=notice.id,
+            detail=dumps(
+                {
+                    "platform_order_no": order.platform_order_no,
+                    "shop_code": order.shop_code,
+                    "channel_code": order.channel_code,
+                    "waybill_no": notice.waybill_no,
+                    "result": result,
+                }
+            ),
+        )
+    )
+    record_integration_event(
+        session,
+        source_system=str(order.channel_code or "PLATFORM").upper(),
+        event_type="PLATFORM_FULFILLMENT_SYNC",
+        biz_key=str(order.platform_order_no or notice.notice_no),
+        payload=payload,
+        trace_id=str(payload.get("trace_id") or ""),
+        status="Succeeded",
+        retry_count=notice.platform_fulfillment_retry_count,
+        response=result,
+    )
+    return {"notice_id": notice.id, "order_id": order.id, "waybill_no": notice.waybill_no, "platform_result": result}
+
+
+def push_platform_fulfillment(session: Session, order: MiddlePlatformOrder, notice: DeliveryNotice) -> dict[str, Any]:
+    payload = {
+        "platform_order_no": order.platform_order_no,
+        "shop_code": order.shop_code,
+        "channel_code": order.channel_code,
+        "waybill_no": notice.waybill_no,
+        "carrier": notice.logistic_code,
+        "notice_no": notice.notice_no,
+        "oms_order_no": notice.oms_order_no,
+    }
+    if config_bool(session, "platform_fulfillment_mock_success", True):
+        return {"ok": True, "mode": "mock", "payload": payload}
+    webhook_url = config_value(session, "platform_fulfillment_webhook_url", "").strip()
+    if not webhook_url:
+        raise RuntimeError("平台履约回传未配置 webhook 或渠道适配器")
+    raise RuntimeError("平台履约回传 webhook adapter 未启用，请配置具体渠道适配器")
+
+
+def handle_platform_fulfillment_sync_failure(session: Session, notice: DeliveryNotice, order: MiddlePlatformOrder, message: str, *, trace_id: str = "") -> dict[str, Any]:
+    notice.platform_fulfillment_retry_count += 1
+    notice.platform_fulfillment_error = message
+    notice.updated_at = now_utc()
+    max_retries = max(1, config_int(session, "platform_fulfillment_sync_max_retries", 3))
+    if notice.platform_fulfillment_retry_count >= max_retries:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"[DLQ_ALERT] Platform fulfillment sync failed permanently for order {order.order_no} / platform_order_no {order.platform_order_no} after {max_retries} retries. Error: {message}")
+        notice.platform_fulfillment_status = "Blocked"
+        create_exception_case(session, order, "OMS_STATUS_CONFLICT", "High", f"运单号回传平台失败：{message}", [], trace_id=trace_id or notice.id)
+        session.add(
+            AuditEvent(
+                event_type="PlatformFulfillmentSyncBlocked",
+                related_object_type="DeliveryNotice",
+                related_object_id=notice.id,
+                detail=dumps({"error": message, "retry_count": notice.platform_fulfillment_retry_count, "waybill_no": notice.waybill_no}),
+            )
+        )
+        record_integration_event(
+            session,
+            source_system=str(order.channel_code or "PLATFORM").upper(),
+            event_type="PLATFORM_FULFILLMENT_SYNC",
+            biz_key=str(order.platform_order_no or notice.notice_no),
+            payload={"notice_id": notice.id, "order_id": order.id, "platform_order_no": order.platform_order_no, "waybill_no": notice.waybill_no},
+            trace_id=trace_id,
+            status="Dead",
+            retry_count=notice.platform_fulfillment_retry_count,
+            error_message=message,
+        )
+        return {"notice_id": notice.id, "order_id": order.id, "blocked": True, "error": message}
+    notice.platform_fulfillment_status = "Retrying"
+    next_retry_at = calculate_next_retry_at(session, notice.platform_fulfillment_retry_count)
+    payload = {
+        "notice_id": notice.id,
+        "order_id": order.id,
+        "platform_order_no": order.platform_order_no,
+        "waybill_no": notice.waybill_no,
+        "trace_id": trace_id,
+        "retry_count": notice.platform_fulfillment_retry_count,
+    }
+    session.add(ProcessingJob(job_type="PLATFORM_FULFILLMENT_SYNC", payload_json=dumps(payload), status="Pending", next_retry_at=next_retry_at))
+    session.add(
+        AuditEvent(
+            event_type="PlatformFulfillmentSyncRetryQueued",
+            related_object_type="DeliveryNotice",
+            related_object_id=notice.id,
+            detail=dumps({"error": message, "retry_count": notice.platform_fulfillment_retry_count, "next_retry_at": next_retry_at.isoformat()}),
+        )
+    )
+    record_integration_event(
+        session,
+        source_system=str(order.channel_code or "PLATFORM").upper(),
+        event_type="PLATFORM_FULFILLMENT_SYNC",
+        biz_key=str(order.platform_order_no or notice.notice_no),
+        payload=payload,
+        trace_id=trace_id,
+        status="Retrying",
+        retry_count=notice.platform_fulfillment_retry_count,
+        error_message=message,
+    )
+    return {"notice_id": notice.id, "order_id": order.id, "retrying": True, "next_retry_at": next_retry_at.isoformat(), "error": message}
+
+
+def print_oms_waybill(session: Session, notice: DeliveryNotice) -> dict[str, Any]:
+    payload = {
+        "deliveryNo": notice.oms_order_no or notice.notice_no,
+        "printType": "pdf",
+        "needLabelCode": True,
+    }
+    if not config_bool(session, "oms_enabled", False) or config_bool(session, "oms_mock_success", True):
+        return {"ok": True, "mode": "mock", "data": {"waybillNo": f"MOCK-{notice.notice_no}", "printData": ""}, "raw": {"request": payload}}
+    client = jackyun_client_from_session(session)
+    result = client.print_delivery_label(payload)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("message") or dumps(result.get("raw", result)))
+    return result
+
+
+def extract_waybill_no(result: dict[str, Any]) -> str:
+    for container in [result.get("data"), result.get("raw"), result]:
+        if not isinstance(container, dict):
+            continue
+        for key in ("waybillNo", "waybill_no", "waybill", "trackingNo", "tracking_no", "logisticsNo"):
+            value = str(container.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def extract_print_data(result: dict[str, Any]) -> str:
+    for container in [result.get("data"), result.get("raw"), result]:
+        if not isinstance(container, dict):
+            continue
+        for key in ("printData", "print_data", "pdf", "pdfBase64", "labelData", "url"):
+            value = str(container.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def save_waybill_outbound_proof(session: Session, order: MiddlePlatformOrder, notice: DeliveryNotice, result: dict[str, Any]) -> OrderAttachment | None:
+    crm_order = order.crm_order
+    waybill_no = extract_waybill_no(result)
+    print_data = extract_print_data(result)
+    fingerprint = hashlib.sha256(f"OutboundProof|{notice.id}|{waybill_no}".encode("utf-8")).hexdigest()
+    existing = (
+        session.query(OrderAttachment)
+        .filter(
+            OrderAttachment.source_system == order.source_system,
+            OrderAttachment.crm_order_id == order.crm_order_id,
+            OrderAttachment.payload_hash == order.payload_hash,
+            OrderAttachment.fingerprint == fingerprint,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    evidence: dict[str, Any] = {
+        "source": "wms-cross.delivery.print",
+        "notice_id": notice.id,
+        "notice_no": notice.notice_no,
+        "oms_order_no": notice.oms_order_no,
+        "waybill_no": waybill_no,
+    }
+    file_url = None
+    file_name = f"{notice.notice_no}-waybill.pdf"
+    if print_data.startswith(("http://", "https://")):
+        file_url = print_data
+        file_name = f"{notice.notice_no}-waybill.url"
+        evidence["external_url"] = print_data
+    elif print_data:
+        try:
+            content = base64.b64decode(print_data, validate=True)
+            storage_ref, digest = save_attachment(file_name, content)
+            evidence["local_storage_ref"] = storage_ref
+            evidence["local_file_hash"] = digest
+            evidence["local_file_size"] = len(content)
+        except Exception as exc:
+            evidence["print_data_unstored"] = {"reason": str(exc)[:500], "sha256": hashlib.sha256(print_data.encode("utf-8")).hexdigest()}
+    attachment = OrderAttachment(
+        crm_sales_order_id=crm_order.id if crm_order else None,
+        source_system=order.source_system,
+        crm_order_id=order.crm_order_id,
+        crm_order_no=order.crm_order_no,
+        payload_hash=order.payload_hash,
+        attachment_type="OutboundProof",
+        file_name=file_name,
+        file_url=file_url,
+        source_file_id=notice.id,
+        fingerprint=fingerprint,
+        parse_status="Registered",
+        evidence_json=dumps(evidence),
+        raw_json=dumps({"waybill_no": waybill_no, "print_result": result}),
+    )
+    session.add(attachment)
+    session.flush()
+    return attachment
+
+
+def handle_oms_waybill_print_failure(session: Session, notice: DeliveryNotice, order: MiddlePlatformOrder, message: str, *, trace_id: str = "") -> dict[str, Any]:
+    notice.print_retry_count += 1
+    notice.print_error = message
+    notice.updated_at = now_utc()
+    max_retries = max(1, config_int(session, "oms_waybill_print_max_retries", 3))
+    if notice.print_retry_count >= max_retries:
+        notice.print_status = "Blocked"
+        create_exception_case(session, order, "OMS_STATUS_CONFLICT", "High", f"跨境面单打印失败：{message}", [], trace_id=trace_id or notice.id)
+        session.add(AuditEvent(event_type="OmsWaybillPrintBlocked", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps({"error": message, "retry_count": notice.print_retry_count})))
+        record_integration_event(
+            session,
+            source_system="OMS",
+            event_type="OMS_WAYBILL_PRINT",
+            biz_key=notice.notice_no,
+            payload={"notice_id": notice.id, "order_id": order.id, "trace_id": trace_id},
+            trace_id=trace_id,
+            status="Dead",
+            retry_count=notice.print_retry_count,
+            error_message=message,
+        )
+        return {"notice_id": notice.id, "order_id": order.id, "blocked": True, "error": message}
+    notice.print_status = "Retrying"
+    next_retry_at = calculate_next_retry_at(session, notice.print_retry_count)
+    payload = {"notice_id": notice.id, "order_id": order.id, "trace_id": trace_id, "retry_count": notice.print_retry_count}
+    session.add(ProcessingJob(job_type="OMS_WAYBILL_PRINT", payload_json=dumps(payload), status="Pending", next_retry_at=next_retry_at))
+    session.add(AuditEvent(event_type="OmsWaybillPrintRetryQueued", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps({"error": message, "retry_count": notice.print_retry_count, "next_retry_at": next_retry_at.isoformat()})))
+    record_integration_event(session, source_system="OMS", event_type="OMS_WAYBILL_PRINT", biz_key=notice.notice_no, payload=payload, trace_id=trace_id, status="Retrying", retry_count=notice.print_retry_count, error_message=message)
+    return {"notice_id": notice.id, "order_id": order.id, "retrying": True, "next_retry_at": next_retry_at.isoformat(), "error": message}
+
+
+def poll_oms_status_updates(session: Session, *, limit: int = 50) -> dict[str, Any]:
+    if not config_bool(session, "oms_enabled", False) or config_bool(session, "oms_mock_success", True):
+        return {"skipped": True, "reason": "oms_disabled_or_mock", "checked": 0, "updated": 0, "failed": 0}
+    client = jackyun_client_from_session(session)
+    notices = (
+        session.query(DeliveryNotice)
+        .filter(DeliveryNotice.status.in_(["Accepted", "Picking"]))
+        .order_by(DeliveryNotice.updated_at)
+        .limit(max(1, limit))
+        .all()
+    )
+    checked = 0
+    updated = 0
+    failed: list[dict[str, str]] = []
+    for notice in notices:
+        checked += 1
+        query_payload = {"pageIndex": 1, "pageSize": 20, "erporderNo": notice.notice_no}
+        if notice.oms_order_no:
+            query_payload["orderNo"] = notice.oms_order_no
+        result = client.query_delivery_orders(query_payload)
+        if not result.get("ok"):
+            failed.append({"notice_id": notice.id, "error": str(result.get("message") or result.get("code") or "query failed")})
+            continue
+        candidate = match_oms_order_candidate(notice, extract_oms_order_candidates(result.get("data")) + extract_oms_order_candidates(result.get("raw")))
+        if candidate is None:
+            failed.append({"notice_id": notice.id, "error": "oms order not found"})
+            continue
+        oms_status = oms_candidate_status(candidate)
+        if not oms_status:
+            failed.append({"notice_id": notice.id, "error": "oms status missing"})
+            continue
+        before_status = session.get(MiddlePlatformOrder, notice.order_id).status if notice.order_id else ""
+        process_oms_status_update(
+            session,
+            {
+                "notice_id": notice.id,
+                "oms_status": oms_status,
+                "oms_order_no": candidate.get("orderNo") or candidate.get("order_no") or notice.oms_order_no,
+                "raw": candidate,
+                "trace_id": "oms-status-poll",
+            },
+        )
+        after_status = session.get(MiddlePlatformOrder, notice.order_id).status if notice.order_id else ""
+        if after_status != before_status or notice.status in {"Picking", "Shipped"}:
+            updated += 1
+    return {"skipped": False, "checked": checked, "updated": updated, "failed": len(failed), "failures": failed[:20]}
+
+
+def match_oms_order_candidate(notice: DeliveryNotice, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for candidate in candidates:
+        erp_no = str(candidate.get("erporderNo") or candidate.get("erp_order_no") or candidate.get("outerOrderNo") or "").strip()
+        oms_no = str(candidate.get("orderNo") or candidate.get("order_no") or candidate.get("tradeNo") or candidate.get("trade_no") or "").strip()
+        if erp_no and erp_no == notice.notice_no:
+            return candidate
+        if notice.oms_order_no and oms_no and oms_no == notice.oms_order_no:
+            return candidate
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def oms_candidate_status(candidate: dict[str, Any]) -> str:
+    for key in ("deliveryStatus", "delivery_status", "orderStatus", "order_status", "wmsStatus", "status", "processStatus"):
+        value = str(candidate.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def resolve_delivery_notice_for_oms_status(session: Session, payload: dict[str, Any]) -> DeliveryNotice | None:
@@ -1389,23 +2225,135 @@ def handle_oms_push_failure(session: Session, notice: DeliveryNotice, order: Mid
     if notice.retry_count >= max_retries:
         notice.status = "Blocked"
         transition_order(session, order, OrderEvent.RETRY_REACHED_MAX_RETRIES, detail={"notice_no": notice.notice_no, "error": message})
-        create_exception_case(session, order, "OMS_BLOCKED", "Critical", message, [], trace_id=notice.oms_idempotency_key)
+        exception_case = create_exception_case(session, order, "OMS_BLOCKED", "Critical", message, [], trace_id=notice.oms_idempotency_key)
+        enqueue_oms_blocked_notification(session, order, notice, exception_case, message)
+        record_integration_event(
+            session,
+            source_system="OMS",
+            event_type="OMS_PUSH_NOTICE",
+            biz_key=notice.notice_no,
+            payload=oms_push_job_payload(order, notice),
+            trace_id=notice.oms_idempotency_key,
+            status="Dead",
+            retry_count=notice.retry_count,
+            error_message=message,
+        )
         return {"notice_id": notice.id, "order_id": order.id, "status": order.status, "blocked": True}
     notice.status = "Retrying"
     notice.next_retry_at = calculate_next_retry_at(session, notice.retry_count)
     event = OrderEvent.FIRST_OMS_PUSH_FAILED if order.status == OrderStatus.OMS_PENDING.value else OrderEvent.RETRY_FAILED_BUT_UNDER_MAX_RETRIES
     transition_order(session, order, event, detail={"notice_no": notice.notice_no, "error": message, "next_retry_at": notice.next_retry_at.isoformat()})
-    payload = {"notice_id": notice.id, "order_id": notice.order_id, "idempotency_key": notice.oms_idempotency_key}
+    payload = oms_push_job_payload(order, notice)
     session.add(ProcessingJob(job_type="OMS_PUSH_NOTICE", payload_json=dumps(payload), status="Pending", next_retry_at=notice.next_retry_at))
+    record_integration_event(
+        session,
+        source_system="OMS",
+        event_type="OMS_PUSH_NOTICE",
+        biz_key=notice.notice_no,
+        payload=payload,
+        trace_id=notice.oms_idempotency_key,
+        status="Retrying",
+        retry_count=notice.retry_count,
+        error_message=message,
+    )
     return {"notice_id": notice.id, "order_id": order.id, "status": order.status, "next_retry_at": notice.next_retry_at.isoformat()}
+
+
+def enqueue_oms_blocked_notification(
+    session: Session,
+    order: MiddlePlatformOrder,
+    notice: DeliveryNotice,
+    exception_case: ExceptionCase,
+    message: str,
+) -> OutboundMailJob | None:
+    if not config_bool(session, "v2_oms_blocked_notification_enabled", True):
+        return None
+    to_addresses, cc_addresses = oms_blocked_recipients(session)
+    if not to_addresses:
+        session.add(
+            AuditEvent(
+                event_type="OmsBlockedNotificationSkipped",
+                related_object_type="DeliveryNotice",
+                related_object_id=notice.id,
+                detail=dumps({"reason": "missing_recipients", "exception_case_id": exception_case.id}),
+            )
+        )
+        return None
+    digest_source = "|".join([notice.id, str(notice.retry_count), message])
+    idempotency_key = f"v2-oms-blocked:{hashlib.sha256(digest_source.encode('utf-8')).hexdigest()}"
+    existing = session.query(OutboundMailJob).filter(OutboundMailJob.idempotency_key == idempotency_key).first()
+    if existing is not None:
+        return existing
+    subject = f"[OMS下推阻塞][{order.crm_order_no or order.order_no}] {notice.notice_no}"
+    body = build_oms_blocked_mail_body(session, order, notice, exception_case, message)
+    job = OutboundMailJob(
+        mail_type="V2OmsBlocked",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=subject,
+        body=body,
+        idempotency_key=idempotency_key,
+        status="Pending",
+        priority=10,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type="OmsBlockedNotificationQueued",
+            related_object_type="DeliveryNotice",
+            related_object_id=notice.id,
+            detail=dumps({"to": to_addresses, "cc": cc_addresses, "exception_case_id": exception_case.id}),
+        )
+    )
+    return job
+
+
+def oms_blocked_recipients(session: Session) -> tuple[list[str], list[str]]:
+    configured_to = config_list(session, "v2_oms_blocked_to_json", [])
+    configured_cc = config_list(session, "v2_oms_blocked_cc_json", [])
+    if configured_to or configured_cc:
+        return unique_emails(configured_to), unique_emails(configured_cc)
+    return validation_failure_recipients(session)
+
+
+def build_oms_blocked_mail_body(
+    session: Session,
+    order: MiddlePlatformOrder,
+    notice: DeliveryNotice,
+    exception_case: ExceptionCase,
+    message: str,
+) -> str:
+    lines = [
+        "相关同事好，",
+        "",
+        "OMS/WMS 发货单下推重试已达到上限，系统已冻结自动重试并生成高危异常，避免重复建单或错发。",
+        "",
+        f"中台订单号：{order.order_no}",
+        f"CRM 订单号：{order.crm_order_no or ''}",
+        f"客户名称：{order.customer_name or ''}",
+        f"发货通知单：{notice.notice_no}",
+        f"发货通知状态：{notice.status}",
+        f"重试次数：{notice.retry_count}/{notice.max_retries}",
+        f"异常编号：{exception_case.id}",
+        f"失败原因：{message}",
+        "",
+        "处理建议：",
+        "- 先核对 OMS 是否已存在同一幂等键或发货单号，避免重复创建。",
+        "- 修复主数据、仓库、接口配置或订单字段后，在异常台填写修复证据并重放 OMS。",
+        "- 未确认下游状态前，不要手工关闭高危异常。",
+        "",
+        config_value(session, "bot_signature", "积木易搭AI机器人"),
+    ]
+    return "\n".join(lines)
 
 
 def calculate_next_retry_at(session: Session, retry_count: int) -> datetime:
     base_delay = max(1, config_int(session, "oms_retry_base_delay_seconds", 60))
     multiplier = max(1, config_int(session, "oms_retry_multiplier", 3))
-    jitter = random.randint(-5, 5)
-    wait_seconds = max(1, base_delay * (multiplier ** max(0, retry_count - 1)) + jitter)
-    return now_utc() + timedelta(seconds=wait_seconds)
+    return next_retry_at(
+        retry_count,
+        RetryPolicy(base_delay_seconds=base_delay, multiplier=multiplier, max_delay_seconds=None, jitter_seconds=5),
+    )
 
 
 def create_exception_case(
@@ -1636,6 +2584,11 @@ def build_context_pack(
 ) -> dict[str, Any]:
     failed = [result.as_dict() for result in validation_results if not result.passed]
     failed_results = [result for result in validation_results if not result.passed]
+    policy = exception_policy(exception_type, severity)
+    evidence_summary = validation_evidence_summary(session, order)
+    evidence_refs = []
+    for result in failed:
+        evidence_refs.extend(result.get("evidenceRefs") or [])
     return {
         "context_type": "V2_ORDER_EXCEPTION",
         "trace_id": trace_id,
@@ -1645,7 +2598,12 @@ def build_context_pack(
             "summary": reason,
             "risk_level": severity,
             "likely_reason": reason,
+            "source_system": policy["source_system"],
+            "responsible_role": policy["responsible_role"],
+            "can_auto_retry": policy["can_auto_retry"],
+            "freeze_order_flow": policy["freeze_order_flow"],
             "suggested_actions": suggested_actions(exception_type, failed),
+            "evidence_refs": list(dict.fromkeys(evidence_refs + evidence_summary)),
         },
         "order": {
             "order_no": order.order_no,
@@ -1659,9 +2617,34 @@ def build_context_pack(
         "validation": {
             "failed_rules": failed,
             "missing_materials": classify_validation_missing_materials(failed_results),
-            "evidence_summary": validation_evidence_summary(session, order),
+            "evidence_summary": evidence_summary,
         },
     }
+
+
+def exception_policy(exception_type: str, severity: str) -> dict[str, Any]:
+    policies: dict[str, dict[str, Any]] = {
+        "VALIDATION_BLOCKED": {"source_system": "CRM", "responsible_role": "商务/销售", "can_auto_retry": False, "freeze_order_flow": True},
+        "SKU_MAPPING_MISSING": {"source_system": "CRM", "responsible_role": "商品/主数据管理员", "can_auto_retry": False, "freeze_order_flow": True},
+        "OMS_REQUIRED_FIELDS_MISSING": {"source_system": "OMS", "responsible_role": "物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        "OMS_BLOCKED": {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        "OMS_STATUS_CONFLICT": {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": True, "freeze_order_flow": True},
+        "CRM_CHANGED_AFTER_OMS_ACCEPTED": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CHANGED_DURING_OMS_PENDING": {"source_system": "CRM", "responsible_role": "商务/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CHANGED_DURING_OMS_RETRY": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CHANGED_DURING_PICKING": {"source_system": "CRM", "responsible_role": "商务主管/仓库/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CANCELLED_AFTER_OMS_ACCEPTED": {"source_system": "CRM", "responsible_role": "商务主管/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CANCELLED_DURING_OMS_PENDING": {"source_system": "CRM", "responsible_role": "商务/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CANCELLED_DURING_OMS_RETRY": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        "CRM_CHANGED_AFTER_SHIPPED": {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
+        "CRM_CANCELLED_AFTER_SHIPPED": {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
+        "MANUAL_REPLAY_WITHOUT_FIX": {"source_system": "Manual", "responsible_role": "商务/IT", "can_auto_retry": False, "freeze_order_flow": True},
+    }
+    default_source = "System" if severity in {"Low", "Medium"} else "CRM"
+    return policies.get(
+        exception_type,
+        {"source_system": default_source, "responsible_role": "商务/IT", "can_auto_retry": severity in {"Low", "Medium"}, "freeze_order_flow": severity in {"High", "Critical"}},
+    )
 
 
 def suggested_actions(exception_type: str, failed: list[dict[str, Any]]) -> list[str]:
@@ -1696,8 +2679,16 @@ def order_dashboard(session: Session) -> dict[str, Any]:
     }
 
 
-def list_middle_orders(session: Session, *, q: str = "", status: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def list_middle_orders(session: Session, *, q: str = "", status: str = "", page: int = 1, page_size: int = 20, current_user: User | None = None) -> dict[str, Any]:
     query = session.query(MiddlePlatformOrder)
+    
+    # Enforce data visibility scope for sales/business operators
+    if current_user is not None and hasattr(current_user, "role") and current_user.role == "business_operator":
+        filter_expr = (MiddlePlatformOrder.sales_user_name == current_user.username)
+        if current_user.department:
+            filter_expr = filter_expr | MiddlePlatformOrder.crm_order.has(CrmSalesOrder.owner_department.ilike(current_user.department))
+        query = query.filter(filter_expr)
+
     if q.strip():
         pattern = f"%{q.strip()}%"
         query = query.filter(
@@ -1712,7 +2703,7 @@ def list_middle_orders(session: Session, *, q: str = "", status: str = "", page:
     total = query.count()
     rows = query.order_by(MiddlePlatformOrder.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
     return {
-        "items": [serialize_middle_order(row) for row in rows],
+        "items": [serialize_middle_order(row, current_user=current_user) for row in rows],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -1722,17 +2713,26 @@ def list_middle_orders(session: Session, *, q: str = "", status: str = "", page:
     }
 
 
-def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool = False) -> dict[str, Any]:
+def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool = False, current_user: User | None = None) -> dict[str, Any]:
+    sales_user = order.sales_user_name
+    dept = order.crm_order.owner_department if order.crm_order else None
+    mask = should_mask_financials(current_user, sales_user, dept)
+
     data = {
         "id": order.id,
         "order_no": order.order_no,
         "crm_sales_order_id": order.crm_sales_order_id,
         "crm_order_id": order.crm_order_id,
         "crm_order_no": order.crm_order_no,
+        "source_policy": order.source_policy,
+        "platform_order_no": order.platform_order_no,
+        "shop_code": order.shop_code,
+        "channel_code": order.channel_code,
+        "fulfillment_type": order.fulfillment_type,
         "customer_name": order.customer_name,
         "sales_user_name": order.sales_user_name,
         "currency": order.currency,
-        "order_amount": str(order.order_amount) if order.order_amount is not None else None,
+        "order_amount": "***" if mask else (str(order.order_amount) if order.order_amount is not None else None),
         "status": order.status,
         "validation_summary": loads(order.validation_summary_json, {}),
         "version": order.version,
@@ -1744,10 +2744,12 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
             {
                 "id": item.id,
                 "sku_code": item.sku_code,
+                "shop_sku_code": item.shop_sku_code,
+                "channel_code": item.channel_code,
                 "product_name": item.product_name,
                 "quantity": str(item.quantity) if item.quantity is not None else None,
-                "unit_price": str(item.unit_price) if item.unit_price is not None else None,
-                "line_amount": str(item.line_amount) if item.line_amount is not None else None,
+                "unit_price": "***" if mask else (str(item.unit_price) if item.unit_price is not None else None),
+                "line_amount": "***" if mask else (str(item.line_amount) if item.line_amount is not None else None),
             }
             for item in order.items
         ]
@@ -1755,6 +2757,8 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
             {
                 "id": notice.id,
                 "notice_no": notice.notice_no,
+                "notice_version": notice.notice_version,
+                "source_snapshot_hash": notice.source_snapshot_hash,
                 "status": notice.status,
                 "oms_method": notice.oms_method,
                 "oms_order_no": notice.oms_order_no,
@@ -1762,6 +2766,15 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
                 "warehouse_code": notice.warehouse_code,
                 "shop_code": notice.shop_code,
                 "logistic_code": notice.logistic_code,
+                "waybill_no": notice.waybill_no,
+                "print_status": notice.print_status,
+                "print_error": notice.print_error,
+                "print_retry_count": notice.print_retry_count,
+                "platform_fulfillment_status": notice.platform_fulfillment_status,
+                "platform_fulfillment_error": notice.platform_fulfillment_error,
+                "platform_fulfillment_retry_count": notice.platform_fulfillment_retry_count,
+                "platform_fulfillment_synced_waybill_no": notice.platform_fulfillment_synced_waybill_no,
+                "platform_fulfillment_synced_at": notice.platform_fulfillment_synced_at.isoformat() if notice.platform_fulfillment_synced_at else None,
                 "retry_count": notice.retry_count,
                 "next_retry_at": notice.next_retry_at.isoformat() if notice.next_retry_at else None,
                 "last_error": notice.last_error,
@@ -1770,6 +2783,7 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
                 "confirmed_by": notice.confirmed_by,
                 "confirmed_at": notice.confirmed_at.isoformat() if notice.confirmed_at else None,
                 "pushed_at": notice.pushed_at.isoformat() if notice.pushed_at else None,
+                "version": notice.version,
             }
             for notice in order.delivery_notices
         ]

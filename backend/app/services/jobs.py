@@ -12,8 +12,39 @@ from backend.app.services.crm_sync import run_crm_sales_order_sync
 from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.exception_diagnosis import diagnose_exception_case
 from backend.app.services.jsonutil import loads
-from backend.app.services.order_middle_platform import DuplicateEventException, process_crm_order_parsed_event, process_oms_push_notice, process_oms_status_update
+from backend.app.services.order_middle_platform import DuplicateEventException, poll_oms_status_updates, process_crm_order_parsed_event, process_oms_push_notice, process_oms_status_update, process_oms_waybill_print, process_platform_fulfillment_sync
 from backend.app.services.workflow import process_inbound_mail
+
+
+def run_platform_sync_async(job_id: str, payload: dict) -> None:
+    from backend.app.database import SessionLocal
+    from backend.app.services.order_middle_platform import process_platform_fulfillment_sync
+    import logging
+    logger = logging.getLogger(__name__)
+
+    with SessionLocal() as db_session:
+        job = db_session.get(ProcessingJob, job_id)
+        if not job:
+            return
+        try:
+            process_platform_fulfillment_sync(db_session, payload)
+            job.status = "Completed"
+            job.error_message = None
+            clear_processing_lock(job)
+            job.version += 1
+            job.updated_at = now_utc()
+            db_session.commit()
+        except Exception as exc:
+            db_session.rollback()
+            job = db_session.get(ProcessingJob, job_id)
+            if job:
+                job.status = "Failed"
+                job.error_message = str(exc)
+                clear_processing_lock(job)
+                job.version += 1
+                job.updated_at = now_utc()
+                db_session.commit()
+            logger.exception(f"Async platform fulfillment sync failed for job {job_id}: {exc}")
 
 
 def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
@@ -41,6 +72,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 {
                     "status": "Running",
                     "attempt_count": ProcessingJob.attempt_count + 1,
+                    "version": ProcessingJob.version + 1,
                     "locked_by": worker,
                     "locked_until": now_utc() + timedelta(seconds=settings.processing_job_lease_seconds),
                     "started_at": now_utc(),
@@ -52,12 +84,13 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
         session.commit()
         if claimed != 1:
             continue
+        session.expire_all()
         handled += 1
         job = session.get(ProcessingJob, job_id)
         if job is None:
             continue
         duplicate = None
-        if job.job_type != "OMS_PUSH_NOTICE":
+        if job.job_type != "OMS_PUSH_NOTICE" and job.job_type != "PLATFORM_FULFILLMENT_SYNC":
             duplicate = (
                 session.query(ProcessingJob)
                 .filter(
@@ -76,6 +109,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
         if duplicate is not None:
             job.status = "Completed"
             job.error_message = f"Skipped duplicate processing job {duplicate.id}"
+            job.version += 1
             job.updated_at = now_utc()
             completed += 1
             session.commit()
@@ -100,6 +134,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                     job.status = "Completed"
                     clear_processing_lock(job)
                     completed += 1
+                    job.version += 1
                     job.updated_at = now_utc()
                     session.commit()
                     continue
@@ -107,6 +142,23 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 process_oms_push_notice(session, loads(job.payload_json, {}))
             elif job.job_type == "OMS_STATUS_SYNC":
                 process_oms_status_update(session, loads(job.payload_json, {}))
+            elif job.job_type == "OMS_STATUS_POLL":
+                poll_oms_status_updates(session, limit=int(payload.get("limit") or 50))
+            elif job.job_type == "OMS_WAYBILL_PRINT":
+                process_oms_waybill_print(session, payload)
+            elif job.job_type == "PLATFORM_FULFILLMENT_SYNC":
+                from backend.app.services.order_middle_platform import config_bool
+                if config_bool(session, "platform_fulfillment_sync_async", True):
+                    import threading
+                    thread = threading.Thread(
+                        target=run_platform_sync_async,
+                        args=(job.id, payload),
+                        name=f"platform-sync-{job.id}"
+                    )
+                    thread.start()
+                    continue
+                else:
+                    process_platform_fulfillment_sync(session, payload)
             elif job.job_type == "DIAGNOSE_EXCEPTION":
                 diagnose_exception_case(session, str(payload.get("exception_id") or ""))
             else:
@@ -115,6 +167,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
             job.error_message = None
             clear_processing_lock(job)
             completed += 1
+            job.version += 1
             job.updated_at = now_utc()
             session.commit()
         except Exception as exc:
@@ -125,6 +178,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
             job.status = "Failed"
             job.error_message = str(exc)
             clear_processing_lock(job)
+            job.version += 1
             job.updated_at = now_utc()
             failed += 1
             session.commit()
@@ -152,6 +206,7 @@ def recover_stale_processing_jobs(session: Session) -> int:
         job.status = "Pending"
         job.error_message = "processing lease expired; job returned to pending"
         clear_processing_lock(job)
+        job.version += 1
         job.updated_at = now
     if stale_jobs:
         session.commit()

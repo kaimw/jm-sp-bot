@@ -116,10 +116,13 @@ def call_model(
     related_object_id: str | None = None,
     stream: bool = False,
     timeout_seconds: float | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     api_key = resolve_api_key(session, config)
     started = time.perf_counter()
     payload = build_openai_chat_payload(config.model_name, messages)
+    if response_format:
+        payload["response_format"] = response_format
     request_timeout = _resolve_timeout_seconds(timeout_seconds)
     status = "Success"
     output: dict[str, Any] | None = None

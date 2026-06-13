@@ -98,6 +98,7 @@ from backend.app.services.workflow import (
     set_weekly_report_recipients,
     weekly_report_recipients,
 )
+from backend.app.services.task_scheduler import RetryPolicy, TaskScheduler
 from backend.app.services.workflow_rules import (
     activate_workflow_version,
     deactivate_workflow_version,
@@ -112,7 +113,7 @@ from backend.app.services.workflow_rules import (
     workflow_binding_for_requirement,
     workflow_version_diff,
 )
-from backend.app.main import assign_exception, reopen_exception, resolve_exception, serialize_exception
+from backend.app.main import assign_exception, diagnose_exception_stream_chunks, global_exception_ticker_items, reopen_exception, resolve_exception, serialize_exception
 from backend.app.schemas import ExceptionAssignRequest, ExceptionReopenRequest, ExceptionResolveRequest
 from backend.app.models import now_utc
 from backend.app.main import self_maintenance_action_detail
@@ -481,12 +482,15 @@ def test_processing_job_runs_erp_material_sync(monkeypatch):
         ),
         session,
     )
-    session.add(ProcessingJob(job_type="sync_erp_materials", payload_json=dumps({"source": "test"}), status="Pending"))
+    job = ProcessingJob(job_type="sync_erp_materials", payload_json=dumps({"source": "test"}), status="Pending")
+    session.add(job)
     session.commit()
 
     result = run_pending_jobs(session)
+    session.refresh(job)
 
     assert result["completed"] == 1
+    assert job.version == 2
     assert session.query(ProductSPU).filter_by(spu_id="MAT-JOB").one().name == "队列物料"
     assert session.query(ProcessingJob).filter_by(job_type="sync_erp_materials", status="Completed").count() == 1
 
@@ -2815,7 +2819,19 @@ def test_stale_processing_job_returns_to_pending_then_runs():
     assert result == {"completed": 0, "failed": 1, "total": 1}
     assert stale.status == "Failed"
     assert stale.attempt_count == 2
+    assert stale.version == 3
     assert stale.locked_by is None
+
+
+def test_task_scheduler_applies_exponential_backoff_cap_and_jitter():
+    now = datetime(2026, 6, 13, tzinfo=timezone.utc)
+    scheduler = TaskScheduler(RetryPolicy(base_delay_seconds=60, multiplier=3, max_delay_seconds=500, jitter_seconds=0))
+    assert scheduler.delay_seconds(1) == 60
+    assert scheduler.delay_seconds(3) == 500
+    assert scheduler.next_retry_at(2, now=now) == now + timedelta(seconds=180)
+
+    jittered = TaskScheduler(RetryPolicy(base_delay_seconds=60, multiplier=3, max_delay_seconds=None, jitter_seconds=5))
+    assert 55 <= jittered.delay_seconds(1) <= 65
 
 
 def test_smtp_send_skips_when_bot_disabled():
@@ -3321,6 +3337,8 @@ def test_exception_lifecycle_assign_resolve_reopen_tracks_sla_and_audit():
     resolved = resolve_exception(case.id, ExceptionResolveRequest(note="CRM 已补齐", actor="ops@example.com"), session)
     assert resolved["status"] == "Resolved"
     assert resolved["resolution_note"] == "CRM 已补齐"
+    assert resolved["resolution_evidence"]["type"] == "MANUAL_EXCEPTION_RESOLUTION"
+    assert resolved["resolution_evidence"]["evidence_refs"] == ["异常详情：缺少客户资料"]
     assert resolved["resolved_at"]
     assert resolved["sla_status"] == "resolved"
 
@@ -3334,6 +3352,85 @@ def test_exception_lifecycle_assign_resolve_reopen_tracks_sla_and_audit():
     assert events == ["ExceptionAssigned", "ExceptionResolved", "ExceptionReopened"]
     serialized = serialize_exception(session.get(ExceptionCase, case.id))
     assert serialized["last_actor"] == "manager"
+
+
+def test_high_risk_exception_resolution_requires_confirmation_actor_and_note():
+    session = make_session()
+    case = ExceptionCase(
+        exception_type="CRM_CHANGED_AFTER_OMS_ACCEPTED",
+        severity="Critical",
+        detail=dumps({"message": "OMS 已接收后 CRM 被编辑"}),
+        status="Open",
+        due_at=now_utc() + timedelta(hours=2),
+    )
+    session.add(case)
+    session.commit()
+
+    with pytest.raises(Exception) as exc_info:
+        resolve_exception(case.id, ExceptionResolveRequest(note="处理", actor="operator"), session)
+    assert getattr(exc_info.value, "status_code", None) == 403
+    assert session.query(ExceptionCase).filter_by(id=case.id).one().status == "Open"
+    audit = session.query(AuditEvent).filter_by(event_type="UNAUTHORIZED_STATE_OVERRIDE", related_object_id=case.id).one()
+    assert "责任人身份" in audit.detail
+
+    resolved = resolve_exception(
+        case.id,
+        ExceptionResolveRequest(note="已核对 OMS 单据并由商务主管确认", actor="ops@example.com", confirm_risk=True),
+        session,
+    )
+    assert resolved["status"] == "Resolved"
+    assert resolved["requires_confirmation"] is True
+    assert resolved["last_actor"] == "ops@example.com"
+    assert resolved["resolution_evidence"]["type"] == "MANUAL_EXCEPTION_RESOLUTION"
+    assert resolved["resolution_evidence"]["evidence_refs"] == ["异常详情：OMS 已接收后 CRM 被编辑"]
+
+
+def test_global_exception_ticker_prioritizes_p0_sla_and_dead_letters():
+    session = make_session()
+    overdue = ExceptionCase(
+        exception_type="CRM_CHANGED_AFTER_OMS_ACCEPTED",
+        severity="Critical",
+        detail=dumps({"message": "OMS 已接收后 CRM 变更"}),
+        status="Open",
+        due_at=now_utc() - timedelta(minutes=5),
+    )
+    medium = ExceptionCase(
+        exception_type="ReviewNeedManual",
+        severity="Medium",
+        detail=dumps({"message": "普通异常"}),
+        status="Open",
+    )
+    failed_job = ProcessingJob(job_type="OMS_PUSH_NOTICE", payload_json=dumps({"notice_id": "demo"}), status="Failed", error_message="OMS timeout")
+    failed_mail = OutboundMailJob(mail_type="V2OmsBlocked", to_json=dumps(["ops@example.com"]), cc_json=dumps([]), subject="OMS 阻塞", body="body", status="Failed", idempotency_key="ticker-mail", last_error="SMTP failed")
+    session.add_all([overdue, medium, failed_job, failed_mail])
+    session.commit()
+
+    items = global_exception_ticker_items(session)
+
+    assert items[0]["type"] == "exception"
+    assert items[0]["tone"] == "danger"
+    assert items[0]["sla_status"] == "overdue"
+    assert any(item["type"] == "processing_dead_letter" and "OMS timeout" in item["message"] for item in items)
+    assert any(item["type"] == "outbound_dead_letter" and item["href"] == "#outbound" for item in items)
+    assert all("普通异常" not in item["message"] for item in items)
+
+
+def test_exception_diagnosis_stream_emits_loading_partial_and_done_events():
+    session = make_session()
+    case = ExceptionCase(
+        exception_type="VALIDATION_BLOCKED",
+        severity="High",
+        detail=dumps({"exception": {"summary": "SKU 映射缺失"}, "validation": {"failed_rules": [{"rule_code": "SKU_MAPPING", "reason": "未找到 SKU"}]}}),
+        status="Open",
+    )
+    session.add(case)
+    session.commit()
+
+    payload = "".join(diagnose_exception_stream_chunks(session, case.id, actor="ops@example.com"))
+    assert "event: loading" in payload
+    assert "event: partial" in payload
+    assert "event: done" in payload
+    assert "SKU 映射缺失" in payload or "未找到 SKU" in payload
 
 
 def test_sync_imap_mailbox_skips_when_bot_disabled():
@@ -3831,6 +3928,7 @@ def test_duplicate_processing_jobs_only_execute_one_business_flow():
     skipped = session.query(ProcessingJob).filter(ProcessingJob.error_message.like("Skipped duplicate%")).one()
     assert result == {"completed": 2, "failed": 0, "total": 2}
     assert skipped.status == "Completed"
+    assert skipped.version == 2
     assert session.query(OrderRequirement).filter_by(source_mail_id=mail.id).count() == 1
     assert session.query(ProductionTask).count() == 1
     assert session.query(OutboundMailJob).filter_by(mail_type="TaskIssue").count() == 1

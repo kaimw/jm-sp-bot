@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from backend.app.models import CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
+from backend.app.models import AuditEvent, CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
 from backend.app.services.crm_attachment_cache import cache_order_attachment_file
 from backend.app.services.crm_attachment_extraction import enrich_order_from_registered_attachments
 from backend.app.services.bootstrap import set_config
@@ -120,6 +120,123 @@ def run_crm_sales_order_sync(session: Session, *, trigger: str = "manual") -> di
         sync_run.error_message = str(exc)
         sync_run.detail_json = dumps({"error_type": exc.__class__.__name__})
         session.commit()
+        raise
+
+
+def crm_order_single_row(order: CrmSalesOrder) -> dict[str, Any]:
+    return {
+        "crm_order_id": order.crm_order_id,
+        "crm_order_no": order.crm_order_no,
+        "customer_id": order.customer_id,
+        "customer_name": order.customer_name,
+        "opportunity_id": order.opportunity_id,
+        "opportunity_name": order.opportunity_name,
+        "life_status": order.life_status,
+        "approval_status": order.approval_status,
+        "order_date": order.order_date,
+        "settlement_method": order.settlement_method,
+        "order_amount": order.order_amount,
+        "received_amount": order.received_amount,
+        "receivable_amount": order.receivable_amount,
+        "invoice_amount": order.invoice_amount,
+        "product_amount": order.product_amount,
+        "logistics_status": order.logistics_status,
+        "shipment_status": order.shipment_status,
+        "invoice_status": order.invoice_status,
+        "sales_user_id": order.sales_user_id,
+        "sales_user_name": order.sales_user_name,
+        "owner_department": order.owner_department,
+        "receipt_contact": order.receipt_contact,
+        "receipt_phone": order.receipt_phone,
+        "receipt_address": order.receipt_address,
+        "delivery_date": order.delivery_date,
+        "remark": order.remark,
+        "attachment_files": "; ".join(str(item) for item in loads(order.attachment_files_json, []) if str(item).strip()),
+        "attachments": loads(order.raw_json, {}).get("attachments") or [],
+    }
+
+
+def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder) -> tuple[dict[str, Any], dict[str, Any]]:
+    detail_request_path = config_value(session, "crm_fxiaoke_detail_request_file", "").strip()
+    detail_request_json = config_value(session, "crm_fxiaoke_detail_request_json", "").strip()
+    if not detail_request_path and not detail_request_json:
+        raise RuntimeError("请先配置 crm_fxiaoke_detail_request_file 或 crm_fxiaoke_detail_request_json")
+    cdp_url = config_value(session, "crm_cdp_url", DEFAULT_CDP_URL).strip() or DEFAULT_CDP_URL
+    node_bin = config_value(session, "crm_node_bin", "node").strip() or "node"
+    script_path = Path(__file__).resolve().parents[3] / "scripts" / "fxiaoke_replay_sales_orders.mjs"
+    if not script_path.exists():
+        raise RuntimeError(f"CRM 同步脚本不存在：{script_path}")
+
+    single_row_path = Path("/private/tmp") / f"fxiaoke-single-row-{order.id}.json"
+    temp_detail_request_path: Path | None = None
+    try:
+        single_row_path.write_text(json.dumps(crm_order_single_row(order), ensure_ascii=False), encoding="utf-8")
+        if detail_request_json and not detail_request_path:
+            temp_detail_request_path = Path("/private/tmp") / f"fxiaoke-detail-request-{hashlib.sha1(detail_request_json.encode()).hexdigest()[:12]}.json"
+            temp_detail_request_path.write_text(detail_request_json, encoding="utf-8")
+            detail_request_path = str(temp_detail_request_path)
+        command = [node_bin, str(script_path), f"--single-row={single_row_path}", f"--detail-request={detail_request_path}"]
+        completed = subprocess.run(
+            command,
+            cwd=str(Path(__file__).resolve().parents[3]),
+            env={**os.environ, "FXIAOKE_CDP_URL": cdp_url, "FXIAOKE_PAGE_SIZE": "1"},
+            capture_output=True,
+            text=True,
+            timeout=max(30, config_int(session, "crm_sync_timeout_seconds", 120)),
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError((completed.stderr or completed.stdout or "CRM 单条详情同步脚本执行失败").strip())
+        output = json.loads(completed.stdout)
+        json_path = output.get("jsonPath")
+        if not json_path:
+            raise RuntimeError("CRM 单条详情同步脚本未返回 jsonPath")
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        rows = data.get("rows") or []
+        if not rows:
+            raise RuntimeError("CRM 单条详情同步未返回订单详情")
+        return rows[0], {"cdp_url": cdp_url, "detail_request_file": detail_request_path, "json_path": json_path, "detail_pages": output.get("detailPages", [])}
+    finally:
+        try:
+            single_row_path.unlink()
+        except FileNotFoundError:
+            pass
+        if temp_detail_request_path is not None:
+            try:
+                temp_detail_request_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def retry_crm_order_detail_sync(session: Session, order: CrmSalesOrder) -> dict[str, Any]:
+    try:
+        row, command = fetch_single_order_detail_via_replay(session, order)
+        result = upsert_crm_sales_orders(session, [row])
+        refreshed = session.get(CrmSalesOrder, order.id) or order
+        session.add(
+            AuditEvent(
+                event_type="CrmOrderDetailRetrySucceeded",
+                related_object_type="CrmSalesOrder",
+                related_object_id=refreshed.id,
+                detail=dumps({"crm_order_id": refreshed.crm_order_id, "crm_order_no": refreshed.crm_order_no, "command": command, "result": result}),
+            )
+        )
+        return {"ok": True, "order_id": refreshed.id, "result": result, "command": command}
+    except Exception as exc:
+        raw = loads(order.raw_json, {})
+        raw["detail_sync_status"] = "Failed"
+        raw["detail_sync_error"] = str(exc)
+        order.raw_json = dumps(raw)
+        order.sync_status = "DetailFailed"
+        order.updated_at = now_utc()
+        session.add(
+            AuditEvent(
+                event_type="CrmOrderDetailRetryFailed",
+                related_object_type="CrmSalesOrder",
+                related_object_id=order.id,
+                detail=dumps({"crm_order_id": order.crm_order_id, "crm_order_no": order.crm_order_no, "error": str(exc)}),
+            )
+        )
         raise
 
 
@@ -391,20 +508,15 @@ def save_order_snapshot(session: Session, order: CrmSalesOrder, row: dict[str, A
 def extract_attachment_records(row: dict[str, Any]) -> list[dict[str, Any]]:
     raw_attachments = row.get("attachments")
     records: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    by_name: dict[str, dict[str, Any]] = {}
 
     def add_record(record: dict[str, Any]) -> None:
-        key = "|".join([
-            normalized_lower(record.get("source_file_id")),
-            normalized_lower(record.get("file_name")),
-            normalized_lower(record.get("file_url")),
-        ])
-        fallback_key = normalized_lower(record.get("file_name"))
-        dedupe_key = key if key.strip("|") else fallback_key
-        if not dedupe_key or dedupe_key in seen:
+        name_key = "|".join([normalized_lower(record.get("source_file_id")), normalized_lower(record.get("file_name"))])
+        if not name_key.strip("|"):
             return
-        seen.add(dedupe_key)
-        records.append(record)
+        existing = by_name.get(name_key)
+        if existing is None or (not existing.get("file_url") and record.get("file_url")):
+            by_name[name_key] = record
 
     if isinstance(raw_attachments, list):
         for item in raw_attachments:
@@ -412,18 +524,36 @@ def extract_attachment_records(row: dict[str, Any]) -> list[dict[str, Any]]:
                 name = normalized_text(item.get("file_name") or item.get("name") or item.get("filename"))
                 if not name:
                     continue
+                raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
                 add_record({
                     "file_name": name,
-                    "file_url": normalized_text(item.get("file_url") or item.get("url")) or None,
-                    "source_file_id": normalized_text(item.get("file_id") or item.get("id")) or None,
+                    "file_url": normalized_text(
+                        item.get("file_url")
+                        or item.get("url")
+                        or item.get("signedUrl")
+                        or item.get("signed_url")
+                        or item.get("download_url")
+                        or item.get("downloadUrl")
+                        or item.get("preview_url")
+                        or item.get("previewUrl")
+                        or raw.get("signedUrl")
+                        or raw.get("signed_url")
+                        or raw.get("download_url")
+                        or raw.get("downloadUrl")
+                        or raw.get("preview_url")
+                        or raw.get("previewUrl")
+                    )
+                    or None,
+                    "source_file_id": normalized_text(item.get("file_id") or item.get("id") or raw.get("path") or raw.get("file_id")) or None,
                     "attachment_type": normalized_text(item.get("type") or item.get("attachment_type")) or None,
                     "raw": item,
                 })
             elif normalized_text(item):
                 add_record({"file_name": normalized_text(item), "raw": item})
-    for name in [item.strip() for item in str(row.get("attachment_files") or "").split(";") if item.strip()]:
-        add_record({"file_name": name, "raw": name})
-    return records
+    if not by_name:
+        for name in [item.strip() for item in str(row.get("attachment_files") or "").split(";") if item.strip()]:
+            add_record({"file_name": name, "raw": name})
+    return list(by_name.values())
 
 
 def attachment_fingerprint(record: dict[str, Any]) -> str:

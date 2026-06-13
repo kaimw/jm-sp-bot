@@ -1,0 +1,4 @@
+interface:
+  display_name: "JM-SP Admin UI Design"
+  short_description: "Design dense operator UI for the JM-SP admin console"
+  default_prompt: "Use $jm-sp-admin-ui-design before changing JM-SP admin console HTML, CSS, JS, React/AntD screens, exception views, tables, filters, responsive behavior, or AI diagnosis panels."

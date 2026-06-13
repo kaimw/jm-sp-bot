@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>商务订单中台智能体 MVP</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260612-4" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260613-shipnexus" />
   </head>
   <body>
     <section id="login-screen" class="login-screen" hidden>
@@ -12,9 +12,20 @@
         <span class="mark">J</span>
         <h1>商务部小J</h1>
         <p>CRM 订单中台与履约工作台</p>
-        <label>用户名 <input name="username" value="admin" autocomplete="username" /></label>
-        <label>密码 <input name="password" type="password" placeholder="默认 admin" autocomplete="current-password" /></label>
+        <label>用户名 <input name="username" id="login-username" value="admin" autocomplete="username" /></label>
+        <label>密码 <input name="password" id="login-password" type="password" placeholder="默认 admin" autocomplete="current-password" /></label>
         <button type="submit" class="button">登录</button>
+        <div class="rbac-demo-accounts">
+          <strong>内置演示账号（点击填入）：</strong>
+          <ul id="demo-account-list">
+            <li data-user="admin" data-pass="admin"><code>admin</code>: 系统管理员</li>
+            <li data-user="owner" data-pass="owner123"><code>owner</code>: 商务负责人</li>
+            <li data-user="operator" data-pass="operator123"><code>operator</code>: 销售 (Sales 部门)</li>
+            <li data-user="operator_other" data-pass="operator123"><code>operator_other</code>: 销售 (Logistics 部门)</li>
+            <li data-user="auditor" data-pass="auditor123"><code>auditor</code>: 财务审计</li>
+            <li data-user="it_ops" data-pass="itops123"><code>it_ops</code>: IT 运维 / 物流</li>
+          </ul>
+        </div>
       </form>
     </section>
 
@@ -28,34 +39,58 @@
       </div>
       <nav aria-label="主导航">
         <div class="nav-group">
-          <span class="nav-group-label">总览</span>
-          <a href="#dashboard" data-page-link="dashboard"><span>Agent 概览</span><small>全局水位</small></a>
-          <a href="#exceptions" data-page-link="exceptions"><span>异常接管</span><small>阻断与高危</small></a>
-        </div>
-        <div class="nav-group">
-          <span class="nav-group-label">订单履约</span>
+          <span class="nav-group-label">运营看板</span>
+          <a href="#dashboard" data-page-link="dashboard"><span>总览</span><small>地图 / KPI / 告警</small></a>
           <a href="#crm-orders" data-page-link="crm-orders"><span>CRM 订单</span><small>同步与预审</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">商务处理</span>
+          <a href="#exceptions" data-page-link="exceptions"><span>异常接管</span><small>阻断与高危</small></a>
+          <a href="#tasks" data-page-link="tasks"><span>生产任务</span><small>任务单与历史流</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">履约与资产</span>
           <a href="#logistics-tasks" data-page-link="logistics-tasks"><span>发货执行</span><small>物流与库存</small></a>
-          <a href="#tasks" data-page-link="tasks"><span>生产任务</span><small>历史邮件流</small></a>
-        </div>
-        <div class="nav-group">
-          <span class="nav-group-label">规则与主数据</span>
           <a href="#products" data-page-link="products"><span>物料中心</span><small>SKU / 库存</small></a>
-          <a href="#workflows" data-page-link="workflows"><span>流程编排</span><small>路由与模板</small></a>
-          <a href="#review-rules" data-page-link="review-rules"><span>预审规则</span><small>字段与防呆</small></a>
         </div>
         <div class="nav-group">
-          <span class="nav-group-label">集成运维</span>
-          <a href="#integration" data-page-link="integration"><span>系统接入</span><small>CRM / OMS / 邮箱</small></a>
+          <span class="nav-group-label">运维监控</span>
           <a href="#outbound" data-page-link="outbound"><span>通知队列</span><small>邮件外发</small></a>
           <a href="#mails" data-page-link="mails"><span>邮件留痕</span><small>入库与分类</small></a>
           <a href="#ops" data-page-link="ops"><span>队列审计</span><small>Job / 附件 / 备份</small></a>
         </div>
+        <div class="nav-group nav-bottom">
+          <a href="#integration" data-page-link="integration" class="settings-entry"><span>Settings</span><small>接入 / 规则 / 通知 / Agent</small></a>
+        </div>
+      </nav>
+    </aside>
+
+    <aside class="settings-sidebar auth-required" aria-label="设置导航">
+      <div class="settings-return">
+        <a class="button ghost" href="#dashboard">返回主应用</a>
+      </div>
+      <div class="settings-brand">
+        <strong>Settings</strong>
+        <small>系统接入、规则和组织配置</small>
+      </div>
+      <nav aria-label="设置菜单">
         <div class="nav-group">
-          <span class="nav-group-label">组织配置</span>
+          <span class="nav-group-label">系统</span>
+          <a href="#integration" data-page-link="integration"><span>系统接入</span><small>CRM / OMS / 邮箱 / 模型</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">规则</span>
+          <a href="#workflows" data-page-link="workflows"><span>流程编排</span><small>路由与模板</small></a>
+          <a href="#review-rules" data-page-link="review-rules"><span>预审规则</span><small>字段与防呆</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">组织</span>
           <a href="#departments" data-page-link="departments"><span>生产通知</span><small>部门邮箱</small></a>
           <a href="#logistics-departments" data-page-link="logistics-departments"><span>物流通知</span><small>部门邮箱</small></a>
-          <a href="#reports" data-page-link="reports"><span>经营周报</span><small>摘要与导出</small></a>
+          <a href="#reports" data-page-link="reports"><span>经营周报</span><small>收件人与导出</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">Agent</span>
           <a href="#skill-lab" data-page-link="skill-lab"><span>技能实验室</span><small>Agent 扩展</small></a>
         </div>
       </nav>
@@ -68,65 +103,85 @@
           <p id="page-subtitle">核心状态、队列水位和待处理风险。</p>
         </div>
         <div class="top-actions">
+          <button id="copilot-open" type="button" class="button ghost">Agent</button>
           <button id="system-toggle" type="button" class="button system-toggle">暂停机器人</button>
           <button id="business-data-clear" type="button" class="button warn">清空数据</button>
+          <span id="user-info" class="user-info"></span>
           <button id="logout" type="button" class="button ghost">退出</button>
         </div>
       </header>
+      <div id="global-exception-ticker" class="global-exception-ticker" aria-live="polite" hidden></div>
       <div id="notice-trail" class="notice-trail" role="status" aria-live="polite"></div>
 
-      <section class="page is-active" data-page="dashboard" data-title="Agent 概览" data-subtitle="从 CRM 感知、预审阻断、OMS 履约到通知队列，一屏查看自动化链路。">
-        <section class="agent-overview">
-          <div class="agent-overview-copy">
-            <small>一期主链路</small>
-            <h2>CRM 审批订单进入中台，预审通过后生成发货通知；异常由人工接管。</h2>
-            <p>管理人员看订单与异常，运维人员看队列与接入。左侧菜单已按这个工作方式重新分组。</p>
+      <section class="page is-active" data-page="dashboard" data-title="Agent 概览" data-subtitle="商务待办、运维水位和关键业务状态。">
+        <div id="dashboard-metrics" class="metrics dashboard-metrics"></div>
+        <section class="dashboard-board-grid" aria-label="商务订单中台地图看板">
+          <div class="dashboard-main-stack">
+            <div id="dashboard-insights" class="dashboard-insights"></div>
+            <div class="dashboard-placeholder-card dashboard-activity-card">
+              <div class="dashboard-card-head">
+                <h2>最近活动</h2>
+                <a href="#ops" class="button ghost">查看详情</a>
+              </div>
+              <div id="dashboard-activity-table" class="dashboard-activity-table">
+                <div><span>时间</span><span>活动</span><span>状态</span></div>
+              </div>
+            </div>
+            <div class="dashboard-mini-grid" aria-label="订单中台指标">
+              <div id="dashboard-order-waterline" class="dashboard-placeholder-card dashboard-mini-card">
+                <div class="dashboard-card-head">
+                  <h2>订单水位</h2>
+                  <a href="#crm-orders" class="button ghost">订单</a>
+                </div>
+              </div>
+              <div id="dashboard-exception-distribution" class="dashboard-placeholder-card dashboard-mini-card">
+                <div class="dashboard-card-head">
+                  <h2>异常分布</h2>
+                  <a href="#exceptions" class="button ghost">异常</a>
+                </div>
+              </div>
+            </div>
           </div>
-          <div class="agent-flow-cards" aria-label="订单中台流程导航">
-            <a href="#crm-orders" class="flow-card">
-              <small>1 感知</small>
-              <strong>CRM 订单同步</strong>
-              <span>发现新订单、查重、识别变更/撤销</span>
-            </a>
-            <a href="#review-rules" class="flow-card">
-              <small>2 认知</small>
-              <strong>完整预审</strong>
-              <span>字段、附件、SKU、金额、库存防呆</span>
-            </a>
-            <a href="#logistics-tasks" class="flow-card">
-              <small>3 执行</small>
-              <strong>发货履约</strong>
-              <span>发货预览、OMS 下推、重试补偿</span>
-            </a>
-            <a href="#exceptions" class="flow-card is-hot">
-              <small>4 接管</small>
-              <strong>异常处理</strong>
-              <span>阻断原因、责任人、处理建议</span>
-            </a>
-            <a href="#ops" class="flow-card">
-              <small>5 监控</small>
-              <strong>队列审计</strong>
-              <span>Job、水位、附件解析与备份</span>
-            </a>
-          </div>
+          <aside class="dashboard-side-stack">
+            <div id="dashboard-business-panel" class="dashboard-focus-panel"></div>
+            <div id="dashboard-ops-panel" class="dashboard-focus-panel"></div>
+            <div id="dashboard-fulfillment-trend" class="dashboard-placeholder-card">
+              <div class="dashboard-card-head">
+                <h2>履约趋势</h2>
+                <a href="#logistics-tasks" class="button ghost">履约</a>
+              </div>
+            </div>
+          </aside>
         </section>
-        <div id="dashboard" class="metrics"></div>
-        <div id="dashboard-insights" class="dashboard-insights"></div>
-        <div id="system-health" class="health-panel"></div>
       </section>
 
       <section class="page product-page" data-page="products" data-title="物料中心" data-subtitle="维护 SKU、库存、价格和别名映射，为订单预审和 OMS 下推提供主数据。">
-        <div class="section-head product-section-head">
-          <h2>物料中心</h2>
-          <p>维护成品库存中的 SPU/SKU、渠道限价和促销规则。</p>
+        <div class="product-workbench-head">
+          <div class="product-workbench-copy">
+            <small>主数据工作台</small>
+            <h2>物料中心</h2>
+            <p>围绕订单预审和履约下推维护 SPU、SKU、库存、价格与促销规则。</p>
+          </div>
+          <div id="product-center-summary" class="metrics compact-metrics product-center-summary">
+            <div class="metric"><small>成品 SPU</small><strong>-</strong><span>商品主档</span></div>
+            <div class="metric"><small>存货 SKU</small><strong>-</strong><span>履约粒度</span></div>
+            <div class="metric warn"><small>库存预警</small><strong>-</strong><span>低库存记录</span></div>
+            <div class="metric danger"><small>零库存</small><strong>-</strong><span>阻断风险</span></div>
+          </div>
         </div>
-        <div class="tabs" id="products-tabs">
-          <button type="button" class="active" data-tab="spu">成品 SPU</button>
-          <button type="button" data-tab="sku">存货 SKU</button>
-          <button type="button" data-tab="inventory">库存管理</button>
-          <button type="button" data-tab="pricing">渠道价格</button>
-          <button type="button" data-tab="promotions">促销规则</button>
-          <button type="button" data-tab="review">预审测试</button>
+        <div class="product-tabs-shell">
+          <div class="tabs" id="products-tabs">
+            <button type="button" class="active" data-tab="spu">成品 SPU</button>
+            <button type="button" data-tab="sku">存货 SKU</button>
+            <button type="button" data-tab="inventory">库存管理</button>
+            <button type="button" data-tab="pricing">渠道价格</button>
+            <button type="button" data-tab="promotions">促销规则</button>
+            <button type="button" data-tab="review">预审测试</button>
+          </div>
+          <div class="product-tabs-hint">
+            <strong>维护优先级</strong>
+            <span>先补别名和价格，再处理库存预警。</span>
+          </div>
         </div>
 
         <div class="tab-content is-active" id="products-spu-tab">
@@ -312,7 +367,7 @@
           <div id="products-promotions-pagination" class="pagination" data-table-pagination="productsPromotions"></div>
         </div>
       </section>
-      <section class="page skill-page" data-page="skill-lab" data-title="技能实验室" data-subtitle="面向运维和管理员的 Agent 扩展入口，新增技能前先小范围验证。">
+      <section class="page skill-page" data-page="skill-lab" data-settings-section="true" data-title="技能实验室" data-subtitle="面向运维和管理员的 Agent 扩展入口，新增技能前先小范围验证。">
         <div class="section-head">
           <h2 id="skill-lab">技能实验室 (Skill Lab)</h2>
           <p>生成的技能将立即热加载到后端引擎，无需重启服务。</p>
@@ -343,7 +398,7 @@
         </div>
       </section>
 
-      <section class="page" data-page="reports" data-title="经营周报" data-subtitle="面向管理层的订单、任务、异常和外发摘要，可预览、入队发送或导出。">
+      <section class="page" data-page="reports" data-settings-section="true" data-title="经营周报" data-subtitle="面向管理层的订单、任务、异常和外发摘要，可预览、入队发送或导出。">
         <div class="section-head">
           <h2>周报发送</h2>
           <p>周报邮件进入外发队列后由 SMTP 发送。</p>
@@ -412,7 +467,7 @@
         </form>
       </section>
 
-      <section class="page" data-page="review-rules" data-title="预审规则" data-subtitle="管理订单进入履约前的字段完整性、业务防呆和人工补充规则。">
+      <section class="page" data-page="review-rules" data-settings-section="true" data-title="预审规则" data-subtitle="管理订单进入履约前的字段完整性、业务防呆和人工补充规则。">
         <div class="section-head">
           <h2>规则与阻断条件</h2>
           <p>一期订单完整预审由后端规则链强制执行；这里保留可配置规则，辅助历史邮件流和流程专项校验。</p>
@@ -435,7 +490,7 @@
         <div id="initial-review-rules-pagination" class="pagination" data-table-pagination="reviewRules"></div>
       </section>
 
-      <section class="page" data-page="workflows" data-title="流程编排" data-subtitle="配置不同业务流程的必填字段、通知路由、预审规则和启用状态。">
+      <section class="page" data-page="workflows" data-settings-section="true" data-title="流程编排" data-subtitle="配置不同业务流程的必填字段、通知路由、预审规则和启用状态。">
         <div class="section-head">
           <h2>业务流程清单</h2>
           <p>查看流程版本、启用状态、责任部门和通知路由，避免管理员在多个配置页之间来回找。</p>
@@ -483,7 +538,7 @@
         </div>
       </section>
 
-      <section class="page" data-page="integration" data-title="系统接入" data-subtitle="集中维护 CRM/OMS/ERP/邮箱/模型等外部系统连接，适合运维排查配置问题。">
+      <section class="page" data-page="integration" data-settings-section="true" data-title="系统接入" data-subtitle="集中维护 CRM/OMS/ERP/邮箱/模型等外部系统连接，适合运维排查配置问题。">
         <div class="tabs" id="integration-tabs" data-tabs="integration">
           <button type="button" class="active" data-tab="crm">CRM 接入</button>
           <button type="button" data-tab="oms">OMS 接入</button>
@@ -530,11 +585,18 @@
             <label>超时(秒)
               <input name="crm_sync_timeout_seconds" type="number" min="30" max="600" />
             </label>
+            <label class="switch-line">
+              <input name="v2_crm_phase1_scope_enabled" type="checkbox" />
+              <span>启用一期纳入范围</span>
+            </label>
             <label class="wide">请求配置 JSON
               <textarea name="crm_fxiaoke_request_json" rows="4" placeholder="可选：粘贴抓到的最小请求 JSON，留空则使用请求配置文件。"></textarea>
             </label>
             <label class="wide">详情请求配置 JSON
               <textarea name="crm_fxiaoke_detail_request_json" rows="4" placeholder="可选：粘贴单条订单详情请求 JSON，支持 {{crm_order_id}} / {{crm_order_no}} 占位符。"></textarea>
+            </label>
+            <label class="wide">一期纳入范围 JSON
+              <textarea name="v2_crm_phase1_scope_json" rows="6" placeholder='{"approved_values":["approved","审批通过"],"include_owner_departments":[],"include_settlement_methods":[],"include_customer_names":[]}'></textarea>
             </label>
             <div class="actions wide">
               <button type="submit" class="button">保存 CRM 配置</button>
@@ -624,9 +686,12 @@
           <div class="actions wide">
             <button type="submit" class="button">保存 OMS 配置</button>
             <button id="test-oms-connection" type="button" class="button ghost">测试 OMS 连接</button>
+            <button id="poll-oms-status" type="button" class="button ghost">拉取 OMS 状态</button>
+            <button id="queue-oms-status-poll" type="button" class="button ghost">入队拉取状态</button>
           </div>
         </form>
         <pre id="oms-test-result" class="test-result"></pre>
+        <pre id="oms-status-poll-result" class="test-result"></pre>
         </div>
         <div class="tab-content" id="integration-mail-tab" hidden>
         <div class="section-head">
@@ -764,7 +829,7 @@
         </div>
       </section>
 
-      <section class="page" data-page="departments" data-title="生产通知" data-subtitle="维护生产部门的主送、抄送和启用状态，作为任务通知的组织通讯录。">
+      <section class="page" data-page="departments" data-settings-section="true" data-title="生产通知" data-subtitle="维护生产部门的主送、抄送和启用状态，作为任务通知的组织通讯录。">
         <div class="section-head">
           <h2>生产部门邮箱</h2>
           <p>任务单下达使用当前启用的生产部门邮箱。</p>
@@ -790,7 +855,7 @@
         <div id="departments-pagination" class="pagination" data-table-pagination="departments"></div>
       </section>
 
-      <section class="page" data-page="logistics-departments" data-title="物流通知" data-subtitle="维护物流部门通知地址，支撑发货异常、库存核查和履约协同。">
+      <section class="page" data-page="logistics-departments" data-settings-section="true" data-title="物流通知" data-subtitle="维护物流部门通知地址，支撑发货异常、库存核查和履约协同。">
         <div class="section-head">
           <h2>物流部门邮箱</h2>
           <p>物流通知和后续物流流程使用当前启用的物流部门邮箱。</p>
@@ -965,6 +1030,65 @@
         </form>
         <div id="jobs-list" class="list"></div>
         <div id="jobs-pagination" class="pagination" data-table-pagination="jobs"></div>
+
+        <div class="section-head">
+          <h2>接口日志</h2>
+          <p>CRM、OMS、面单和平台回传的集成事件状态。</p>
+        </div>
+        <form id="integration-events-filter-form" class="table-filter-bar clearable-filter-bar" data-table-filter="integrationEvents">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索接口日志" placeholder="链路 / 业务键 / 错误" />
+          </div>
+          <select name="status" aria-label="状态"><option value="">全部状态</option></select>
+          <select name="event_type" aria-label="事件类型"><option value="">全部事件</option></select>
+          <select name="source_system" aria-label="来源系统"><option value="">全部系统</option></select>
+          <div class="filter-actions">
+            <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+            <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+          </div>
+        </form>
+        <div id="integration-events-list" class="list"></div>
+        <div id="integration-events-pagination" class="pagination" data-table-pagination="integrationEvents"></div>
+
+        <div class="section-head">
+          <h2>Agent 运行</h2>
+          <p>自动诊断、规则判断等智能任务的执行留痕。</p>
+        </div>
+        <form id="agent-runs-filter-form" class="table-filter-bar clearable-filter-bar" data-table-filter="agentRuns">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索 Agent 运行" placeholder="Agent / 任务 / 对象 / 错误" />
+          </div>
+          <select name="status" aria-label="运行状态"><option value="">全部状态</option></select>
+          <select name="agent_name" aria-label="Agent"><option value="">全部 Agent</option></select>
+          <select name="task_type" aria-label="任务类型"><option value="">全部任务</option></select>
+          <div class="filter-actions">
+            <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+            <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+          </div>
+        </form>
+        <div id="agent-runs-list" class="list"></div>
+        <div id="agent-runs-pagination" class="pagination" data-table-pagination="agentRuns"></div>
+
+        <div class="section-head">
+          <h2>模型调用</h2>
+          <p>大模型请求、响应摘要、耗时和失败原因。</p>
+        </div>
+        <form id="model-calls-filter-form" class="table-filter-bar clearable-filter-bar" data-table-filter="modelCalls">
+          <div class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input name="q" aria-label="搜索模型调用" placeholder="任务 / 对象 / 状态 / 错误" />
+          </div>
+          <select name="status" aria-label="调用状态"><option value="">全部状态</option></select>
+          <select name="task_type" aria-label="任务类型"><option value="">全部任务</option></select>
+          <div class="filter-actions">
+            <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
+            <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
+          </div>
+        </form>
+        <div id="model-calls-list" class="list"></div>
+        <div id="model-calls-pagination" class="pagination" data-table-pagination="modelCalls"></div>
 
         <div class="section-head">
           <h2>附件解析</h2>
@@ -1220,6 +1344,7 @@
             </div>
             <div id="crm-order-flow-badge" class="status-pill is-muted">未进入中台</div>
           </div>
+          <div id="crm-order-flow-alert" class="crm-order-flow-alert" hidden></div>
           <div id="crm-order-flow" class="crm-order-flow"></div>
           <div id="crm-order-flow-evidence" class="crm-order-flow-evidence"></div>
         </section>
@@ -1420,7 +1545,27 @@
       </section>
     </div>
 
+    <div id="exception-context-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="exception-context-title" style="max-width: 980px;">
+        <div class="modal-head">
+          <div><small>异常接管</small><h2 id="exception-context-title">异常上下文</h2></div>
+          <button id="exception-context-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div id="exception-context-body" class="exception-context-body"></div>
+      </section>
+    </div>
+
+    <div id="copilot-drawer" class="modal-backdrop copilot-backdrop" hidden>
+      <section class="modal-panel copilot-panel" role="dialog" aria-modal="true" aria-labelledby="copilot-title">
+        <div class="modal-head">
+          <div><small>Agent 控制台</small><h2 id="copilot-title">当前上下文</h2></div>
+          <button id="copilot-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div id="copilot-body" class="copilot-body"></div>
+      </section>
+    </div>
+
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260612-5"></script>
+    <script src="/static/app.js?v=20260613-shipnexus"></script>
   </body>
 </html>

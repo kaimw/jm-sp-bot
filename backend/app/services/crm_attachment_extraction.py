@@ -224,8 +224,7 @@ def extract_priority_buyer_blocks(text: str, result: ExtractedOmsFields) -> None
 
 def extract_oms_fields_with_llm(session: Session, order: CrmSalesOrder, source_text: str, current: ExtractedOmsFields) -> ExtractedOmsFields:
     current.validation_errors = validate_extracted_fields(current)
-    should_allow_override = bool(current.validation_errors)
-    if not current.validation_errors or not llm_fallback_enabled(session):
+    if not llm_fallback_enabled(session):
         return current
     config = active_model_config(session)
     if not model_ready(session, config):
@@ -269,7 +268,12 @@ def extract_oms_fields_with_llm(session: Session, order: CrmSalesOrder, source_t
     if not data:
         return current
     merged = ExtractedOmsFields(**current.as_dict())
-    merged.source = "llm" if current.confidence < 75 else "rule+llm"
+    merged.source = "llm"
+    merged.receipt_contact = ""
+    merged.receipt_phone = ""
+    merged.receipt_address = ""
+    merged.delivery_date = ""
+    merged.evidence = [item for item in merged.evidence if item.get("field") not in {"receipt_contact", "receipt_phone", "receipt_address", "delivery_date"}]
     for key in ("receipt_contact", "receipt_phone", "receipt_address"):
         value = normalize_text(data.get(key))
         if key == "receipt_contact":
@@ -279,14 +283,7 @@ def extract_oms_fields_with_llm(session: Session, order: CrmSalesOrder, source_t
             valid = is_valid_receipt_phone(value)
         else:
             valid = is_detailed_receipt_address(value)
-        existing_valid = (
-            is_valid_receipt_contact(merged.receipt_contact)
-            if key == "receipt_contact"
-            else is_valid_receipt_phone(merged.receipt_phone)
-            if key == "receipt_phone"
-            else is_detailed_receipt_address(merged.receipt_address)
-        )
-        if value and valid and (not existing_valid or should_allow_override):
+        if value and valid:
             setattr(merged, key, value)
             merged.evidence.append({"field": key, "value": value, "text": "LLM fallback"})
     date = normalize_date(str(data.get("delivery_date") or ""))
@@ -328,6 +325,7 @@ def download_attachment_text(attachment: OrderAttachment, *, timeout_seconds: fl
 def enrich_order_from_attachment_text(session: Session, order: CrmSalesOrder, attachment_texts: list[tuple[OrderAttachment | None, str]]) -> ExtractedOmsFields:
     source_text = "\n\n".join(f"[{attachment.file_name if attachment else 'inline'}]\n{text}" for attachment, text in attachment_texts if text.strip())
     rule_result = extract_oms_fields_by_rule(source_text)
+    rule_result.validation_errors = ["联系人三要素已切换为 LLM 主提取，规则结果仅作上下文参考"]
     result = extract_oms_fields_with_llm(session, order, source_text, rule_result)
     result.validation_errors = validate_extracted_fields(result)
     result.manual_review_required = bool(result.validation_errors)

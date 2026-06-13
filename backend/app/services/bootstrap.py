@@ -3,8 +3,10 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.models import LogisticsDepartment, MailTemplate, ModelProviderConfig, ProductionDepartment, SystemConfig, now_utc
+from backend.app.models import LogisticsDepartment, MailTemplate, ModelProviderConfig, ProductionDepartment, SystemConfig, User, now_utc
 from backend.app.services.jsonutil import dumps
+from backend.app.services.auth import hash_password
+
 
 
 LEGACY_DEFAULT_BAIDU_MAP_AK = "DC5abb7ad1c9c694af28f4732aa163c3"
@@ -171,6 +173,7 @@ def seed_defaults(session: Session) -> None:
         "缺 SKU 客户": {"customer_code": "CUST-SKU-CHECK", "customer_name": "缺 SKU 客户"},
     }), is_secret=False)
     ensure_config(session, "v2_validation_failure_notification_enabled", "true", is_secret=False)
+    ensure_config(session, "v2_oms_blocked_notification_enabled", "true", is_secret=False)
     ensure_config(session, "v2_validation_failure_to_json", "[]", is_secret=False)
     ensure_config(session, "v2_validation_failure_cc_json", "[]", is_secret=False)
     ensure_config(session, "oms_retry_base_delay_seconds", "60", is_secret=False)
@@ -267,3 +270,43 @@ def seed_defaults(session: Session) -> None:
                 status="Active",
             )
         )
+
+    # Seed default RBAC users
+    if session.query(User).count() == 0:
+        session.add(User(
+            username=settings.admin_username,
+            password_hash=hash_password(settings.admin_password),
+            role="admin",
+            department="IT"
+        ))
+        session.add(User(
+            username="owner",
+            password_hash=hash_password("owner123"),
+            role="business_owner",
+            department="Business"
+        ))
+        session.add(User(
+            username="operator",
+            password_hash=hash_password("operator123"),
+            role="business_operator",
+            department="Sales"
+        ))
+        session.add(User(
+            username="operator_other",
+            password_hash=hash_password("operator123"),
+            role="business_operator",
+            department="Logistics"
+        ))
+        session.add(User(
+            username="auditor",
+            password_hash=hash_password("auditor123"),
+            role="auditor",
+            department="Finance"
+        ))
+        session.add(User(
+            username="it_ops",
+            password_hash=hash_password("itops123"),
+            role="it_ops",
+            department="Logistics"
+        ))
+

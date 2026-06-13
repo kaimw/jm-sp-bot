@@ -101,6 +101,9 @@ class JackyunClient:
     def query_delivery_orders(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.call_api("wms.order.query-info.page", payload)
 
+    def print_delivery_label(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.call_api("wms-cross.delivery.print", payload)
+
     def search_skus(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.call_api("erp-goods.goods.sku.search", payload)
 

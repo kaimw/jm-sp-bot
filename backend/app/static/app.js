@@ -14,7 +14,16 @@ let productSpuSuggestTimer = null;
 let productSpuSuggestSeq = 0;
 let productSkuSuggestTimer = null;
 let productSkuSuggestSeq = 0;
+let productCenterState = {
+  spu: null,
+  sku: null,
+  materialLowStock: null,
+  materialZeroStock: null,
+  finishedLowStock: null,
+  finishedZeroStock: null,
+};
 let dashboardViewState = { period: "year" };
+let currentCrmOrderDetailId = "";
 let baiduMapLoadPromise = null;
 let baiduDemandMap = null;
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
@@ -27,6 +36,9 @@ const tableStates = {
   outbound: { q: "", status: "", mail_type: "", recipient: "", page: 1, page_size: 10 },
   exceptions: { q: "", status: "Open", severity: "", exception_type: "", page: 1, page_size: 10 },
   jobs: { q: "", status: "", job_type: "", page: 1, page_size: 10 },
+  integrationEvents: { q: "", status: "", event_type: "", source_system: "", page: 1, page_size: 10 },
+  agentRuns: { q: "", status: "", agent_name: "", task_type: "", page: 1, page_size: 10 },
+  modelCalls: { q: "", status: "", task_type: "", page: 1, page_size: 10 },
   attachments: { q: "", parse_status: "", content_type: "", mail_id: "", page: 1, page_size: 10 },
   audit: { q: "", event_type: "", actor: "", related_object_type: "", page: 1, page_size: 10 },
   backups: { q: "", status: "", backup_type: "", page: 1, page_size: 10 },
@@ -113,6 +125,13 @@ function h(value) {
     '"': "&quot;",
     "'": "&#39;",
   })[char]);
+}
+
+function normalizePercent(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(0, Math.min(100, Math.round(number)));
 }
 
 function splitEmails(value) {
@@ -234,16 +253,27 @@ function showLogin() {
   if (screen) screen.hidden = false;
 }
 
-function showApp() {
+function showApp(user) {
   document.body.classList.add("is-authenticated");
   const screen = $("#login-screen");
   if (screen) screen.hidden = true;
+
+  const userInfo = $("#user-info");
+  if (userInfo && user) {
+    userInfo.textContent = `${user.username} (${user.role_name || user.role})` + (user.department ? ` - ${user.department}` : "");
+  }
+
+  const toggleBtn = $("#system-toggle");
+  const clearBtn = $("#business-data-clear");
+  const isIT = user && (user.role === "admin" || user.role === "it_ops");
+  if (toggleBtn) toggleBtn.style.display = isIT ? "" : "none";
+  if (clearBtn) clearBtn.style.display = isIT ? "" : "none";
 }
 
 async function ensureAuthenticated() {
   const data = await api("/api/auth/me", { skipAuthRedirect: true });
   if (data.authenticated) {
-    showApp();
+    showApp(data);
     return true;
   }
   showLogin();
@@ -254,11 +284,101 @@ function currentPageName() {
   return (window.location.hash || "#dashboard").slice(1) || "dashboard";
 }
 
+function copilotContextForPage(pageName = currentPageName()) {
+  const activePage = document.querySelector(".page.is-active");
+  const title = activePage?.dataset?.title || $("#page-title")?.textContent || "当前页面";
+  const subtitle = activePage?.dataset?.subtitle || $("#page-subtitle")?.textContent || "";
+  const defaults = {
+    title,
+    summary: subtitle || "订单中台运行视图",
+    focus: ["查看当前列表状态", "处理高优先级待办", "必要时进入运维日志"],
+    actions: [
+      ["异常台", "#exceptions", "阻断接管"],
+      ["运维", "#ops", "队列与留痕"],
+      ["CRM 订单", "#crm-orders", "订单流程"],
+    ],
+  };
+  const contexts = {
+    dashboard: {
+      title: "Agent 概览",
+      summary: "CRM 入库、预审、OMS 履约、异常和通知队列的总览。",
+      focus: ["中台订单水位", "预审直通率", "OMS 阻断和开放异常"],
+      actions: [["异常台", "#exceptions", "处理阻断"], ["CRM 订单", "#crm-orders", "查看流程"], ["运维", "#ops", "查日志"]],
+    },
+    "crm-orders": {
+      title: "CRM 订单",
+      summary: "从 CRM 同步来的订单事实源，点击订单可查看完整流程和当前状态。",
+      focus: ["详情同步状态", "预审结果", "CRM 变更/撤销风险"],
+      actions: [["接入设置", "#integration", "同步配置"], ["异常台", "#exceptions", "处理阻断"], ["发货执行", "#logistics-tasks", "履约视图"]],
+    },
+    exceptions: {
+      title: "异常接管",
+      summary: "阻断、死信和高危变更的人工接管入口。",
+      focus: ["AI 诊断", "上下文证据", "分派、关闭、重开和 OMS 重放"],
+      actions: [["运维", "#ops", "队列留痕"], ["CRM 订单", "#crm-orders", "订单流程"], ["外发", "#outbound", "通知状态"]],
+    },
+    ops: {
+      title: "运维",
+      summary: "处理队列、接口日志、Agent 运行和模型调用留痕。",
+      focus: ["失败队列", "集成事件", "Agent/模型调用轨迹"],
+      actions: [["异常台", "#exceptions", "业务阻断"], ["接入配置", "#integration", "外部系统"], ["外发", "#outbound", "通知队列"]],
+    },
+    integration: {
+      title: "系统接入",
+      summary: "CRM、OMS、模型、ERP 和端到端邮箱的运行配置。",
+      focus: ["CRM 一期范围", "OMS 真实下推", "模型调用凭证"],
+      actions: [["CRM 订单", "#crm-orders", "同步结果"], ["运维", "#ops", "接口日志"], ["工作台", "#dashboard", "总体水位"]],
+    },
+    products: {
+      title: "物料中心",
+      summary: "SKU、库存、价格、别名和促销规则支撑订单预审。",
+      focus: ["SKU 映射", "库存可用量", "价格和促销分摊"],
+      actions: [["CRM 订单", "#crm-orders", "预审验证"], ["异常台", "#exceptions", "主数据阻断"], ["运维", "#ops", "导入日志"]],
+    },
+  };
+  return contexts[pageName] || defaults;
+}
+
+function renderCopilotDrawer() {
+  const body = $("#copilot-body");
+  if (!body) return;
+  const context = copilotContextForPage();
+  $("#copilot-title").textContent = context.title;
+  body.innerHTML = `
+    <div class="copilot-context-card">
+      <strong>${h(context.title)}</strong>
+      <p>${h(context.summary)}</p>
+    </div>
+    <div class="copilot-context-card">
+      <strong>关注点</strong>
+      <div class="copilot-action-list">
+        ${(context.focus || []).map((item) => `<a href="${h(window.location.hash || "#dashboard")}"><span>${h(item)}</span><small>当前</small></a>`).join("")}
+      </div>
+    </div>
+    <div class="copilot-context-card">
+      <strong>动作</strong>
+      <div class="copilot-action-list">
+        ${(context.actions || []).map(([label, href, hint]) => `<a href="${h(href)}"><span>${h(label)}</span><small>${h(hint)}</small></a>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function openCopilotDrawer() {
+  renderCopilotDrawer();
+  $("#copilot-drawer").hidden = false;
+}
+
+function closeCopilotDrawer() {
+  $("#copilot-drawer").hidden = true;
+}
+
 function setActivePage(pageName = currentPageName()) {
   const pages = [...document.querySelectorAll(".page")];
   const visiblePages = pages.filter((page) => !hiddenPages.has(page.dataset.page));
   const target = visiblePages.find((page) => page.dataset.page === pageName) || visiblePages.find((page) => page.dataset.page === "dashboard");
   if (!target) return;
+  document.body.classList.toggle("is-settings-mode", target.dataset.settingsSection === "true");
   pages.forEach((page) => page.classList.toggle("is-active", page === target));
   document.querySelectorAll("[data-page-link]").forEach((link) => {
     link.classList.toggle("active", link.dataset.pageLink === target.dataset.page);
@@ -272,57 +392,234 @@ function setActivePage(pageName = currentPageName()) {
 }
 
 async function refreshDashboard() {
-  const [data, health] = await Promise.all([api("/api/dashboard"), api("/api/system/health")]);
+  const [data, health, ticker, v2Summary] = await Promise.all([
+    api("/api/dashboard"),
+    api("/api/system/health"),
+    api("/api/global-exception-ticker"),
+    api("/api/v2/order-dashboard"),
+  ]);
+  const businessTodo =
+    Number(data.drafted || 0) +
+    Number(data.questioned || 0) +
+    Number(data.change_review || 0) +
+    Number(data.exceptions_open || 0);
+  const statusCounts = v2Summary.status_counts || {};
+  const omsAttention = Number(v2Summary.oms_retrying || 0) + Number(v2Summary.oms_blocked || 0);
   const labels = [
-    ["任务总数", data.tasks_total, "全部销售需求任务"],
-    ["草稿待确认", data.drafted, "等待初审或人工补充"],
-    ["已下达", data.issued, "已发送生产任务单"],
-    ["生产疑问", data.questioned, "生产侧待答疑"],
-    ["已关闭", data.closed, "已确认、取消或终止"],
-    ["发送失败", data.outbound_failed, "需运维处理的外发"],
-    ["变更/取消", data.change_review, "待复核的变更请求"],
+    ["中台订单", v2Summary.total_orders || 0, "CRM 审批后进入中台的订单", "normal"],
+    ["预审直通率", `${v2Summary.stp_rate || 0}%`, "已通过预审或进入履约链路", Number(v2Summary.stp_rate || 0) >= 90 ? "ok" : "warn"],
+    ["OMS 阻断", omsAttention, `重试 ${v2Summary.oms_retrying || 0} / 死信 ${v2Summary.oms_blocked || 0}`, omsAttention ? "danger" : "ok"],
+    ["开放异常", data.exceptions_open || 0, `商务待办 ${businessTodo}`, Number(data.exceptions_open || 0) ? "warn" : "ok"],
   ];
-  $("#dashboard").innerHTML = labels
-    .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></div>`)
+  renderDashboardFocus(data, health);
+  renderGlobalExceptionTicker(ticker.items || []);
+  $("#dashboard-metrics").innerHTML = labels
+    .map(([label, value, hint, tone]) => `<div class="metric metric-${h(tone)}"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></div>`)
     .join("");
-  renderSystemHealth(health);
   renderDashboardInsights(data.analytics || {});
+  renderAgentDashboardPanels(v2Summary, data, health, ticker.items || [], statusCounts);
 }
 
-function renderSystemHealth(health) {
-  const node = $("#system-health");
+function renderGlobalExceptionTicker(items) {
+  const node = $("#global-exception-ticker");
   if (!node) return;
-  const readiness = health.readiness || { ready: false, missing: [] };
-  const worker = health.worker || {};
-  const outbound = health.queues?.outbound || {};
-  const processing = health.queues?.processing || {};
-  const outboundCounts = outbound.counts || {};
-  const processingCounts = processing.counts || {};
+  const rows = (items || []).slice(0, 6);
+  node.hidden = rows.length === 0;
+  if (!rows.length) {
+    node.innerHTML = "";
+    return;
+  }
   node.innerHTML = `
-    <div class="health-card ${readiness.ready ? "is-ok" : "is-warn"}">
-      <small>启动就绪</small>
-      <strong>${readiness.ready ? "已就绪" : "未就绪"}</strong>
-      <span>${readiness.ready ? "配置完整" : `缺少：${h((readiness.missing || []).join("、") || "未知")}`}</span>
+    <strong>高优先级异常</strong>
+    <div class="global-exception-track">
+      ${rows
+        .map(
+          (item) => `
+            <a class="global-exception-item is-${h(item.tone || "warn")}" href="${h(item.href || "#exceptions")}" title="${h(item.message || "")}">
+              <span>${h(item.title || item.type || "异常")}</span>
+              <small>${h(item.sla_status ? `SLA ${item.sla_status}` : item.message || "")}</small>
+            </a>`
+        )
+        .join("")}
     </div>
-    <div class="health-card ${health.bot_enabled ? "is-ok" : "is-warn"}">
-      <small>系统开关</small>
-      <strong>${health.bot_enabled ? "运行中" : "已停用"}</strong>
-      <span>${health.bot_enabled ? "自动流程允许执行" : "不会自动消费邮件和队列"}</span>
+  `;
+}
+
+function statusTone(value, warnAt = 1, dangerAt = Infinity) {
+  const number = Number(value || 0);
+  if (number >= dangerAt) return "danger";
+  if (number >= warnAt) return "warn";
+  return "ok";
+}
+
+function renderAgentDashboardPanels(v2Summary, data, health, tickerItems, statusCounts) {
+  renderDashboardActivity(data, health, tickerItems);
+  renderOrderWaterline(v2Summary, statusCounts);
+  renderExceptionDistribution(data, tickerItems);
+  renderFulfillmentTrend(v2Summary, statusCounts);
+}
+
+function renderDashboardActivity(data, health, tickerItems) {
+  const node = $("#dashboard-activity-table");
+  if (!node) return;
+  const processingCounts = health.queues?.processing?.counts || {};
+  const outboundCounts = health.queues?.outbound?.counts || {};
+  const rows = [
+    [data.generated_at ? formatTime(data.generated_at) : "当前", "CRM 同步 / 订单预审 / 队列事件", `${processingCounts.Pending || 0} 待处理 / ${processingCounts.Failed || 0} 失败`],
+    [data.generated_at ? formatTime(data.generated_at) : "当前", "OMS 下推 / 通知发送 / 异常接管", `${outboundCounts.Pending || 0} 待通知 / ${outboundCounts.Failed || 0} 死信`],
+    ...(tickerItems || []).slice(0, 2).map((item) => [
+      item.created_at ? formatTime(item.created_at) : "最新",
+      item.title || item.type || "高优先级异常",
+      item.sla_status || item.message || "待处理",
+    ]),
+  ];
+  node.innerHTML = `
+    <div><span>时间</span><span>活动</span><span>状态</span></div>
+    ${rows
+      .map(([time, activity, status]) => `<div><span>${h(time)}</span><span>${h(activity)}</span><strong>${h(status)}</strong></div>`)
+      .join("")}
+  `;
+}
+
+function renderOrderWaterline(v2Summary, statusCounts) {
+  const node = $("#dashboard-order-waterline");
+  if (!node) return;
+  const rows = [
+    ["预审阻断", statusCounts.VALIDATION_BLOCKED || 0, "需补字段/主数据/附件"],
+    ["预审通过", statusCounts.VALIDATED || 0, "等待发货通知"],
+    ["待推 OMS", statusCounts.OMS_PENDING || 0, "已确认待下推"],
+    ["履约归档", statusCounts.FULFILLMENT_ARCHIVED || 0, "一期流程完成"],
+  ];
+  node.innerHTML = `
+    <div class="dashboard-card-head">
+      <h2>订单水位</h2>
+      <a href="#crm-orders" class="button ghost">订单</a>
     </div>
-    <div class="health-card">
-      <small>自动 worker</small>
-      <strong>${worker.auto_worker_enabled ? `${h(worker.configured_interval_seconds)} 秒/轮` : "未启用"}</strong>
-      <span>${worker.last_finished_at ? `最近完成：${h(formatTime(worker.last_finished_at))}` : "当前进程尚无完成记录"}</span>
+    <strong class="dashboard-placeholder-value">${h(v2Summary.total_orders || 0)}</strong>
+    <p>CRM 订单进入中台后的预审、OMS 和归档分布。</p>
+    <div class="dashboard-focus-list">
+      ${rows.map(([label, value, hint]) => `<a class="dashboard-focus-row is-${Number(value) ? "warn" : "ok"}" href="#crm-orders"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></a>`).join("")}
     </div>
-    <div class="health-card ${Number(outboundCounts.Pending || 0) ? "is-warn" : "is-ok"}">
-      <small>外发队列</small>
-      <strong>Pending ${h(outboundCounts.Pending || 0)}</strong>
-      <span>自动 ${h(outbound.pending_auto_dispatchable || 0)} / 手动 ${h(outbound.pending_manual_only || 0)} / 失败 ${h(outboundCounts.Failed || 0)}</span>
+  `;
+}
+
+function renderExceptionDistribution(data, tickerItems) {
+  const node = $("#dashboard-exception-distribution");
+  if (!node) return;
+  const highRisk = (tickerItems || []).filter((item) => item.type === "exception").length;
+  const rows = [
+    ["开放异常", data.exceptions_open || 0, "异常台待处理"],
+    ["高优先级", highRisk, "Critical/High 或 SLA 风险"],
+    ["处理死信", (tickerItems || []).filter((item) => item.type === "processing_dead_letter").length, "队列失败需接管"],
+    ["通知死信", (tickerItems || []).filter((item) => item.type === "outbound_dead_letter").length, "邮件发送失败"],
+  ];
+  node.innerHTML = `
+    <div class="dashboard-card-head">
+      <h2>异常分布</h2>
+      <a href="#exceptions" class="button ghost">异常</a>
     </div>
-    <div class="health-card ${Number(processingCounts.Pending || 0) ? "is-warn" : "is-ok"}">
-      <small>入库队列</small>
-      <strong>Pending ${h(processingCounts.Pending || 0)}</strong>
-      <span>Running ${h(processingCounts.Running || 0)} / Failed ${h(processingCounts.Failed || 0)}</span>
+    <strong class="dashboard-placeholder-value">${h(data.exceptions_open || 0)}</strong>
+    <p>商务、履约、系统队列和通知链路的阻断风险。</p>
+    <div class="dashboard-focus-list">
+      ${rows.map(([label, value, hint]) => `<a class="dashboard-focus-row is-${Number(value) ? "warn" : "ok"}" href="#exceptions"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></a>`).join("")}
+    </div>
+  `;
+}
+
+function renderFulfillmentTrend(v2Summary, statusCounts) {
+  const node = $("#dashboard-fulfillment-trend");
+  if (!node) return;
+  const fulfillmentActive =
+    Number(statusCounts.OMS_PENDING || 0) +
+    Number(statusCounts.OMS_RETRYING || 0) +
+    Number(statusCounts.OMS_ACCEPTED || 0) +
+    Number(statusCounts.PICKING || 0) +
+    Number(statusCounts.SHIPPED || 0);
+  const rows = [
+    ["OMS 待推送", statusCounts.OMS_PENDING || 0, "待创建下游单"],
+    ["OMS 重试中", statusCounts.OMS_RETRYING || 0, "自动补偿中"],
+    ["OMS 已接收", statusCounts.OMS_ACCEPTED || 0, "等待执行状态"],
+    ["拣货/已发货", Number(statusCounts.PICKING || 0) + Number(statusCounts.SHIPPED || 0), "仓库执行中"],
+  ];
+  node.innerHTML = `
+    <div class="dashboard-card-head">
+      <h2>履约趋势</h2>
+      <a href="#logistics-tasks" class="button ghost">履约</a>
+    </div>
+    <strong class="dashboard-placeholder-value">${h(fulfillmentActive)}</strong>
+    <p>已进入发货通知、OMS 下推、仓库执行的订单水位。</p>
+    <div class="dashboard-focus-list">
+      ${rows.map(([label, value, hint]) => `<a class="dashboard-focus-row is-${Number(value) ? "warn" : "ok"}" href="#logistics-tasks"><span>${h(label)}</span><strong>${h(value)}</strong><small>${h(hint)}</small></a>`).join("")}
+    </div>
+  `;
+}
+
+function renderDashboardFocus(data, health) {
+  const business = $("#dashboard-business-panel");
+  const ops = $("#dashboard-ops-panel");
+  if (!business || !ops) return;
+  const readiness = health.readiness || { ready: false, missing: [] };
+  const processing = health.queues?.processing || {};
+  const outbound = health.queues?.outbound || {};
+  const processingCounts = processing.counts || {};
+  const outboundCounts = outbound.counts || {};
+  const configRiskCount = (readiness.ready ? 0 : Math.max(1, (readiness.missing || []).length)) + (health.bot_enabled ? 0 : 1);
+  const businessRows = [
+    ["草稿待确认", data.drafted, "等待初审或补充", Number(data.drafted || 0) ? "warn" : "ok", "#tasks"],
+    ["生产疑问", data.questioned, "生产侧待答疑", Number(data.questioned || 0) ? "warn" : "ok", "#tasks"],
+    ["变更/取消", data.change_review, "待商务复核", Number(data.change_review || 0) ? "warn" : "ok", "#crm-orders"],
+    ["异常接管", data.exceptions_open, "阻断项需人工处理", Number(data.exceptions_open || 0) ? "danger" : "ok", "#exceptions"],
+  ];
+  const opsRows = [
+    ["启动就绪", readiness.ready ? "已就绪" : "未就绪", readiness.ready ? "配置完整" : `缺少 ${(readiness.missing || []).length || 0} 项配置`, readiness.ready ? "ok" : "warn", "#integration"],
+    ["机器人", health.bot_enabled ? "运行中" : "已停用", health.bot_enabled ? "自动流程可执行" : "不会自动消费邮件和队列", health.bot_enabled ? "ok" : "warn", "#integration"],
+    ["入库队列", `Pending ${processingCounts.Pending || 0}`, `Failed ${processingCounts.Failed || 0}`, statusTone(Number(processingCounts.Failed || 0), 1, 1), "#ops"],
+    ["外发队列", `Pending ${outboundCounts.Pending || 0}`, `Failed ${outboundCounts.Failed || 0}`, statusTone(Number(outboundCounts.Failed || 0), 1, 1), "#outbound"],
+  ];
+  const businessTotal = businessRows.reduce((sum, row) => sum + Number(row[1] || 0), 0);
+  const opsTotal =
+    configRiskCount +
+    Number(processingCounts.Pending || 0) +
+    Number(processingCounts.Failed || 0) +
+    Number(outboundCounts.Pending || 0) +
+    Number(outboundCounts.Failed || 0);
+  const renderRows = (rows) =>
+    rows
+      .map(
+        ([label, value, hint, tone, href]) => `
+          <a class="dashboard-focus-row is-${h(tone)}" href="${h(href)}">
+            <span>${h(label)}</span>
+            <strong>${h(value ?? 0)}</strong>
+            <small>${h(hint)}</small>
+          </a>`
+      )
+      .join("");
+  business.innerHTML = `
+    <div class="dashboard-focus-head">
+      <div>
+        <small>商务关注</small>
+        <h2>需要人工判断的订单事项</h2>
+      </div>
+      <strong>${h(businessTotal)}</strong>
+    </div>
+    <div class="dashboard-focus-list">${renderRows(businessRows)}</div>
+    <div class="dashboard-focus-actions">
+      <a class="button" href="${businessTotal ? "#exceptions" : "#crm-orders"}">${businessTotal ? "处理商务待办" : "查看 CRM 订单"}</a>
+      <a class="button ghost" href="#tasks">生产任务</a>
+    </div>
+  `;
+  ops.innerHTML = `
+    <div class="dashboard-focus-head">
+      <div>
+        <small>运维关注</small>
+        <h2>影响自动化运行的配置与队列</h2>
+      </div>
+      <strong>${h(opsTotal)}</strong>
+    </div>
+    <div class="dashboard-focus-list">${renderRows(opsRows)}</div>
+    <div class="dashboard-focus-actions">
+      <a class="button" href="${opsTotal ? "#integration" : "#ops"}">${opsTotal ? "检查系统接入" : "查看队列审计"}</a>
+      <a class="button ghost" href="#outbound">通知队列</a>
     </div>
   `;
 }
@@ -1982,12 +2279,95 @@ async function refreshJobs() {
         <div class="row">
           <div><strong>${h(row.job_type)}</strong><br /><small>${h(row.id)}</small></div>
           <div><small>状态</small><br />${h(row.status)}</div>
-          <div><small>尝试</small><br />${h(row.attempt_count)}</div>
+          <div><small>尝试 / 版本</small><br />${h(row.attempt_count)} / V${h(row.version ?? 0)}</div>
           <div><small>${h(row.error_message || row.created_at)}</small></div>
         </div>`
       )
       .join("") || `<div class="row"><div>暂无入库队列任务</div></div>`;
   renderListPagination("#jobs-pagination", "jobs", data);
+}
+
+async function refreshIntegrationEvents() {
+  const data = normalizeListPayload(await api(`/api/integration-events?${queryFromState(tableStates.integrationEvents)}`), tableStates.integrationEvents);
+  setSelectOptions("#integration-events-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.integrationEvents.status);
+  setSelectOptions("#integration-events-filter-form [name=event_type]", data.event_type_options || [], "全部事件", tableStates.integrationEvents.event_type);
+  setSelectOptions("#integration-events-filter-form [name=source_system]", data.source_system_options || [], "全部系统", tableStates.integrationEvents.source_system);
+  $("#integration-events-list").innerHTML =
+    (data.items || []).map((row) => `
+      <div class="row">
+        <div>
+          <strong>${h(row.event_type)}</strong><br />
+          <small>${h(row.source_system)} · ${h(row.status)}</small>
+        </div>
+        <div>
+          <strong>${h(row.biz_key)}</strong><br />
+          <small>${h(String(row.payload_hash || "").slice(0, 12))}</small>
+        </div>
+        <div>
+          <strong>${h(row.retry_count || 0)}</strong><br />
+          <small>${h(formatTime(row.updated_at || row.created_at))}</small>
+        </div>
+        <div>
+          <small>${h(row.error_message || row.trace_id || "-")}</small>
+        </div>
+      </div>
+    `).join("") || `<div class="row"><div>暂无接口日志</div></div>`;
+  renderListPagination("#integration-events-pagination", "integrationEvents", data);
+}
+
+async function refreshAgentRuns() {
+  const data = normalizeListPayload(await api(`/api/agent-run-logs?${queryFromState(tableStates.agentRuns)}`), tableStates.agentRuns);
+  setSelectOptions("#agent-runs-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.agentRuns.status);
+  setSelectOptions("#agent-runs-filter-form [name=agent_name]", data.agent_name_options || [], "全部 Agent", tableStates.agentRuns.agent_name);
+  setSelectOptions("#agent-runs-filter-form [name=task_type]", data.task_type_options || [], "全部任务", tableStates.agentRuns.task_type);
+  $("#agent-runs-list").innerHTML =
+    (data.items || []).map((row) => `
+      <div class="row">
+        <div>
+          <strong>${h(row.agent_name)}</strong><br />
+          <small>${h(row.task_type)} · ${h(row.status)}</small>
+        </div>
+        <div>
+          <strong>${h(row.related_object_id || "-")}</strong><br />
+          <small>${h(row.related_object_type || "未关联对象")}</small>
+        </div>
+        <div>
+          <strong>${h(formatTime(row.finished_at || row.started_at))}</strong><br />
+          <small>${h(row.finished_at ? "已结束" : "运行中")}</small>
+        </div>
+        <div>
+          <small>${h(row.error_message || (row.output && row.output.summary) || "-")}</small>
+        </div>
+      </div>
+    `).join("") || `<div class="row"><div>暂无 Agent 运行记录</div></div>`;
+  renderListPagination("#agent-runs-pagination", "agentRuns", data);
+}
+
+async function refreshModelCalls() {
+  const data = normalizeListPayload(await api(`/api/model-call-logs?${queryFromState(tableStates.modelCalls)}`), tableStates.modelCalls);
+  setSelectOptions("#model-calls-filter-form [name=status]", data.status_options || [], "全部状态", tableStates.modelCalls.status);
+  setSelectOptions("#model-calls-filter-form [name=task_type]", data.task_type_options || [], "全部任务", tableStates.modelCalls.task_type);
+  $("#model-calls-list").innerHTML =
+    (data.items || []).map((row) => `
+      <div class="row">
+        <div>
+          <strong>${h(row.task_type)}</strong><br />
+          <small>${h(row.status)} · ${h(row.provider_config_id || "无模型配置")}</small>
+        </div>
+        <div>
+          <strong>${h(row.related_object_id || "-")}</strong><br />
+          <small>${h(row.related_object_type || "未关联对象")}</small>
+        </div>
+        <div>
+          <strong>${h(row.latency_ms ?? "-")}</strong><br />
+          <small>${h(formatTime(row.created_at))}</small>
+        </div>
+        <div>
+          <small>${h(row.error_message || (row.output && row.output.summary) || (row.output && row.output.root_cause) || "-")}</small>
+        </div>
+      </div>
+    `).join("") || `<div class="row"><div>暂无模型调用记录</div></div>`;
+  renderListPagination("#model-calls-pagination", "modelCalls", data);
 }
 
 async function refreshAttachments() {
@@ -2137,6 +2517,54 @@ function renderCrmSnapshots(snapshots = []) {
   `).join("");
 }
 
+function renderSnapshotDiff(diff = {}) {
+  const changes = Array.isArray(diff.changes) ? diff.changes : [];
+  if (!changes.length) {
+    return `<p class="muted-line">暂无快照字段差异</p>`;
+  }
+  return `
+    <div class="snapshot-diff-list">
+      <div class="snapshot-diff-head">
+        <span>字段</span>
+        <span>旧值</span>
+        <span>新值</span>
+        <span>来源</span>
+      </div>
+      ${changes
+        .map(
+          (item) => `
+            <div class="snapshot-diff-row">
+              <strong>${h(item.field_label || item.field || "-")}</strong>
+              <small>${h(item.old_value || "空")}</small>
+              <small>${h(item.new_value || "空")}</small>
+              <small>${h(item.source_path || item.source || "-")}</small>
+            </div>`
+        )
+        .join("")}
+    </div>
+    <p class="muted-line">快照 V${h(diff.from_version || "-")} → V${h(diff.to_version || "-")}</p>
+  `;
+}
+
+function renderDeliveryNoticeEvidence(notices = []) {
+  if (!Array.isArray(notices) || !notices.length) {
+    return `<p class="muted-line">暂无发货通知</p>`;
+  }
+  return notices.map((notice) => `
+    <p>
+      <strong>${h(notice.notice_no)}</strong> · ${h(notice.status)}
+      ${notice.oms_order_no ? ` · OMS ${h(notice.oms_order_no)}` : ""}
+      ${notice.waybill_no ? ` · 运单 ${h(notice.waybill_no)}` : ""}
+      <br />
+      <small>业务版本 V${h(notice.notice_version || 1)} · 锁版本 ${h(notice.version ?? 0)} · 面单 ${h(notice.print_status || "NotRequested")}${notice.print_retry_count ? `(${h(notice.print_retry_count)})` : ""} · 平台回传 ${h(notice.platform_fulfillment_status || "NotRequired")}${notice.platform_fulfillment_retry_count ? `(${h(notice.platform_fulfillment_retry_count)})` : ""}</small>
+      ${notice.source_snapshot_hash ? `<br /><small>来源快照 ${h(String(notice.source_snapshot_hash).slice(0, 12))}</small>` : ""}
+      ${notice.platform_fulfillment_synced_waybill_no ? `<br /><small>已回传运单 ${h(notice.platform_fulfillment_synced_waybill_no)}${notice.platform_fulfillment_synced_at ? ` · ${h(formatTime(notice.platform_fulfillment_synced_at))}` : ""}</small>` : ""}
+      ${notice.print_error ? `<br /><small>面单错误：${h(notice.print_error)}</small>` : ""}
+      ${notice.platform_fulfillment_error ? `<br /><small>平台回传错误：${h(notice.platform_fulfillment_error)}</small>` : ""}
+    </p>
+  `).join("");
+}
+
 function flowStatusText(status) {
   return {
     done: "完成",
@@ -2182,6 +2610,7 @@ function renderCrmOrderFlow(flow = {}) {
   const order = flow.middle_order;
   const currentNode = $("#crm-order-flow-current");
   const badge = $("#crm-order-flow-badge");
+  const alertNode = $("#crm-order-flow-alert");
   const flowNode = $("#crm-order-flow");
   const evidenceNode = $("#crm-order-flow-evidence");
   if (!currentNode || !badge || !flowNode || !evidenceNode) return;
@@ -2194,6 +2623,16 @@ function renderCrmOrderFlow(flow = {}) {
     currentNode.textContent = `${middleOrderStatusLabel(order.status)} · 中台订单 ${order.order_no}`;
     badge.className = flowBadgeClass(order.status);
     badge.textContent = middleOrderStatusLabel(order.status);
+  }
+  if (alertNode) {
+    const alert = flow.risk_alert;
+    alertNode.hidden = !alert;
+    alertNode.innerHTML = alert
+      ? `<strong>${h(alert.exception_type || "CRM 变更待处理")}</strong>
+          <p>${h(alert.summary || "")}</p>
+          <small>快照 V${h(alert.current_snapshot_version || "-")} → V${h(alert.latest_snapshot_version || "-")} · 发货预览 ${h(alert.preview_status || "-")} · OMS job ${h(alert.oms_job_status || "-")}${alert.oms_status ? ` · OMS 状态 ${h(alert.oms_status)}` : ""}${alert.oms_order_no ? ` · OMS ${h(alert.oms_order_no)}` : ""}</small>
+          <ul>${(alert.next_actions || []).map((item) => `<li>${h(item)}</li>`).join("")}</ul>`
+      : "";
   }
 
   flowNode.innerHTML = (flow.steps || [])
@@ -2217,18 +2656,19 @@ function renderCrmOrderFlow(flow = {}) {
   const jobs = flow.processing_jobs || [];
   const audits = flow.audit_events || [];
   const snapshots = flow.crm_snapshots || [];
+  const snapshotDiff = flow.snapshot_diff || {};
   evidenceNode.innerHTML = `
     <div>
       <h4>CRM 快照</h4>
       ${renderCrmSnapshots(snapshots)}
     </div>
     <div>
+      <h4>快照差异</h4>
+      ${renderSnapshotDiff(snapshotDiff)}
+    </div>
+    <div>
       <h4>发货通知</h4>
-      ${
-        notices.length
-          ? notices.map((notice) => `<p><strong>${h(notice.notice_no)}</strong> · ${h(notice.status)}${notice.oms_order_no ? ` · OMS ${h(notice.oms_order_no)}` : ""}</p>`).join("")
-          : `<p class="muted-line">暂无发货通知</p>`
-      }
+      ${renderDeliveryNoticeEvidence(notices)}
     </div>
     <div>
       <h4>异常</h4>
@@ -2270,6 +2710,7 @@ function renderCrmOmsExtractionAlert(row) {
 }
 
 async function openCrmOrderDetail(orderId) {
+  currentCrmOrderDetailId = orderId;
   const modal = $("#crm-order-detail-modal");
   modal.hidden = false;
   $("#crm-order-detail-title").textContent = "订单详情";
@@ -2283,7 +2724,10 @@ async function openCrmOrderDetail(orderId) {
   try {
     const row = await api(`/api/crm/orders/${orderId}`);
     $("#crm-order-detail-title").textContent = row.crm_order_no || row.crm_order_id || "订单详情";
-    $("#crm-order-detail-meta").textContent = `${row.source_system || "CRM"} · 同步时间 ${row.synced_at ? formatTime(row.synced_at) : "未同步"} · ${row.crm_detail_message || ""}`;
+    const canRetryDetail = row.crm_detail_status === "detail_failed" || row.crm_detail_status === "list_only";
+    $("#crm-order-detail-meta").innerHTML = `${h(row.source_system || "CRM")} · 同步时间 ${row.synced_at ? h(formatTime(row.synced_at)) : "未同步"} · ${h(row.crm_detail_message || "")}${
+      canRetryDetail ? ` <button class="button ghost mini" data-action="retry-crm-detail-sync" data-id="${h(row.id)}">重试详情同步</button>` : ""
+    }`;
     $("#crm-order-detail-summary").innerHTML = [
       ["订单金额", formatAmountHtml(row.order_amount, row.currency), row.currency || "CNY"],
       ["已回款", formatAmountHtml(row.received_amount, row.currency), "CRM 回款金额"],
@@ -2330,6 +2774,7 @@ async function openCrmOrderDetail(orderId) {
 
 function closeCrmOrderDetail() {
   $("#crm-order-detail-modal").hidden = true;
+  currentCrmOrderDetailId = "";
 }
 
 async function refreshOps() {
@@ -2433,16 +2878,194 @@ function statusPillClass(status) {
 function renderExceptionActions(row) {
   const id = h(row.id);
   const isClosed = ["Resolved", "Closed"].includes(row.status);
+  const highRisk = row.requires_confirmation ? "true" : "false";
   return `
+    <button class="button ghost" data-action="view-exception-context" data-id="${id}">上下文</button>
     <button class="button ghost" data-action="assign-exception" data-id="${id}">分派</button>
     <button class="button ghost" data-action="diagnose-exception" data-id="${id}">诊断</button>
     ${
       isClosed
         ? `<button class="button ghost" data-action="reopen-exception" data-id="${id}">重开</button>`
-        : `<button class="button ghost" data-action="resolve-exception" data-id="${id}">关闭</button>`
+        : `<button class="button ghost" data-action="resolve-exception" data-id="${id}" data-high-risk="${highRisk}">关闭</button>`
     }
     <button class="button ghost" data-action="patch-exception" data-id="${id}">补字段</button>
   `;
+}
+
+function diagnoseExceptionStream(id) {
+  if (!window.EventSource) return Promise.resolve(false);
+  return new Promise((resolve, reject) => {
+    const source = new EventSource(`/api/exceptions/${encodeURIComponent(id)}/diagnose-stream`);
+    let completed = false;
+    source.addEventListener("loading", (event) => {
+      const data = JSON.parse(event.data || "{}");
+      toast(data.message || "AI 诊断启动");
+    });
+    source.addEventListener("partial", (event) => {
+      const data = JSON.parse(event.data || "{}");
+      toast(data.message || "AI 诊断处理中");
+    });
+    source.addEventListener("done", () => {
+      completed = true;
+      source.close();
+      toast("诊断已生成");
+      resolve(true);
+    });
+    source.addEventListener("error", (event) => {
+      source.close();
+      if (completed) return;
+      const data = event.data ? JSON.parse(event.data) : {};
+      reject(new Error(data.message || "AI 流式诊断失败"));
+    });
+  });
+}
+
+function omsReplayNoticeCandidate(order = {}) {
+  const notices = Array.isArray(order.delivery_notices) ? order.delivery_notices : [];
+  return notices.find((notice) => ["Blocked", "Retrying"].includes(notice.status)) || notices.find((notice) => notice.id) || null;
+}
+
+function renderExceptionContextPanel(data = {}) {
+  const exception = data.exception || {};
+  const order = data.middle_order || {};
+  const crm = data.crm_order || {};
+  const diagnosis = data.diagnosis || {};
+  const jobs = data.processing_jobs || [];
+  const audits = data.audit_events || [];
+  const feedback = data.feedback || [];
+  const actions = data.next_actions || [];
+  const snapshotDiff = data.snapshot_diff || {};
+  const replayGate = data.oms_replay || {};
+  return `
+    <div class="exception-context-grid">
+      <section>
+        <h3>${h(exception.exception_type || "异常")}</h3>
+        <p>${h(summarizeExceptionDetail(exception.detail || {}))}</p>
+        <div class="exception-materials">
+          <span>${h(exception.status || "-")}</span>
+          <span>${h(exception.severity || "-")}</span>
+          <span>${h(exception.sla_status || "-")}</span>
+        </div>
+      </section>
+      <section>
+        <h3>${h(order.order_no || crm.crm_order_no || "订单")}</h3>
+        <p>${h(order.customer_name || crm.customer_name || "-")} · ${h(order.status || "-")}</p>
+        <small>${h(order.channel_code || "")}${order.shop_code ? ` · ${h(order.shop_code)}` : ""}${order.platform_order_no ? ` · ${h(order.platform_order_no)}` : ""}</small>
+      </section>
+      <section>
+        <h3>AI 诊断</h3>
+        ${
+          diagnosis.summary
+            ? `<p>${h(diagnosis.summary)}</p><small>责任建议：${h(diagnosis.suggested_owner || "-")} · 置信度 ${h(diagnosis.confidence ?? "-")}</small>`
+            : `<p class="muted-line">暂无诊断</p>`
+        }
+        <div class="exception-context-actions">
+          <button class="button ghost" data-action="diagnosis-feedback" data-id="${h(exception.id)}" data-feedback="accepted">采纳</button>
+          <button class="button ghost" data-action="diagnosis-feedback" data-id="${h(exception.id)}" data-feedback="modified">修改</button>
+          <button class="button ghost" data-action="diagnosis-feedback" data-id="${h(exception.id)}" data-feedback="rejected">驳回</button>
+        </div>
+      </section>
+    </div>
+    ${
+      diagnosis.address_correction
+        ? `
+        <div class="exception-context-section address-correction-card" style="margin-bottom: 20px; background: var(--surface-soft); padding: 16px; border-radius: 8px; border: 1px dashed var(--warn);">
+          <h3 style="display: flex; align-items: center; gap: 8px; color: var(--warn); font-size: 15px; margin-bottom: 8px;">
+            <span>💡 AI 地址智能修复建议</span>
+          </h3>
+          <p class="correction-reason" style="margin: 4px 0 12px; font-size: 13px; color: var(--ink);">
+            <strong>修正原因：</strong>${h(diagnosis.address_correction.reason || "智能分析建议修正。")}
+          </p>
+          <table class="correction-comparison-table" style="width: 100%; border-collapse: collapse; margin-bottom: 15px;">
+            <thead>
+              <tr style="border-bottom: 2px solid var(--line); font-size: 13px; color: var(--muted);">
+                <th style="padding: 6px 12px; text-align: left; font-weight: 600;">字段</th>
+                <th style="padding: 6px 12px; text-align: left; font-weight: 600;">原始值</th>
+                <th style="padding: 6px 12px; text-align: left; font-weight: 600;">修正后建议值</th>
+              </tr>
+            </thead>
+            <tbody style="font-size: 13px;">
+              ${
+                diagnosis.address_correction.receipt_address
+                  ? `<tr style="border-bottom: 1px solid var(--line);">
+                      <td style="padding: 8px 12px; font-weight: 500;">收货地址</td>
+                      <td style="padding: 8px 12px; text-decoration: line-through; color: var(--muted);">${h(order.receipt_address || crm.receipt_address || "空")}</td>
+                      <td style="padding: 8px 12px; font-weight: 600; color: var(--warn);">${h(diagnosis.address_correction.receipt_address)}</td>
+                    </tr>`
+                  : ""
+              }
+              ${
+                diagnosis.address_correction.receipt_contact
+                  ? `<tr style="border-bottom: 1px solid var(--line);">
+                      <td style="padding: 8px 12px; font-weight: 500;">收货人</td>
+                      <td style="padding: 8px 12px; text-decoration: line-through; color: var(--muted);">${h(order.receipt_contact || crm.receipt_contact || "空")}</td>
+                      <td style="padding: 8px 12px; font-weight: 600; color: var(--warn);">${h(diagnosis.address_correction.receipt_contact)}</td>
+                    </tr>`
+                  : ""
+              }
+              ${
+                diagnosis.address_correction.receipt_phone
+                  ? `<tr style="border-bottom: 1px solid var(--line);">
+                      <td style="padding: 8px 12px; font-weight: 500;">联系电话</td>
+                      <td style="padding: 8px 12px; text-decoration: line-through; color: var(--muted);">${h(order.receipt_phone || crm.receipt_phone || "空")}</td>
+                      <td style="padding: 8px 12px; font-weight: 600; color: var(--warn);">${h(diagnosis.address_correction.receipt_phone)}</td>
+                    </tr>`
+                  : ""
+              }
+            </tbody>
+          </table>
+          <div style="display: flex; gap: 10px;">
+            <button class="button success" style="background-color: #16a34a; color: white;" data-action="apply-address-correction" data-exception-id="${h(exception.id)}">一键应用地址修复</button>
+          </div>
+        </div>
+        `
+        : ""
+    }
+    <div class="exception-context-section">
+      <h3>下一步</h3>
+      <ul>${actions.map((item) => `<li>${h(item)}</li>`).join("") || "<li>暂无建议</li>"}</ul>
+      ${
+        replayGate.ready && replayGate.notice_id
+          ? `<div class="exception-context-actions">
+              <button class="button" data-action="replay-oms-notice" data-id="${h(replayGate.notice_id)}" data-exception-id="${h(exception.id || "")}" data-notice-no="${h(replayGate.notice_no || "")}">填写修复证据并重放 OMS</button>
+            </div>`
+          : replayGate.reason
+            ? `<p class="muted-line">OMS 重放暂不可用：${h(replayGate.reason)}</p>`
+          : ""
+      }
+    </div>
+    <div class="exception-context-section">
+      <h3>CRM 快照差异</h3>
+      ${renderSnapshotDiff(snapshotDiff)}
+    </div>
+    <div class="exception-context-grid">
+      <section>
+        <h3>队列</h3>
+        ${jobs.slice(0, 6).map((job) => `<p><strong>${h(job.job_type)}</strong> · ${h(job.status)}<br /><small>${h(job.error_message || job.created_at || "")}</small></p>`).join("") || `<p class="muted-line">暂无关联队列</p>`}
+      </section>
+      <section>
+        <h3>审计</h3>
+        ${audits.slice(0, 6).map((event) => `<p><strong>${h(event.event_type)}</strong><br /><small>${h(event.actor || "")} · ${h(formatTime(event.created_at))}</small></p>`).join("") || `<p class="muted-line">暂无关联审计</p>`}
+      </section>
+      <section>
+        <h3>反馈</h3>
+        ${feedback.slice(-5).reverse().map((item) => `<p><strong>${h(item.feedback)}</strong> · ${h(item.actor || "")}<br /><small>${h(item.note || "")}</small></p>`).join("") || `<p class="muted-line">暂无反馈</p>`}
+      </section>
+    </div>
+  `;
+}
+
+async function openExceptionContext(id) {
+  $("#exception-context-modal").hidden = false;
+  $("#exception-context-title").textContent = "异常上下文";
+  $("#exception-context-body").innerHTML = `<div class="empty-note">正在读取异常上下文...</div>`;
+  try {
+    const data = await api(`/api/exceptions/${id}/context`);
+    $("#exception-context-title").textContent = data.exception?.exception_type || "异常上下文";
+    $("#exception-context-body").innerHTML = renderExceptionContextPanel(data);
+  } catch (error) {
+    $("#exception-context-body").innerHTML = `<div class="empty-note">读取失败：${h(messageFromError(error))}</div>`;
+  }
 }
 
 function formatTime(value) {
@@ -2642,6 +3265,15 @@ function renderCrmSyncRuns(runs = []) {
     : `<div class="row"><div>暂无同步记录</div></div>`;
 }
 
+function crmContactConfidenceHtml(row = {}) {
+  const confidence = normalizePercent(row.contact_extraction_confidence);
+  const needsReview = Boolean(row.contact_extraction_manual_review_required);
+  const pillClass = needsReview ? "is-danger" : confidence === null ? "is-muted" : confidence >= 80 ? "is-active" : "is-warn";
+  const label = confidence === null ? "未识别" : `${confidence}%`;
+  const suffix = needsReview ? " · 人工确认" : "";
+  return `<span class="status-pill crm-contact-confidence ${pillClass}" title="LLM 从附件识别收货联系人、电话、地址的置信度">LLM ${h(label)}${h(suffix)}</span>`;
+}
+
 async function refreshCrmOrders() {
   const [listPayload, summary, v2Summary] = await Promise.all([
     api(`/api/crm/orders?${queryFromState(tableStates.crmOrders)}`),
@@ -2676,6 +3308,8 @@ async function refreshCrmOrders() {
               </div>
               <div>
                 <small>${h(row.synced_at ? formatTime(row.synced_at) : "")}</small><br />
+                ${crmContactConfidenceHtml(row)}
+                <br />
                 <button class="button ghost compact-action" type="button" data-action="view-crm-order" data-id="${h(row.id)}">详情</button>
                 <button class="button ghost compact-action" type="button" data-action="queue-crm-v2" data-id="${h(row.id)}">入中台</button>
                 <button class="button ghost compact-action" type="button" data-action="process-crm-v2" data-id="${h(row.id)}">立即预审</button>
@@ -2689,8 +3323,8 @@ async function refreshCrmOrders() {
 }
 
 async function refreshAll() {
-  await Promise.all([
-    refreshDashboard(),
+  await refreshDashboard();
+  const refreshers = [
     refreshSkills(),
     refreshDepartments(),
     refreshLogisticsDepartments(),
@@ -2703,6 +3337,9 @@ async function refreshAll() {
     refreshConfig(),
     refreshWeeklyReportRecipients(),
     refreshJobs(),
+    refreshIntegrationEvents(),
+    refreshAgentRuns(),
+    refreshModelCalls(),
     refreshAttachments(),
     refreshMails(),
     refreshOps(),
@@ -2714,7 +3351,12 @@ async function refreshAll() {
     refreshProductsPromotions(),
     refreshProductReviewReadiness(),
     refreshCrmOrders(),
-  ]);
+  ];
+  const results = await Promise.allSettled(refreshers);
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) {
+    notifyError(failed.reason, ["系统", "局部刷新失败"]);
+  }
 }
 
 $("#crm-orders-list")?.addEventListener("click", async (event) => {
@@ -2746,6 +3388,9 @@ const tableRefreshers = {
   outbound: refreshOutbound,
   exceptions: refreshExceptions,
   jobs: refreshJobs,
+  integrationEvents: refreshIntegrationEvents,
+  agentRuns: refreshAgentRuns,
+  modelCalls: refreshModelCalls,
   attachments: refreshAttachments,
   audit: refreshOps,
   backups: refreshOps,
@@ -2852,18 +3497,32 @@ $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   try {
-    await api("/api/auth/login", {
+    const data = await api("/api/auth/login", {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(form.entries())),
       skipAuthRedirect: true,
     });
-    showApp();
+    showApp(data);
     toast("已登录");
     await refreshAll();
   } catch (error) {
     toast(error.message || "登录失败");
   }
 });
+
+const demoList = $("#demo-account-list");
+if (demoList) {
+  demoList.addEventListener("click", (event) => {
+    const li = event.target.closest("li");
+    if (!li) return;
+    const username = li.dataset.user;
+    const password = li.dataset.pass;
+    const usernameInput = $("#login-username");
+    const passwordInput = $("#login-password");
+    if (usernameInput) usernameInput.value = username;
+    if (passwordInput) passwordInput.value = password;
+  });
+}
 
 $("#logout").addEventListener("click", async () => {
   try {
@@ -3406,7 +4065,9 @@ async function saveCrmConfig() {
   if (!values.crm_api_key) delete values.crm_api_key;
   if (!values.crm_fxiaoke_request_json) delete values.crm_fxiaoke_request_json;
   if (!values.crm_fxiaoke_detail_request_json) delete values.crm_fxiaoke_detail_request_json;
+  if (!values.v2_crm_phase1_scope_json) delete values.v2_crm_phase1_scope_json;
   values.crm_sync_enabled = formNode.elements.crm_sync_enabled.checked;
+  values.v2_crm_phase1_scope_enabled = formNode.elements.v2_crm_phase1_scope_enabled.checked;
   await api("/api/config/crm", {
     method: "PUT",
     body: JSON.stringify(values),
@@ -3496,6 +4157,44 @@ $("#test-oms-connection")?.addEventListener("click", async (event) => {
   } catch (error) {
     notifyError(error, ["系统接入", "OMS 连接测试失败"]);
     if (resultNode) resultNode.textContent = messageFromError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function runOmsStatusPollAction(asyncJob = false) {
+  const resultNode = $("#oms-status-poll-result");
+  if (resultNode) {
+    resultNode.classList.add("show");
+    resultNode.textContent = asyncJob ? "正在投递 OMS 状态拉取任务..." : "正在拉取 OMS 状态...";
+  }
+  try {
+    await saveOmsConfig();
+    const result = await api(`/api/v2/oms/status-poll?limit=50${asyncJob ? "&async_job=true" : ""}`, { method: "POST" });
+    if (resultNode) resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(asyncJob ? "OMS 状态拉取已入队" : `OMS 状态拉取完成：检查 ${result.checked || 0}，更新 ${result.updated || 0}`);
+    await Promise.all([refreshJobs(), refreshCrmOrders()]);
+  } catch (error) {
+    notifyError(error, ["系统接入", "OMS 状态拉取失败"]);
+    if (resultNode) resultNode.textContent = messageFromError(error);
+  }
+}
+
+$("#poll-oms-status")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await runOmsStatusPollAction(false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#queue-oms-status-poll")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await runOmsStatusPollAction(true);
   } finally {
     button.disabled = false;
   }
@@ -4030,7 +4729,25 @@ $("#mail-detail-modal")?.addEventListener("click", (event) => {
 });
 
 $("#crm-order-detail-close")?.addEventListener("click", closeCrmOrderDetail);
-$("#crm-order-detail-modal")?.addEventListener("click", (event) => {
+$("#crm-order-detail-modal")?.addEventListener("click", async (event) => {
+  const actionButton = event.target.closest("button[data-action='retry-crm-detail-sync']");
+  if (actionButton) {
+    const id = actionButton.dataset.id || currentCrmOrderDetailId;
+    if (!id) return;
+    actionButton.disabled = true;
+    actionButton.textContent = "同步中...";
+    try {
+      await api(`/api/crm/orders/${id}/retry-detail-sync`, { method: "POST" });
+      toast("CRM 订单详情已重新同步");
+      await openCrmOrderDetail(id);
+      await refreshCrmOrders();
+    } catch (error) {
+      notifyError(error, ["CRM", "详情同步重试失败"]);
+      actionButton.disabled = false;
+      actionButton.textContent = "重试详情同步";
+    }
+    return;
+  }
   if (event.target.id === "crm-order-detail-modal") closeCrmOrderDetail();
 });
 
@@ -4044,6 +4761,70 @@ $("#inventory-classification-modal")?.addEventListener("click", (event) => {
   if (event.target.id === "inventory-classification-modal") closeInventoryClassificationDiagnostics();
 });
 
+$("#exception-context-close")?.addEventListener("click", () => {
+  $("#exception-context-modal").hidden = true;
+});
+$("#exception-context-modal")?.addEventListener("click", (event) => {
+  if (event.target.id === "exception-context-modal") $("#exception-context-modal").hidden = true;
+});
+
+$("#copilot-open")?.addEventListener("click", openCopilotDrawer);
+$("#copilot-close")?.addEventListener("click", closeCopilotDrawer);
+$("#copilot-drawer")?.addEventListener("click", (event) => {
+  if (event.target.id === "copilot-drawer") closeCopilotDrawer();
+  if (event.target.closest("a")) closeCopilotDrawer();
+});
+
+$("#exception-context-body")?.addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  if (target.dataset.action === "replay-oms-notice") {
+    const evidence = window.prompt(`填写 OMS 重放修复证据${target.dataset.noticeNo ? `（${target.dataset.noticeNo}）` : ""}`, "");
+    if (evidence === null) return;
+    if (!evidence.trim()) {
+      toast("请先填写修复证据");
+      return;
+    }
+    await api(`/api/v2/delivery-notices/${target.dataset.id}/replay-oms`, {
+      method: "POST",
+      body: JSON.stringify({ repair_evidence: evidence.trim(), actor: "operator" }),
+    });
+    toast("OMS 重放已入队");
+    if (target.dataset.exceptionId) await openExceptionContext(target.dataset.exceptionId);
+    await refreshAll();
+    return;
+  }
+  if (target.dataset.action === "apply-address-correction") {
+    if (!window.confirm("确定要一键应用此 AI 地址修复建议吗？这将修改 CRM 订单收货信息并重新验证订单。")) return;
+    try {
+      const res = await api(`/api/exceptions/${target.dataset.exceptionId}/apply-address-correction`, {
+        method: "POST"
+      });
+      if (res.success) {
+        toast(res.message || "地址修复应用成功！");
+        await openExceptionContext(target.dataset.exceptionId);
+        await refreshAll();
+      } else {
+        toast(res.message || "应用修复失败");
+      }
+    } catch (e) {
+      toast("应用失败：" + messageFromError(e));
+    }
+    return;
+  }
+  if (target.dataset.action !== "diagnosis-feedback") return;
+  const note = window.prompt("反馈说明", "");
+  if (note === null) return;
+  const id = target.dataset.id;
+  await api(`/api/exceptions/${id}/diagnosis-feedback`, {
+    method: "POST",
+    body: JSON.stringify({ feedback: target.dataset.feedback, note, actor: "operator" }),
+  });
+  toast("诊断反馈已记录");
+  await openExceptionContext(id);
+  await refreshExceptions();
+});
+
 
 
 $("#exceptions-list").addEventListener("click", async (event) => {
@@ -4051,12 +4832,38 @@ $("#exceptions-list").addEventListener("click", async (event) => {
   if (!target) return;
   const id = target.dataset.id;
   const action = target.dataset.action;
+  if (action === "view-exception-context") {
+    await openExceptionContext(id);
+    return;
+  }
   if (action === "resolve-exception") {
-    const note = window.prompt("关闭说明", "已人工处理");
+    const isHighRisk = target.dataset.highRisk === "true";
+    let actor = "operator";
+    let confirm_risk = false;
+    if (isHighRisk) {
+      confirm_risk = window.confirm("这是高危异常。确认已完成下游核对、责任人身份校验，并继续关闭？");
+      if (!confirm_risk) return;
+      actor = window.prompt("责任人身份（姓名/邮箱）", "");
+      if (actor === null) return;
+      if (!actor.trim() || ["operator", "system", "admin", "manager"].includes(actor.trim().toLowerCase())) {
+        toast("请输入明确责任人身份");
+        return;
+      }
+    }
+    const note = window.prompt("关闭说明", isHighRisk ? "" : "已人工处理");
     if (note === null) return;
+    if (isHighRisk && note.trim().length < 6) {
+      toast("高危异常需填写明确处理备注");
+      return;
+    }
     await api(`/api/exceptions/${id}/resolve`, {
       method: "POST",
-      body: JSON.stringify({ note, actor: "operator" }),
+      body: JSON.stringify({
+        note,
+        actor,
+        confirm_risk,
+        resolution_evidence: isHighRisk ? { ui_action: "manual_close_high_risk", confirm_risk: true } : null,
+      }),
     });
     toast("异常已关闭");
   }
@@ -4075,8 +4882,16 @@ $("#exceptions-list").addEventListener("click", async (event) => {
     toast("异常已分派");
   }
   if (action === "diagnose-exception") {
-    await api(`/api/exceptions/${id}/diagnose`, { method: "POST" });
-    toast("诊断已生成");
+    try {
+      const streamed = await diagnoseExceptionStream(id);
+      if (!streamed) {
+        await api(`/api/exceptions/${id}/diagnose`, { method: "POST" });
+        toast("诊断已生成");
+      }
+    } catch (error) {
+      await api(`/api/exceptions/${id}/diagnose`, { method: "POST" });
+      toast(error.message ? `流式失败，已同步生成：${error.message}` : "流式失败，已同步生成");
+    }
   }
   if (action === "reopen-exception") {
     const note = window.prompt("重开原因", "需要继续处理");
@@ -4156,10 +4971,38 @@ function cacheProductSkuRows(rows = []) {
   });
 }
 
+function productPayloadTotal(data, rows = []) {
+  const total = data?.total ?? data?.total_count ?? data?.count;
+  const number = Number(total);
+  return Number.isFinite(number) ? number : rows.length;
+}
+
+function renderProductCenterSummary() {
+  const node = $("#product-center-summary");
+  if (!node) return;
+  const value = (item) => item === null || item === undefined ? "-" : item;
+  const lowStock =
+    productCenterState.materialLowStock === null && productCenterState.finishedLowStock === null
+      ? null
+      : Number(productCenterState.materialLowStock || 0) + Number(productCenterState.finishedLowStock || 0);
+  const zeroStock =
+    productCenterState.materialZeroStock === null && productCenterState.finishedZeroStock === null
+      ? null
+      : Number(productCenterState.materialZeroStock || 0) + Number(productCenterState.finishedZeroStock || 0);
+  node.innerHTML = `
+    <div class="metric"><small>成品 SPU</small><strong>${h(value(productCenterState.spu))}</strong><span>商品主档</span></div>
+    <div class="metric"><small>存货 SKU</small><strong>${h(value(productCenterState.sku))}</strong><span>履约粒度</span></div>
+    <div class="metric ${Number(lowStock || 0) ? "warn" : ""}"><small>库存预警</small><strong>${h(value(lowStock))}</strong><span>低库存记录</span></div>
+    <div class="metric ${Number(zeroStock || 0) ? "danger" : ""}"><small>零库存</small><strong>${h(value(zeroStock))}</strong><span>阻断风险</span></div>
+  `;
+}
+
 async function refreshProductsSpu() {
   const data = await api(`/api/products/spu?${queryFromState(tableStates.productsSpu)}`);
   const rows = data.items || [];
   cacheProductSpuRows(rows);
+  productCenterState.spu = productPayloadTotal(data, rows);
+  renderProductCenterSummary();
   $("#products-spu-list").innerHTML = rows.map(row => `
     <div class="row product-row">
       <div><strong>${h(row.spu_id)}</strong><br /><small>${h(row.name)}</small></div>
@@ -4540,6 +5383,8 @@ async function refreshProductsSku() {
   const data = await api(`/api/products/sku?${queryFromState(tableStates.productsSku)}`);
   const rows = data.items || [];
   cacheProductSkuRows(rows);
+  productCenterState.sku = productPayloadTotal(data, rows);
+  renderProductCenterSummary();
   $("#products-sku-list").innerHTML = rows.map(row => `
     <div class="row product-row">
       <div><strong>${h(row.sku_id)}</strong><br /><small>${h(JSON.stringify(row.attributes))}</small></div>
@@ -4633,6 +5478,9 @@ async function refreshProductsInventory() {
   const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsInventory)}`);
   const rows = data.items || [];
   const summary = data.summary || {};
+  productCenterState.materialLowStock = Number(summary.low_stock_count || 0);
+  productCenterState.materialZeroStock = Number(summary.zero_stock_count || 0);
+  renderProductCenterSummary();
   renderInventorySummary("#products-inventory-summary", summary, `${inventoryMeasureLabel(summary.measure_type)}合计`);
   renderInventoryTypeRows("#products-inventory-list", rows, "暂无非成品库存数据，请先同步 ERP 库存", "productsInventory", "物料");
   renderListPagination("#products-inventory-pagination", "productsInventory", data);
@@ -4644,6 +5492,9 @@ async function refreshProductsFinishedInventory() {
   const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsFinishedInventory)}`);
   const rows = data.items || [];
   const summary = data.summary || {};
+  productCenterState.finishedLowStock = Number(summary.low_stock_count || 0);
+  productCenterState.finishedZeroStock = Number(summary.zero_stock_count || 0);
+  renderProductCenterSummary();
   renderInventorySummary("#products-finished-inventory-summary", summary, "成品库存合计");
   renderInventoryTypeRows("#products-finished-inventory-list", rows, "暂无成品库存数据，请先同步 ERP 库存", "productsFinishedInventory", "成品");
   renderListPagination("#products-finished-inventory-pagination", "productsFinishedInventory", data);

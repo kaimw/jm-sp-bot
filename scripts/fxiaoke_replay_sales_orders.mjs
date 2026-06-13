@@ -323,18 +323,22 @@ async function main() {
   const probePath = parseArg("probe", DEFAULT_PROBE);
   const requestPath = parseArg("request", process.env.FXIAOKE_REQUEST_FILE || "");
   const detailRequestPath = parseArg("detail-request", process.env.FXIAOKE_DETAIL_REQUEST_FILE || "");
-  if (!probePath && !requestPath) {
+  const singleRowPath = parseArg("single-row", "");
+  if (!probePath && !requestPath && !singleRowPath) {
     throw new Error("Probe or request file required: --probe=/private/tmp/fxiaoke-cdp-probe-....json or --request=/private/tmp/fxiaoke-list-request.json");
   }
-  let listRequest;
-  if (requestPath) {
-    listRequest = parseJson(await fs.readFile(requestPath, "utf8"), requestPath);
-  } else {
-    const probe = parseJson(await fs.readFile(probePath, "utf8"), probePath);
-    listRequest = probe.requests.find((request) => request.url.includes("/SalesOrderObj/controller/List?"));
+  let listRequest = null;
+  if (!singleRowPath) {
+    if (requestPath) {
+      listRequest = parseJson(await fs.readFile(requestPath, "utf8"), requestPath);
+    } else {
+      const probe = parseJson(await fs.readFile(probePath, "utf8"), probePath);
+      listRequest = probe.requests.find((request) => request.url.includes("/SalesOrderObj/controller/List?"));
+    }
+    if (!listRequest) throw new Error("SalesOrderObj List request not found in probe file");
   }
-  if (!listRequest) throw new Error("SalesOrderObj List request not found in probe file");
   const detailRequest = detailRequestPath ? parseJson(await fs.readFile(detailRequestPath, "utf8"), detailRequestPath) : null;
+  if (singleRowPath && !detailRequest) throw new Error("Single row detail sync requires --detail-request");
 
   const browser = await chromium.connectOverCDP(CDP_URL);
   const page = await firstPage(browser);
@@ -342,7 +346,12 @@ async function main() {
   const rawPages = [];
   let total = null;
 
-  for (let offset = 0; total === null || offset < total; offset += PAGE_SIZE) {
+  if (singleRowPath) {
+    rows.push(parseJson(await fs.readFile(singleRowPath, "utf8"), singleRowPath));
+    total = 1;
+  }
+
+  for (let offset = 0; !singleRowPath && (total === null || offset < total); offset += PAGE_SIZE) {
     const payload = makePayload(listRequest.postData, offset, PAGE_SIZE);
     const result = await page.evaluate(
       async ({ url, payload }) => {

@@ -4,12 +4,34 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
 
 from backend.app.config import settings
+from backend.app.models import User
+
 
 
 COOKIE_NAME = "jm_sp_session"
+
+
+def hash_password(password: str, salt: bytes = None) -> str:
+    if salt is None:
+        salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+    return f"{salt.hex()}:{key.hex()}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        salt_hex, key_hex = password_hash.split(":", 1)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(key_hex)
+        key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+        return hmac.compare_digest(key, expected)
+    except Exception:
+        return False
+
 
 
 def create_session_token(username: str) -> str:
@@ -48,3 +70,19 @@ def _base64_url_encode(value: bytes) -> str:
 def _base64_url_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     return base64.urlsafe_b64decode(value + padding)
+
+
+def should_mask_financials(user: User | None, sales_user_name: str | None, owner_department: str | None) -> bool:
+    if user is None:
+        return False
+    if not hasattr(user, "role"):
+        return False
+    if user.role in ("admin", "business_owner", "auditor"):
+        return False
+    if user.role == "business_operator":
+        if user.username == sales_user_name:
+            return False
+        if user.department and owner_department and user.department.lower() == owner_department.lower():
+            return False
+    return True
+

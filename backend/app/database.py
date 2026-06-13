@@ -97,6 +97,7 @@ def ensure_runtime_schema() -> None:
                 "locked_until": _datetime_type(),
                 "next_retry_at": _datetime_type(),
                 "started_at": _datetime_type(),
+                "version": "INTEGER DEFAULT 0 NOT NULL",
             },
         )
     if "mail_messages" in tables:
@@ -119,13 +120,43 @@ def ensure_runtime_schema() -> None:
             {
                 "oms_method": "VARCHAR(64) DEFAULT 'wms.order.create' NOT NULL",
                 "oms_order_no": "VARCHAR(128)",
+                "notice_version": "INTEGER DEFAULT 1 NOT NULL",
+                "source_snapshot_hash": "VARCHAR(128)",
                 "owner_code": "VARCHAR(128)",
                 "warehouse_code": "VARCHAR(128)",
                 "shop_code": "VARCHAR(128)",
                 "logistic_code": "VARCHAR(128)",
+                "waybill_no": "VARCHAR(128)",
+                "print_status": "VARCHAR(32) DEFAULT 'NotRequested' NOT NULL",
+                "print_error": "TEXT",
+                "print_retry_count": "INTEGER DEFAULT 0 NOT NULL",
+                "platform_fulfillment_status": "VARCHAR(32) DEFAULT 'NotRequired' NOT NULL",
+                "platform_fulfillment_error": "TEXT",
+                "platform_fulfillment_retry_count": "INTEGER DEFAULT 0 NOT NULL",
+                "platform_fulfillment_synced_at": _datetime_type(),
+                "platform_fulfillment_synced_waybill_no": "VARCHAR(128)",
                 "split_preview_json": "TEXT DEFAULT '{}' NOT NULL",
                 "confirmed_by": "VARCHAR(128)",
                 "confirmed_at": _datetime_type(),
+            },
+        )
+    if "middle_platform_orders" in tables:
+        _ensure_columns(
+            "middle_platform_orders",
+            {
+                "source_policy": "VARCHAR(32) DEFAULT 'CRM_ONLY' NOT NULL",
+                "platform_order_no": "VARCHAR(128)",
+                "shop_code": "VARCHAR(128)",
+                "channel_code": "VARCHAR(128)",
+                "fulfillment_type": "VARCHAR(64)",
+            },
+        )
+    if "middle_platform_order_items" in tables:
+        _ensure_columns(
+            "middle_platform_order_items",
+            {
+                "shop_sku_code": "VARCHAR(128)",
+                "channel_code": "VARCHAR(128)",
             },
         )
     if "crm_sales_orders" in tables:
@@ -144,11 +175,28 @@ def ensure_runtime_schema() -> None:
             {
                 "assignee": "VARCHAR(128)",
                 "resolution_note": "TEXT",
+                "resolution_evidence_json": "TEXT",
                 "due_at": _datetime_type(),
                 "resolved_at": _datetime_type(),
                 "reopened_at": _datetime_type(),
                 "last_actor": "VARCHAR(128)",
                 "updated_at": _datetime_type(),
+            },
+        )
+    if "agent_run_logs" in tables:
+        _ensure_columns(
+            "agent_run_logs",
+            {
+                "agent_name": "VARCHAR(64) NOT NULL",
+                "task_type": "VARCHAR(64) NOT NULL",
+                "related_object_type": "VARCHAR(64)",
+                "related_object_id": "VARCHAR(36)",
+                "input_json": "TEXT",
+                "output_json": "TEXT",
+                "status": "VARCHAR(32) NOT NULL",
+                "error_message": "TEXT",
+                "started_at": _datetime_type(),
+                "finished_at": _datetime_type(),
             },
         )
     if "production_tasks" in tables:

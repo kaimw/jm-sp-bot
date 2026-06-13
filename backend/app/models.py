@@ -175,11 +175,31 @@ class ProcessingJob(Base):
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
     locked_by: Mapped[str | None] = mapped_column(String(128))
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class IntegrationEvent(Base):
+    __tablename__ = "integration_events"
+    __table_args__ = (UniqueConstraint("event_type", "biz_key", "payload_hash", name="uq_integration_event_hash"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_system: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    biz_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    request_json: Mapped[str | None] = mapped_column(Text)
+    response_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
@@ -198,6 +218,22 @@ class ModelCallLog(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class AgentRunLog(Base):
+    __tablename__ = "agent_run_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    related_object_type: Mapped[str | None] = mapped_column(String(64))
+    related_object_id: Mapped[str | None] = mapped_column(String(36))
+    input_json: Mapped[str | None] = mapped_column(Text)
+    output_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class MaintenanceSession(Base):
@@ -444,6 +480,7 @@ class ExceptionCase(Base):
     status: Mapped[str] = mapped_column(String(32), default="Open", nullable=False)
     assignee: Mapped[str | None] = mapped_column(String(128))
     resolution_note: Mapped[str | None] = mapped_column(Text)
+    resolution_evidence_json: Mapped[str | None] = mapped_column(Text)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -643,6 +680,11 @@ class MiddlePlatformOrder(Base):
     crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
     crm_order_no: Mapped[str] = mapped_column(String(128), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_policy: Mapped[str] = mapped_column(String(32), default="CRM_ONLY", nullable=False)
+    platform_order_no: Mapped[str | None] = mapped_column(String(128))
+    shop_code: Mapped[str | None] = mapped_column(String(128))
+    channel_code: Mapped[str | None] = mapped_column(String(128))
+    fulfillment_type: Mapped[str | None] = mapped_column(String(64))
     customer_name: Mapped[str | None] = mapped_column(String(255))
     sales_user_name: Mapped[str | None] = mapped_column(String(128))
     currency: Mapped[str | None] = mapped_column(String(16))
@@ -667,6 +709,8 @@ class MiddlePlatformOrderItem(Base):
     order_id: Mapped[str] = mapped_column(String(36), ForeignKey("middle_platform_orders.id"), nullable=False)
     sku_code: Mapped[str | None] = mapped_column(String(128))
     product_name: Mapped[str | None] = mapped_column(String(255))
+    shop_sku_code: Mapped[str | None] = mapped_column(String(128))
+    channel_code: Mapped[str | None] = mapped_column(String(128))
     quantity: Mapped[float | None] = mapped_column(Numeric(15, 2))
     unit_price: Mapped[float | None] = mapped_column(Numeric(15, 2))
     line_amount: Mapped[float | None] = mapped_column(Numeric(15, 2))
@@ -684,6 +728,8 @@ class DeliveryNotice(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     notice_no: Mapped[str] = mapped_column(String(64), nullable=False)
     order_id: Mapped[str] = mapped_column(String(36), ForeignKey("middle_platform_orders.id"), nullable=False)
+    notice_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    source_snapshot_hash: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(32), default="Created", nullable=False)
     oms_idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     oms_method: Mapped[str] = mapped_column(String(64), default="wms.order.create", nullable=False)
@@ -692,6 +738,15 @@ class DeliveryNotice(Base):
     warehouse_code: Mapped[str | None] = mapped_column(String(128))
     shop_code: Mapped[str | None] = mapped_column(String(128))
     logistic_code: Mapped[str | None] = mapped_column(String(128))
+    waybill_no: Mapped[str | None] = mapped_column(String(128))
+    print_status: Mapped[str] = mapped_column(String(32), default="NotRequested", nullable=False)
+    print_error: Mapped[str | None] = mapped_column(Text)
+    print_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    platform_fulfillment_status: Mapped[str] = mapped_column(String(32), default="NotRequired", nullable=False)
+    platform_fulfillment_error: Mapped[str | None] = mapped_column(Text)
+    platform_fulfillment_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    platform_fulfillment_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    platform_fulfillment_synced_waybill_no: Mapped[str | None] = mapped_column(String(128))
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -835,3 +890,16 @@ class PromotionRule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
     sku: Mapped[ProductSKU | None] = relationship(back_populates="promotion_rules")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)  # admin, business_owner, business_operator, auditor, it_ops
+    department: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+

@@ -58,6 +58,8 @@ class AdminPasswordRequest(BaseModel):
 class ExceptionResolveRequest(BaseModel):
     note: str = ""
     actor: str = "operator"
+    confirm_risk: bool = False
+    resolution_evidence: dict[str, Any] | None = None
 
 
 class ExceptionAssignRequest(BaseModel):
@@ -152,6 +154,8 @@ class CrmRuntimeConfigUpdate(BaseModel):
     crm_fxiaoke_detail_request_json: str | None = None
     crm_sync_page_size: int | None = None
     crm_sync_timeout_seconds: int | None = None
+    v2_crm_phase1_scope_enabled: bool | None = None
+    v2_crm_phase1_scope_json: str | None = None
 
 
 class OmsRuntimeConfigUpdate(BaseModel):
@@ -160,6 +164,12 @@ class OmsRuntimeConfigUpdate(BaseModel):
     oms_auto_confirm_delivery_notice: bool | None = None
     oms_inventory_review_enabled: bool | None = None
     oms_inventory_missing_blocks: bool | None = None
+    v2_validation_failure_notification_enabled: bool | None = None
+    v2_oms_blocked_notification_enabled: bool | None = None
+    v2_validation_failure_to_json: str | None = None
+    v2_validation_failure_cc_json: str | None = None
+    v2_oms_blocked_to_json: str | None = None
+    v2_oms_blocked_cc_json: str | None = None
     oms_retry_base_delay_seconds: int | None = None
     oms_retry_multiplier: int | None = None
     oms_max_retries: int | None = None

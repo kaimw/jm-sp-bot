@@ -27,6 +27,7 @@ from backend.app.services.mail_throttle import (
 )
 from backend.app.services.parser import classify_mail, normalize_latest_reply
 from backend.app.services.storage import save_attachment
+from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
 from backend.app.services.workflow import (
     add_audit,
     bot_enabled,
@@ -459,8 +460,7 @@ def _outbound_priority_for(mail_type: str) -> int:
 
 def _next_retry_at(attempt_count: int) -> datetime:
     """指数退避：第 n 次失败后，等待 min(2^n × 60s, 3600s) 重试。"""
-    wait_seconds = min(2 ** attempt_count * 60, 3600)
-    return datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+    return next_retry_at(attempt_count, RetryPolicy(base_delay_seconds=120, multiplier=2, max_delay_seconds=3600))
 
 
 def mark_outbound_failure(session: Session, job: OutboundMailJob, error: str) -> None:

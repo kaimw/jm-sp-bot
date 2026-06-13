@@ -23,7 +23,9 @@ MIGRATION_TABLE_ORDER = [
     "mail_messages",
     "attachment_assets",
     "processing_jobs",
+    "integration_events",
     "model_call_logs",
+    "agent_run_logs",
     "maintenance_sessions",
     "maintenance_actions",
     "order_requirements",
@@ -54,6 +56,7 @@ MIGRATION_TABLE_ORDER = [
     "product_inventory_snapshots",
     "channel_pricings",
     "promotion_rules",
+    "users",
 ]
 
 DEFERRED_COLUMN_UPDATES = {
