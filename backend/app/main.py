@@ -7,7 +7,9 @@ import contextlib
 import csv
 import hmac
 import logging
+import os
 import re
+import subprocess
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -144,6 +146,7 @@ from backend.app.services.order_middle_platform import (
     confirm_delivery_notice,
     enqueue_crm_order_parsed_event,
     enqueue_oms_push,
+    ExceptionType,
     list_middle_orders,
     OrderStatus,
     order_dashboard,
@@ -236,6 +239,71 @@ from backend.app.services.skills.factory import SkillFactory
 
 PUBLIC_API_PATHS = {"/api/auth/login", "/api/auth/logout", "/api/auth/me"}
 logger = logging.getLogger(__name__)
+
+
+_secrets_cache = []
+_last_cache_time = 0.0
+_crm_browser_process: subprocess.Popen | None = None
+_crm_browser_meta: dict = {}
+
+def get_secret_values() -> list[str]:
+    global _secrets_cache, _last_cache_time
+    import time
+    now = time.time()
+    if now - _last_cache_time < 30.0:
+        return _secrets_cache
+    try:
+        from backend.app.database import SessionLocal
+        from backend.app.models import SystemConfig
+        with SessionLocal() as session:
+            rows = session.query(SystemConfig).filter_by(is_secret=True).all()
+            _secrets_cache = [
+                row.value for row in rows 
+                if row.value and len(row.value) >= 5 and not row.value.startswith("enc:")
+            ]
+            _last_cache_time = now
+    except Exception:
+        pass
+    return _secrets_cache
+
+
+class SensitiveDataFormatter(logging.Formatter):
+    def __init__(self, fmt=None, datefmt=None, style='%', secrets_getter=None):
+        super().__init__(fmt, datefmt, style)
+        self.secrets_getter = secrets_getter
+        self.sensitive_patterns = [
+            r"(?i)(password|passwd|api_key|app_secret|auth_secret|api_key_str)\s*[:=]\s*['\"]([^'\"]+)['\"]",
+            r"(?i)(bot_email_password|e2e_sales_password|e2e_production_password|erp_app_sec|crm_password|crm_api_key)\s*=\s*['\"]([^'\"]+)['\"]"
+        ]
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        for pattern in self.sensitive_patterns:
+            formatted = re.sub(pattern, lambda m: f"{m.group(1)}: '***'" if ":" in m.group(0) else f"{m.group(1)}='***'", formatted)
+        if self.secrets_getter:
+            secrets = self.secrets_getter()
+            for secret in secrets:
+                if secret and len(secret) >= 5:
+                    formatted = formatted.replace(secret, "***")
+        return formatted
+
+
+def setup_log_scrubbing():
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        old_formatter = handler.formatter
+        fmt = old_formatter._fmt if old_formatter else None
+        datefmt = old_formatter.datefmt if old_formatter else None
+        style = old_formatter._style.default_format if old_formatter and hasattr(old_formatter._style, 'default_format') else '%'
+        handler.setFormatter(
+            SensitiveDataFormatter(
+                fmt=fmt,
+                datefmt=datefmt,
+                style=style,
+                secrets_getter=get_secret_values
+            )
+        )
+
 mail_worker_task: asyncio.Task | None = None
 EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 LOGISTICS_TASK_NO_PATTERN = re.compile(r"LT-\d{8}-\d{4}", re.IGNORECASE)
@@ -323,6 +391,7 @@ def distinct_values(session: Session, column) -> list[str]:
 
 
 async def startup() -> None:
+    setup_log_scrubbing()
     init_db()
     with SessionLocal() as session:
         seed_defaults(session)
@@ -678,6 +747,11 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
     crm_api_key = system_config_value(session, "crm_api_key", overrides).strip()
     if not crm_api_key and not (crm_username and crm_password):
         missing.append("CRM账号密码或API Key")
+    crm_system_owner_email = system_config_value(session, "crm_system_owner_email", overrides).strip()
+    if not crm_system_owner_email:
+        missing.append("CRM系统负责人邮箱")
+    elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", crm_system_owner_email):
+        missing.append("CRM系统负责人邮箱格式不合法")
 
     if not system_config_bool(session, "oms_enabled", False):
         missing.append("OMS接入未启用")
@@ -689,6 +763,11 @@ def runtime_startup_readiness(session: Session, overrides: dict | None = None) -
         missing.append("OMS AppKey")
     if not oms_app_secret:
         missing.append("OMS AppSecret")
+    oms_admin_email = system_config_value(session, "oms_admin_email", overrides).strip()
+    if not oms_admin_email:
+        missing.append("OMS管理员邮箱")
+    elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", oms_admin_email):
+        missing.append("OMS管理员邮箱格式不合法")
 
     departments = session.query(ProductionDepartment).filter_by(status="Active").all()
     production_main_recipients: list[str] = []
@@ -756,6 +835,98 @@ def config_int(session: Session, key: str, default: int) -> int:
         return int(row.value) if row is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def crm_cdp_port_from_config(session: Session) -> int:
+    port = config_int(session, "crm_cdp_port", 0)
+    if port:
+        return port
+    url = system_config_value(session, "crm_cdp_url", {}, "http://127.0.0.1:9333")
+    match = re.search(r":(\d+)(?:/|$)", url)
+    if match:
+        return int(match.group(1))
+    return 9333
+
+
+def crm_browser_status() -> dict:
+    global _crm_browser_process, _crm_browser_meta
+    process = _crm_browser_process
+    running = process is not None and process.poll() is None
+    if process is not None and not running:
+        _crm_browser_meta = {**_crm_browser_meta, "exit_code": process.returncode}
+        _crm_browser_process = None
+    return {
+        "managed": running,
+        "pid": process.pid if running and process is not None else None,
+        **_crm_browser_meta,
+    }
+
+
+def stop_crm_browser_process() -> dict:
+    global _crm_browser_process, _crm_browser_meta
+    process = _crm_browser_process
+    if process is None or process.poll() is not None:
+        _crm_browser_process = None
+        return {"stopped": False, **_crm_browser_meta}
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    _crm_browser_meta = {**_crm_browser_meta, "stopped": True, "exit_code": process.returncode}
+    _crm_browser_process = None
+    return {"stopped": True, **_crm_browser_meta}
+
+
+def start_crm_browser_process(session: Session, requested_mode: str | None = None) -> dict:
+    global _crm_browser_process, _crm_browser_meta
+    mode = (requested_mode or system_config_value(session, "crm_cdp_browser_mode", {}, "headless")).strip().lower()
+    if mode not in {"headless", "headed"}:
+        raise HTTPException(status_code=400, detail="CRM 浏览器模式只能是 headless 或 headed")
+    current = crm_browser_status()
+    if current.get("managed"):
+        if current.get("mode") == mode:
+            return {**current, "already_running": True}
+        stop_crm_browser_process()
+
+    port = crm_cdp_port_from_config(session)
+    user_data_dir = system_config_value(session, "crm_cdp_user_data_dir", {}, f"/private/tmp/fxiaoke-cdp-profile-{port}").strip()
+    chrome_bin = system_config_value(session, "crm_chrome_bin", {}, "").strip()
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "fxiaoke_start_cdp_chrome.mjs"
+    if not script_path.exists():
+        raise HTTPException(status_code=500, detail=f"CRM 专用浏览器启动脚本不存在：{script_path}")
+    command = [
+        "node",
+        str(script_path),
+        f"--port={port}",
+        f"--user-data-dir={user_data_dir}",
+    ]
+    if mode == "headed":
+        command.append("--headed")
+    env = os.environ.copy()
+    if chrome_bin:
+        env["CHROME_BIN"] = chrome_bin
+    try:
+        _crm_browser_process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"CRM 专用浏览器启动失败：{exc}") from exc
+    _crm_browser_meta = {
+        "mode": mode,
+        "cdp_url": f"http://127.0.0.1:{port}",
+        "port": port,
+        "user_data_dir": user_data_dir,
+        "started_at": now_utc().isoformat(),
+    }
+    return crm_browser_status()
 
 
 def system_queue_health(session: Session) -> dict:
@@ -877,7 +1048,9 @@ def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depe
             raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
     secret_keys = {"bot_email_password", "baidu_map_ak", "e2e_sales_password", "e2e_production_password"}
     for key, value in values.items():
-        if value in (None, ""):
+        if value is None:
+            continue
+        if key in secret_keys and str(value).strip() in {"", "***"}:
             continue
         set_config(session, key, str(value), is_secret=key in secret_keys)
     session.commit()
@@ -901,7 +1074,9 @@ def update_erp_config(payload: ErpRuntimeConfigUpdate, session: Session = Depend
         values["erp_material_sync_interval_seconds"] = interval
     secret_keys = {"erp_app_sec"}
     for key, value in values.items():
-        if value in (None, ""):
+        if value is None:
+            continue
+        if key in secret_keys and str(value).strip() in {"", "***"}:
             continue
         set_config(session, key, str(value), is_secret=key in secret_keys)
     set_config(session, "erp_readonly", "true", is_secret=False)
@@ -918,6 +1093,13 @@ def update_crm_config(payload: CrmRuntimeConfigUpdate, session: Session = Depend
         if interval < 60:
             raise HTTPException(status_code=400, detail="CRM 同步周期不能低于 60 秒")
         values["crm_sync_interval_seconds"] = interval
+    if "crm_sync_min_order_date" in values and values["crm_sync_min_order_date"] not in (None, ""):
+        min_order_date = str(values["crm_sync_min_order_date"]).strip()
+        try:
+            datetime.strptime(min_order_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="CRM 最早下单日期格式必须是 YYYY-MM-DD") from exc
+        values["crm_sync_min_order_date"] = min_order_date
     if "crm_sync_page_size" in values and values["crm_sync_page_size"] not in (None, ""):
         page_size = int(values["crm_sync_page_size"])
         if page_size < 1 or page_size > 200:
@@ -928,6 +1110,30 @@ def update_crm_config(payload: CrmRuntimeConfigUpdate, session: Session = Depend
         if timeout < 30 or timeout > 600:
             raise HTTPException(status_code=400, detail="CRM 同步超时需在 30-600 秒之间")
         values["crm_sync_timeout_seconds"] = timeout
+    if "crm_cdp_browser_mode" in values and values["crm_cdp_browser_mode"] not in (None, ""):
+        mode = str(values["crm_cdp_browser_mode"]).strip().lower()
+        if mode not in {"headless", "headed"}:
+            raise HTTPException(status_code=400, detail="CRM 浏览器模式只能是 headless 或 headed")
+        values["crm_cdp_browser_mode"] = mode
+    if "crm_cdp_port" in values and values["crm_cdp_port"] not in (None, ""):
+        port = int(values["crm_cdp_port"])
+        if port < 1024 or port > 65535:
+            raise HTTPException(status_code=400, detail="CRM CDP 端口需在 1024-65535 之间")
+        values["crm_cdp_port"] = port
+        if "crm_cdp_url" not in values or not str(values.get("crm_cdp_url") or "").strip():
+            values["crm_cdp_url"] = f"http://127.0.0.1:{port}"
+    if "crm_cdp_user_data_dir" in values and values["crm_cdp_user_data_dir"] not in (None, ""):
+        values["crm_cdp_user_data_dir"] = str(values["crm_cdp_user_data_dir"]).strip()
+    if "crm_chrome_bin" in values and values["crm_chrome_bin"] not in (None, ""):
+        values["crm_chrome_bin"] = str(values["crm_chrome_bin"]).strip()
+    if "crm_system_owner_email" in values and values["crm_system_owner_email"] not in (None, ""):
+        email = str(values["crm_system_owner_email"]).strip()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise HTTPException(status_code=400, detail="CRM 系统负责人邮箱格式不正确")
+        values["crm_system_owner_email"] = email
+    resulting_crm_system_owner_email = str(values.get("crm_system_owner_email") or system_config_value(session, "crm_system_owner_email", {})).strip()
+    if not resulting_crm_system_owner_email:
+        raise HTTPException(status_code=400, detail="CRM 系统负责人邮箱为必填项")
     if "v2_crm_phase1_scope_json" in values and values["v2_crm_phase1_scope_json"] not in (None, ""):
         scope_config = loads(str(values["v2_crm_phase1_scope_json"]), None)
         if not isinstance(scope_config, dict):
@@ -967,6 +1173,18 @@ def update_oms_config(payload: OmsRuntimeConfigUpdate, session: Session = Depend
         if method not in {"wms.order.create", "wms-ods.order.create"}:
             raise HTTPException(status_code=400, detail="发货单创建接口仅支持 wms.order.create 或 wms-ods.order.create")
         values["oms_create_order_method"] = method
+    if "oms_admin_email" in values and values["oms_admin_email"] not in (None, ""):
+        email = str(values["oms_admin_email"]).strip()
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise HTTPException(status_code=400, detail="OMS 管理员邮箱格式不正确")
+        values["oms_admin_email"] = email
+    resulting_oms_admin_email = str(values.get("oms_admin_email") or system_config_value(session, "oms_admin_email", {})).strip()
+    if not resulting_oms_admin_email:
+        raise HTTPException(status_code=400, detail="OMS 管理员邮箱为必填项")
+    if "oms_customer_query_payload_json" in values and values["oms_customer_query_payload_json"] not in (None, ""):
+        payload_json = loads(str(values["oms_customer_query_payload_json"]), None)
+        if not isinstance(payload_json, dict):
+            raise HTTPException(status_code=400, detail="OMS 客户查询参数必须是 JSON 对象")
     secret_keys = {"oms_jackyun_app_secret"}
     for key, value in values.items():
         if value is None:
@@ -984,6 +1202,21 @@ def test_jackyun_connection(session: Session = Depends(get_session)) -> dict:
     try:
         client = jackyun_client_from_session(session)
         result = client.search_skus({"pageNo": 1, "pageSize": 1})
+        # 构建签名诊断信息（AppSecret 完全遮蔽，用于排查签名错误）
+        app_secret_len = len(client.config.app_secret)
+        app_secret_masked = client.config.app_secret[0] + "***" + client.config.app_secret[-1] if app_secret_len >= 2 else "***"
+        bizcontent_json = '{"pageNo":1,"pageSize":1}'
+        # 模拟 sign_params 的拼接过程：按 key 排序 → key+value 拼接 → 前后包裹 secret → 转小写 → MD5
+        params_sorted = sorted([
+            ("appkey", client.config.app_key),
+            ("bizcontent", bizcontent_json),
+            ("contenttype", client.config.content_type),
+            ("method", "erp-goods.goods.sku.search"),
+            ("timestamp", "[CURRENT_TIMESTAMP]"),
+            ("version", client.config.version),
+        ], key=lambda x: x[0])
+        joined = "".join(f"{k}{v}" for k, v in params_sorted)
+        sign_string_masked = f"[SECRET_{app_secret_len}chars]{joined}[SECRET_{app_secret_len}chars]".lower()
         return {
             "ok": bool(result.get("ok")),
             "endpoint": client.config.gateway_url,
@@ -991,6 +1224,13 @@ def test_jackyun_connection(session: Session = Depends(get_session)) -> dict:
             "code": result.get("code"),
             "sub_code": result.get("sub_code"),
             "message": result.get("message"),
+            "_diagnostic": {
+                "app_secret_len": app_secret_len,
+                "app_secret_masked": app_secret_masked,
+                "app_key": client.config.app_key,
+                "sign_string_masked": sign_string_masked,
+                "note": "sign_string_masked 中 [SECRET_Nchars] 代表 AppSecret 前后包裹的位置，拼接顺序为 appkey→bizcontent→contenttype→method→timestamp→version",
+            },
         }
     except JackyunConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1467,7 +1707,7 @@ def update_model_provider(payload: ModelProviderUpdate, session: Session = Depen
         value = getattr(payload, field)
         if value not in (None, ""):
             setattr(model, field, value)
-    if payload.api_key:
+    if payload.api_key and str(payload.api_key).strip() != "***":
         set_config(session, "model_api_key", payload.api_key, is_secret=True)
         model.credential_ref = "config:model_api_key"
     session.commit()
@@ -3656,7 +3896,7 @@ def apply_exception_address_correction(
     if critical is not None:
         transition_order(session, order, OrderEvent.RULES_FAILED_CRITICAL, trace_id=trace_id, detail={"rule_code": critical.rule_code})
         # Keep exception case open, but update detail with new validation summary
-        case.detail = dumps(build_context_pack(session, order, case.exception_type, case.severity, critical.reason, validation_results, trace_id=trace_id))
+        case.detail = dumps(build_context_pack(session, order, ExceptionType(case.exception_type), case.severity, critical.reason, validation_results, trace_id=trace_id))
         session.add(case)
         session.commit()
         return {
@@ -5059,10 +5299,23 @@ def crm_order_processing_jobs(session: Session, row: CrmSalesOrder, middle_order
 
 def exception_summary(row: ExceptionCase) -> str:
     detail = loads(row.detail, {})
+    detail = detail if isinstance(detail, dict) else {}
+    order = detail.get("order")
+    order = order if isinstance(order, dict) else {}
+    order_no = order.get("order_no") or detail.get("order_no") or ""
+    crm_order_no = order.get("crm_order_no") or detail.get("crm_order_no") or ""
+    prefix = f"[{order_no}]" if order_no else ""
+    if crm_order_no and crm_order_no != order_no:
+        prefix = f"[{order_no}/{crm_order_no}]" if order_no else f"[{crm_order_no}]"
     exception = detail.get("exception") if isinstance(detail, dict) else {}
+    summary = ""
     if isinstance(exception, dict):
-        return str(exception.get("summary") or exception.get("likely_reason") or "")[:240]
-    return ""
+        summary = str(exception.get("summary") or exception.get("likely_reason") or "")
+    if prefix and summary:
+        return f"{prefix} {summary}"[:240]
+    if prefix:
+        return prefix[:240]
+    return summary[:240] if summary else row.exception_type
 
 
 def serialize_fulfillment_item(row: FulfillmentItem) -> dict:
@@ -5182,6 +5435,9 @@ def serialize_evidence(row: ExtractionEvidence) -> dict:
 def serialize_exception(row: ExceptionCase) -> dict:
     detail = loads(row.detail, {})
     sla_status = exception_sla_status(row)
+    order = detail.get("order") if isinstance(detail, dict) else {}
+    middle_order_no = order.get("order_no") if isinstance(order, dict) else None
+    crm_order_no = order.get("crm_order_no") if isinstance(order, dict) else None
     return {
         "id": row.id,
         "related_task_id": row.related_task_id,
@@ -5190,6 +5446,8 @@ def serialize_exception(row: ExceptionCase) -> dict:
         "detail": detail,
         "detail_text": row.detail,
         "status": row.status,
+        "order_no": middle_order_no,
+        "crm_order_no": crm_order_no,
         "requires_confirmation": is_high_risk_exception(row),
         "assignee": row.assignee,
         "resolution_note": row.resolution_note,
@@ -5498,7 +5756,7 @@ def list_crm_orders(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    query = session.query(CrmSalesOrder)
+    query = session.query(CrmSalesOrder).filter(or_(CrmSalesOrder.scope_status.is_(None), CrmSalesOrder.scope_status != "Ignored"))
     
     # Enforce data visibility scope for sales/business operators
     if hasattr(current_user, "role") and current_user.role == "business_operator":
@@ -5608,6 +5866,26 @@ def get_crm_sync_summary(session: Session = Depends(get_session)) -> dict:
     return {**crm_order_summary(session), "runs": [serialize_sync_run(row) for row in runs]}
 
 
+@app.get("/api/crm/browser/status")
+def get_crm_browser_status(current_user: User = Depends(require_role(["admin", "it_ops"]))) -> dict:
+    return crm_browser_status()
+
+
+@app.post("/api/crm/browser/start")
+def start_crm_browser(
+    payload: dict | None = None,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(require_role(["admin", "it_ops"])),
+) -> dict:
+    mode = (payload or {}).get("mode")
+    return start_crm_browser_process(session, requested_mode=str(mode) if mode else None)
+
+
+@app.post("/api/crm/browser/stop")
+def stop_crm_browser(current_user: User = Depends(require_role(["admin", "it_ops"]))) -> dict:
+    return stop_crm_browser_process()
+
+
 @app.post("/api/crm/sync/queue")
 def queue_crm_sync(session: Session = Depends(get_session)) -> dict:
     return queue_crm_order_sync(session, source="manual")
@@ -5679,8 +5957,9 @@ def process_crm_order_to_v2(order_id: str, session: Session = Depends(get_sessio
         raise HTTPException(status_code=404, detail="CRM 订单不存在")
     try:
         job = enqueue_crm_order_parsed_event(session, row, trace_id=f"manual-{uuid.uuid4()}")
-        payload = job.payload_json
-        result = process_crm_order_parsed_event(session, loads(payload, {}))
+        payload = loads(job.payload_json, {})
+        payload["force_revalidate"] = True
+        result = process_crm_order_parsed_event(session, payload)
         job.status = "Completed"
         job.error_message = None
         job.updated_at = now_utc()
@@ -5713,7 +5992,7 @@ def replay_v2_delivery_notice(notice_id: str, payload: dict | None = None, sessi
                 "notice_no": notice.notice_no,
                 "notice_status": notice.status,
                 "order_status": order.status,
-                "risk": "MANUAL_REPLAY_WITHOUT_FIX",
+                "risk": ExceptionType.MANUAL_REPLAY_WITHOUT_FIX.value,
                 "action": "blocked",
             }
             session.add(
@@ -5727,7 +6006,7 @@ def replay_v2_delivery_notice(notice_id: str, payload: dict | None = None, sessi
             existing = (
                 session.query(ExceptionCase)
                 .filter(
-                    ExceptionCase.exception_type == "MANUAL_REPLAY_WITHOUT_FIX",
+                    ExceptionCase.exception_type == ExceptionType.MANUAL_REPLAY_WITHOUT_FIX.value,
                     ExceptionCase.status == "Open",
                     ExceptionCase.detail.ilike(f"%{order.order_no}%"),
                 )
@@ -5736,7 +6015,7 @@ def replay_v2_delivery_notice(notice_id: str, payload: dict | None = None, sessi
             if existing is None:
                 session.add(
                     ExceptionCase(
-                        exception_type="MANUAL_REPLAY_WITHOUT_FIX",
+                        exception_type=ExceptionType.MANUAL_REPLAY_WITHOUT_FIX.value,
                         severity="High",
                         detail=dumps({**detail, "summary": "未填写修复证据，禁止重放 OMS"}),
                         status="Open",
@@ -5769,7 +6048,7 @@ def replay_v2_delivery_notice(notice_id: str, payload: dict | None = None, sessi
         resolved_cases = (
             session.query(ExceptionCase)
             .filter(
-                ExceptionCase.exception_type.in_(["OMS_BLOCKED", "MANUAL_REPLAY_WITHOUT_FIX"]),
+                ExceptionCase.exception_type.in_(["OMS_BLOCKED", ExceptionType.MANUAL_REPLAY_WITHOUT_FIX.value]),
                 ExceptionCase.status == "Open",
                 ExceptionCase.detail.ilike(f"%{order.order_no}%"),
             )

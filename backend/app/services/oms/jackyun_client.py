@@ -10,6 +10,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from backend.app.models import SystemConfig
+from backend.app.services.crypto import decrypt_value
 
 
 DEFAULT_JACKYUN_GATEWAY = "https://open.jackyun.com/open/openapi/do"
@@ -33,6 +34,8 @@ def config_value(session: Session, key: str, default: str = "") -> str:
     row = session.get(SystemConfig, key)
     if row is None or row.value is None:
         return default
+    if row.is_secret:
+        return decrypt_value(str(row.value))
     return str(row.value)
 
 
@@ -109,6 +112,9 @@ class JackyunClient:
 
     def query_sku_stock(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.call_api("erp-stock.stock.skulist", payload)
+
+    def query_customers(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.call_api(method, payload)
 
 
 def sign_params(params: dict[str, str], app_secret: str) -> str:

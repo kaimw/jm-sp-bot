@@ -146,8 +146,14 @@ class CrmRuntimeConfigUpdate(BaseModel):
     crm_username: str | None = None
     crm_password: str | None = None
     crm_api_key: str | None = None
+    crm_system_owner_email: str | None = None
     crm_sync_interval_seconds: int | None = None
+    crm_sync_min_order_date: str | None = None
     crm_cdp_url: str | None = None
+    crm_cdp_browser_mode: str | None = None
+    crm_cdp_port: int | None = None
+    crm_cdp_user_data_dir: str | None = None
+    crm_chrome_bin: str | None = None
     crm_fxiaoke_request_file: str | None = None
     crm_fxiaoke_request_json: str | None = None
     crm_fxiaoke_detail_request_file: str | None = None
@@ -179,6 +185,9 @@ class OmsRuntimeConfigUpdate(BaseModel):
     oms_jackyun_version: str | None = None
     oms_jackyun_content_type: str | None = None
     oms_jackyun_timeout_seconds: int | None = None
+    oms_admin_email: str | None = None
+    oms_customer_query_method: str | None = None
+    oms_customer_query_payload_json: str | None = None
     oms_owner_code: str | None = None
     oms_warehouse_code: str | None = None
     oms_shop_code: str | None = None

@@ -13,8 +13,38 @@ from typing import Any, Protocol
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from backend.app.services.rules import (
+    BlockerLevel,
+    DEFAULT_RULES,
+    OrderContext,
+    OrderValidationRule,
+    ValidationResult,
+    register_rule,
+    remove_rule,
+)
+from backend.app.services.rules.helpers import (
+    config_bool,
+    config_dict,
+    config_int,
+    config_list,
+    config_value,
+    inventory_available_quantity,
+    is_approved_status,
+    parse_decimal,
+)
+from backend.app.services.auth import should_mask_financials
+from backend.app.services.crm_attachment_extraction import enrich_order_from_registered_attachments
+from backend.app.services.exception_diagnosis import enqueue_exception_diagnosis
+from backend.app.services.address_quality import is_detailed_receipt_address
+from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
+from backend.app.services.jsonutil import dumps, loads
+from backend.app.services.storage import save_attachment
+from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
+from backend.app.services.time_utils import format_beijing_time
+
 from backend.app.models import (
     AuditEvent,
+    ChannelPricing,
     CrmSalesOrder,
     DeliveryNotice,
     ExceptionCase,
@@ -24,20 +54,10 @@ from backend.app.models import (
     OrderAttachment,
     OutboundMailJob,
     ProcessingJob,
-    ProductInventorySnapshot,
     ProductSKU,
-    ChannelPricing,
     SystemConfig,
-    User,
     now_utc,
 )
-from backend.app.services.auth import should_mask_financials
-from backend.app.services.exception_diagnosis import enqueue_exception_diagnosis
-from backend.app.services.address_quality import is_detailed_receipt_address
-from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
-from backend.app.services.jsonutil import dumps, loads
-from backend.app.services.storage import save_attachment
-from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
 
 
 class IllegalStateTransition(ValueError):
@@ -143,11 +163,43 @@ class OrderEvent(str, Enum):
     CANCEL_CONFIRMED = "CancelConfirmed"
 
 
-class BlockerLevel(str, Enum):
-    NONE = "NONE"
-    LOW = "LOW"
-    HIGH = "HIGH"
-    CRITICAL = "CRITICAL"
+# ═══════════════════════════════════════════════════════
+# ExceptionType —— 统一异常类型枚举
+
+
+class ExceptionType(str, Enum):
+    """V2 订单中台统一异常类型枚举，对应设计文档 §5.2.2"""
+    VALIDATION_BLOCKED = "VALIDATION_BLOCKED"
+    SKU_MAPPING_MISSING = "SKU_MAPPING_MISSING"
+    CUSTOMER_MAPPING_MISSING = "CUSTOMER_MAPPING_MISSING"
+    INVENTORY_SHORTAGE = "INVENTORY_SHORTAGE"
+    WAREHOUSE_OR_LOGISTICS_MISSING = "WAREHOUSE_OR_LOGISTICS_MISSING"
+    CRM_CHANGED_BEFORE_OMS_PUSH = "CRM_CHANGED_BEFORE_OMS_PUSH"
+    CRM_CHANGED_AFTER_OMS_ACCEPTED = "CRM_CHANGED_AFTER_OMS_ACCEPTED"
+    CRM_CHANGED_DURING_OMS_PENDING = "CRM_CHANGED_DURING_OMS_PENDING"
+    CRM_CHANGED_DURING_OMS_RETRY = "CRM_CHANGED_DURING_OMS_RETRY"
+    CRM_CHANGED_DURING_PICKING = "CRM_CHANGED_DURING_PICKING"
+    CRM_CHANGED_AFTER_SHIPPED = "CRM_CHANGED_AFTER_SHIPPED"
+    CRM_CANCELLED_BEFORE_OMS_PUSH = "CRM_CANCELLED_BEFORE_OMS_PUSH"
+    CRM_CANCELLED_AFTER_OMS_ACCEPTED = "CRM_CANCELLED_AFTER_OMS_ACCEPTED"
+    CRM_CANCELLED_DURING_OMS_PENDING = "CRM_CANCELLED_DURING_OMS_PENDING"
+    CRM_CANCELLED_DURING_OMS_RETRY = "CRM_CANCELLED_DURING_OMS_RETRY"
+    CRM_CANCELLED_AFTER_SHIPPED = "CRM_CANCELLED_AFTER_SHIPPED"
+    CRM_DETAIL_SYNC_FAILED = "CRM_DETAIL_SYNC_FAILED"
+    CRM_ATTACHMENT_MISSING = "CRM_ATTACHMENT_MISSING"
+    CRM_ATTACHMENT_PARSE_FAILED = "CRM_ATTACHMENT_PARSE_FAILED"
+    OMS_BLOCKED = "OMS_BLOCKED"
+    OMS_REQUIRED_FIELDS_MISSING = "OMS_REQUIRED_FIELDS_MISSING"
+    OMS_PUSH_TIMEOUT = "OMS_PUSH_TIMEOUT"
+    OMS_VALIDATION_FAILED = "OMS_VALIDATION_FAILED"
+    OMS_IDEMPOTENCY_CONFLICT = "OMS_IDEMPOTENCY_CONFLICT"
+    OMS_STATUS_CONFLICT = "OMS_STATUS_CONFLICT"
+    JOB_LOCK_CONFLICT = "JOB_LOCK_CONFLICT"
+    DUPLICATE_EVENT_REPLAYED = "DUPLICATE_EVENT_REPLAYED"
+    MANUAL_CONFIRM_WITH_STALE_PREVIEW = "MANUAL_CONFIRM_WITH_STALE_PREVIEW"
+    MANUAL_REPLAY_WITHOUT_FIX = "MANUAL_REPLAY_WITHOUT_FIX"
+    UNAUTHORIZED_STATE_OVERRIDE = "UNAUTHORIZED_STATE_OVERRIDE"
+    INTEGRATION_CONFIG_INVALID = "INTEGRATION_CONFIG_INVALID"
 
 
 STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
@@ -181,375 +233,6 @@ STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
     (OrderStatus.FINANCE_CHECKING, OrderEvent.FINANCE_CHECK_FAILED): OrderStatus.FINANCE_EXCEPTION,
     (OrderStatus.FINANCE_CHECKING, OrderEvent.FINANCE_CHECK_PASSED): OrderStatus.CLOSED,
 }
-
-
-@dataclass
-class ValidationResult:
-    rule_code: str
-    passed: bool
-    blocker_level: BlockerLevel = BlockerLevel.NONE
-    reason: str = ""
-    evidence_refs: list[str] | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "rule_code": self.rule_code,
-            "passed": self.passed,
-            "blockerLevel": self.blocker_level.value,
-            "reason": self.reason,
-            "evidenceRefs": self.evidence_refs or [],
-        }
-
-
-@dataclass
-class OrderContext:
-    order: MiddlePlatformOrder
-    crm_order: CrmSalesOrder
-    items: list[MiddlePlatformOrderItem]
-    session: Session
-
-
-class OrderValidationRule(Protocol):
-    def get_rule_code(self) -> str:
-        ...
-
-    def supports(self, context: OrderContext) -> bool:
-        ...
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        ...
-
-
-class RequiredHeadFieldsRule:
-    required_fields = ("crm_order_id", "crm_order_no", "customer_name")
-
-    def get_rule_code(self) -> str:
-        return "REQUIRED_HEAD_FIELDS"
-
-    def supports(self, context: OrderContext) -> bool:
-        return True
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        missing = [field for field in self.required_fields if not getattr(context.order, field, None)]
-        if missing:
-            return ValidationResult(
-                self.get_rule_code(),
-                False,
-                BlockerLevel.CRITICAL,
-                f"订单头字段缺失：{', '.join(missing)}",
-                missing,
-            )
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class PhaseOneCompletenessRule:
-    def get_rule_code(self) -> str:
-        return "PHASE1_COMPLETE_PRE_REVIEW_FIELDS"
-
-    def supports(self, context: OrderContext) -> bool:
-        return True
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        crm = context.crm_order
-        missing: list[str] = []
-        invalid: list[str] = []
-        raw = loads(crm.raw_json, {})
-        attachments = loads(crm.attachment_files_json, [])
-        if not isinstance(attachments, list):
-            attachments = []
-
-        required = [
-            ("approval_status", "CRM 审批状态"),
-            ("sales_user_name", "销售负责人"),
-            ("owner_department", "归属部门"),
-            ("order_date", "订单日期"),
-            ("settlement_method", "结算方式"),
-            ("receipt_contact", "收货联系人"),
-            ("receipt_phone", "收货联系电话"),
-            ("receipt_address", "收货地址"),
-        ]
-        for field, label in required:
-            if not str(getattr(crm, field, "") or "").strip():
-                missing.append(f"{label}({field})")
-        if str(crm.receipt_address or "").strip() and not is_detailed_receipt_address(crm.receipt_address):
-            invalid.append(f"收货地址不是可邮寄详细地址：{crm.receipt_address}")
-
-        if not str(context.order.currency or "").strip():
-            missing.append("币种(currency)")
-        if not attachments:
-            missing.append("关键附件(attachment_files)")
-        if not context.items:
-            missing.append("订单商品明细(order_items)")
-
-        approval_status = str(crm.approval_status or "").strip()
-        if approval_status and not is_approved_status(context.session, approval_status):
-            invalid.append(f"CRM 审批状态未通过：{approval_status}")
-
-        attachment_names = "；".join(str(item) for item in attachments)
-        if attachments and config_bool(context.session, "v2_review_require_key_attachment", True):
-            if not re.search(r"(合同|采购|订单|PO|盖章|签章|回签)", attachment_names, re.IGNORECASE):
-                invalid.append("附件未识别到合同/采购订单/签章等关键凭证")
-
-        if raw.get("life_status") and str(raw.get("life_status")).lower() not in {"normal", "active", "正常"}:
-            invalid.append(f"CRM 订单生命状态异常：{raw.get('life_status')}")
-
-        if missing or invalid:
-            parts = []
-            if missing:
-                parts.append("缺少字段：" + "、".join(missing))
-            if invalid:
-                parts.append("预审不通过：" + "；".join(invalid))
-            return ValidationResult(
-                self.get_rule_code(),
-                False,
-                BlockerLevel.CRITICAL,
-                "；".join(parts),
-                missing + invalid,
-            )
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class CustomerMappingRule:
-    def get_rule_code(self) -> str:
-        return "CUSTOMER_MAPPING"
-
-    def supports(self, context: OrderContext) -> bool:
-        return config_bool(context.session, "v2_review_customer_mapping_required", True)
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        crm = context.crm_order
-        customer_id = str(crm.customer_id or "").strip()
-        customer_name = str(crm.customer_name or context.order.customer_name or "").strip()
-        if not customer_name:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "客户名称缺失，无法完成客户主数据映射。", ["CRM.customer_name"])
-        mapping = config_dict(context.session, "v2_customer_mapping_json", {})
-        candidates = [customer_id, customer_name]
-        for key in candidates:
-            if key and key in mapping:
-                mapped = mapping.get(key) or {}
-                customer_code = str(mapped.get("customer_code") or mapped.get("code") or key).strip()
-                if customer_code:
-                    return ValidationResult(self.get_rule_code(), True, evidence_refs=[f"客户映射：{customer_name}->{customer_code}"])
-        if customer_id:
-            return ValidationResult(self.get_rule_code(), True, evidence_refs=[f"CRM 客户ID：{customer_id}"])
-        return ValidationResult(
-            self.get_rule_code(),
-            False,
-            BlockerLevel.CRITICAL,
-            f"客户未在一期客户映射表中维护：{customer_name}",
-            [f"CRM.customer_name={customer_name}", "配置项 v2_customer_mapping_json"],
-        )
-
-
-class PositiveAmountRule:
-    def get_rule_code(self) -> str:
-        return "POSITIVE_ORDER_AMOUNT"
-
-    def supports(self, context: OrderContext) -> bool:
-        return True
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        if context.order.order_amount is None:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "订单金额为空，需人工确认 CRM 金额。")
-        if Decimal(str(context.order.order_amount)) <= Decimal("0"):
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "订单金额必须大于 0。")
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class AmountConsistencyRule:
-    def get_rule_code(self) -> str:
-        return "AMOUNT_CONSISTENCY"
-
-    def supports(self, context: OrderContext) -> bool:
-        return True
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        crm = context.crm_order
-        order_amount = parse_decimal(crm.order_amount)
-        product_amount = parse_decimal(crm.product_amount)
-        received_amount = parse_decimal(crm.received_amount)
-        receivable_amount = parse_decimal(crm.receivable_amount)
-        failures: list[str] = []
-
-        if product_amount is None:
-            failures.append("商品金额(product_amount)缺失")
-        elif order_amount is not None and abs(order_amount - product_amount) > Decimal("0.01"):
-            failures.append(f"订单金额 {order_amount} 与商品金额 {product_amount} 不一致")
-
-        if received_amount is not None and receivable_amount is not None and order_amount is not None:
-            if abs((received_amount + receivable_amount) - order_amount) > Decimal("0.01"):
-                failures.append(f"已收+应收 {received_amount + receivable_amount} 与订单金额 {order_amount} 不一致")
-
-        if failures:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "；".join(failures), failures)
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class HasOrderItemsRule:
-    def get_rule_code(self) -> str:
-        return "HAS_ORDER_ITEMS"
-
-    def supports(self, context: OrderContext) -> bool:
-        return True
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        if not context.items:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "CRM 订单未解析到任何明细行。")
-        missing_qty = [item.sku_code or item.product_name or item.id for item in context.items if item.quantity is None or Decimal(str(item.quantity)) <= 0]
-        if missing_qty:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, f"订单明细数量缺失或不合法：{', '.join(missing_qty[:5])}")
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class KnownSkuRule:
-    def get_rule_code(self) -> str:
-        return "KNOWN_ACTIVE_SKU"
-
-    def supports(self, context: OrderContext) -> bool:
-        return bool(context.items)
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        sku_codes = sorted({str(item.sku_code or "").strip() for item in context.items if str(item.sku_code or "").strip()})
-        if not sku_codes:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.HIGH, "订单明细未提供 SKU 编码，需人工映射。")
-        known = {
-            row[0]
-            for row in context.session.query(ProductSKU.sku_id)
-            .filter(ProductSKU.sku_id.in_(sku_codes), ProductSKU.status == "Active")
-            .all()
-        }
-        missing = [sku for sku in sku_codes if sku not in known]
-        if missing:
-            unmapped_shop_skus = [item.shop_sku_code for item in context.items if item.sku_code in missing and item.shop_sku_code]
-            if unmapped_shop_skus:
-                return ValidationResult("SKU_MAPPING_MISSING", False, BlockerLevel.CRITICAL, f"CRM 渠道 SKU 未匹配中台标准 SKU：{', '.join(unmapped_shop_skus[:10])}", unmapped_shop_skus)
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, f"SKU 未在主数据启用：{', '.join(missing[:10])}", missing)
-        return ValidationResult(self.get_rule_code(), True)
-
-
-class LocalInventoryAvailableRule:
-    def get_rule_code(self) -> str:
-        return "LOCAL_INVENTORY_AVAILABLE"
-
-    def supports(self, context: OrderContext) -> bool:
-        return config_bool(context.session, "oms_inventory_review_enabled", True) and bool(context.items)
-
-    def validate(self, context: OrderContext) -> ValidationResult:
-        missing_blocks = config_bool(context.session, "oms_inventory_missing_blocks", False)
-        failures: list[str] = []
-        unknown: list[str] = []
-        for item in context.items:
-            sku_code = str(item.sku_code or "").strip()
-            if not sku_code:
-                continue
-            required = Decimal(str(item.quantity or 0))
-            available = inventory_available_quantity(context.session, sku_code)
-            if available is None:
-                unknown.append(sku_code)
-                continue
-            if available < required:
-                failures.append(f"{sku_code} 可用 {available} < 需求 {required}")
-        if failures:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "库存可用量不足：" + "；".join(failures[:8]), failures)
-        if unknown and missing_blocks:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.CRITICAL, "未找到库存快照：" + "、".join(unknown[:8]), unknown)
-        if unknown:
-            return ValidationResult(self.get_rule_code(), False, BlockerLevel.HIGH, "部分 SKU 暂无库存快照，已允许进入人工发货单确认：" + "、".join(unknown[:8]), unknown)
-        return ValidationResult(self.get_rule_code(), True)
-
-
-DEFAULT_RULES: list[OrderValidationRule] = [
-    RequiredHeadFieldsRule(),
-    PhaseOneCompletenessRule(),
-    CustomerMappingRule(),
-    PositiveAmountRule(),
-    AmountConsistencyRule(),
-    HasOrderItemsRule(),
-    KnownSkuRule(),
-    LocalInventoryAvailableRule(),
-]
-
-
-def config_value(session: Session, key: str, default: str = "") -> str:
-    row = session.get(SystemConfig, key)
-    if row is None or row.value is None:
-        return default
-    return str(row.value)
-
-
-def config_bool(session: Session, key: str, default: bool = False) -> bool:
-    value = config_value(session, key, "")
-    if value == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def config_list(session: Session, key: str, default: list[str] | None = None) -> list[str]:
-    raw = config_value(session, key, "")
-    if raw:
-        parsed = loads(raw, None)
-        if isinstance(parsed, list):
-            return [str(item).strip() for item in parsed if str(item).strip()]
-        return [item.strip() for item in raw.split(",") if item.strip()]
-    return list(default or [])
-
-
-def config_dict(session: Session, key: str, default: dict[str, Any] | None = None) -> dict[str, Any]:
-    raw = config_value(session, key, "")
-    if raw:
-        parsed = loads(raw, None)
-        if isinstance(parsed, dict):
-            return parsed
-    return dict(default or {})
-
-
-def config_int(session: Session, key: str, default: int) -> int:
-    try:
-        return int(config_value(session, key, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def is_approved_status(session: Session, value: str) -> bool:
-    allowed = config_list(
-        session,
-        "v2_review_crm_approved_values",
-        ["approved", "审批通过", "已审批", "已通过", "complete", "completed", "passed"],
-    )
-    normalized = value.strip().lower()
-    return normalized in {item.strip().lower() for item in allowed}
-
-
-def inventory_available_quantity(session: Session, sku_code: str) -> Decimal | None:
-    rows = (
-        session.query(ProductInventorySnapshot)
-        .filter(ProductInventorySnapshot.material_code == sku_code, ProductInventorySnapshot.status == "Active")
-        .all()
-    )
-    if not rows:
-        return None
-    total = Decimal("0")
-    for row in rows:
-        source = loads(row.source_payload_json, {})
-        raw_available = (
-            source.get("canUseQuantity")
-            or source.get("availableQuantity")
-            or source.get("available_quantity")
-            or source.get("qty")
-            or row.qty
-        )
-        total += parse_decimal(raw_available) or Decimal("0")
-    return total
-
-
-def parse_decimal(value: Any) -> Decimal | None:
-    text = str(value or "").strip().replace(",", "")
-    if not text:
-        return None
-    try:
-        return Decimal(text).quantize(Decimal("0.01"))
-    except (InvalidOperation, ValueError):
-        return None
 
 
 def transition_order(
@@ -660,6 +343,7 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
     validate_crm_order_parsed_event(payload)
     data = payload.get("data") or {}
     trace_id = str(payload.get("trace_id") or "")
+    force_revalidate = bool(payload.get("force_revalidate"))
     payload_hash = str(data.get("payload_hash") or "").strip()
     crm_order = None
     crm_sales_order_id = str(data.get("crm_sales_order_id") or "").strip()
@@ -677,7 +361,7 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         .filter(MiddlePlatformOrder.source_system == crm_order.source_system, MiddlePlatformOrder.crm_order_id == crm_order.crm_order_id)
         .first()
     )
-    if existing_order is not None and payload_hash and existing_order.payload_hash == payload_hash and existing_order.status != OrderStatus.CRM_APPROVED.value:
+    if existing_order is not None and payload_hash and existing_order.payload_hash == payload_hash and existing_order.status != OrderStatus.CRM_APPROVED.value and not force_revalidate:
         raise DuplicateEventException(f"重复 CRM_ORDER_PARSED 事件：{crm_order.crm_order_id}/{payload_hash}")
     if existing_order is not None and is_crm_order_cancelled(crm_order):
         return handle_crm_cancel_confirmed(session, existing_order, crm_order, payload_hash=payload_hash, trace_id=trace_id)
@@ -685,6 +369,17 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         change_result = handle_crm_snapshot_changed(session, existing_order, crm_order, new_payload_hash=payload_hash, trace_id=trace_id)
         if not change_result.get("continue_processing", False):
             return change_result
+
+    extraction_result = enrich_order_from_registered_attachments(session, crm_order)
+    if extraction_result is not None:
+        session.add(
+            AuditEvent(
+                event_type="CrmAttachmentOmsFieldsExtracted",
+                related_object_type="CrmSalesOrder",
+                related_object_id=crm_order.id,
+                detail=dumps({"trace_id": trace_id, "result": extraction_result.as_dict()}),
+            )
+        )
 
     order = upsert_middle_platform_order(session, crm_order)
     if order.status == OrderStatus.CRM_APPROVED.value:
@@ -696,8 +391,9 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         order.validation_summary_json = dumps({"results": [result.as_dict() for result in validation_results]})
         critical = next((result for result in validation_results if result.blocker_level == BlockerLevel.CRITICAL), None)
         if critical is not None:
-            transition_order(session, order, OrderEvent.RULES_FAILED_CRITICAL, trace_id=trace_id, detail={"rule_code": critical.rule_code})
-            exception_case = create_exception_case(session, order, "VALIDATION_BLOCKED", "High", critical.reason, validation_results, trace_id=trace_id)
+            failed_codes = [result.rule_code for result in validation_results if not result.passed]
+            transition_order(session, order, OrderEvent.RULES_FAILED_CRITICAL, trace_id=trace_id, detail={"rule_code": critical.rule_code, "failed_rule_codes": failed_codes})
+            exception_case = create_exception_case(session, order, ExceptionType.VALIDATION_BLOCKED, "High", validation_blocker_summary(validation_results), validation_results, trace_id=trace_id)
             enqueue_validation_failure_notification(session, order, validation_results, exception_case, trace_id=trace_id)
             return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "validation_passed": False}
         transition_order(session, order, OrderEvent.RULES_PASSED, trace_id=trace_id)
@@ -745,7 +441,7 @@ def handle_crm_snapshot_changed(
         case = create_exception_case(
             session,
             order,
-            "CRM_CHANGED_BEFORE_OMS_PUSH",
+            ExceptionType.CRM_CHANGED_BEFORE_OMS_PUSH,
             "High",
             "CRM 订单在发货通知生成后发生变更，旧发货预览已作废，需重新预审。",
             [],
@@ -757,7 +453,7 @@ def handle_crm_snapshot_changed(
         cancel_oms_push_jobs(session, order, reason="crm_snapshot_changed")
         expire_delivery_notices(session, order, reason="crm_snapshot_changed_during_oms_push")
         transition_order(session, order, OrderEvent.CRM_SNAPSHOT_CHANGED, trace_id=trace_id, detail=detail)
-        exception_type = "CRM_CHANGED_DURING_OMS_PENDING" if status == OrderStatus.OMS_PENDING else "CRM_CHANGED_DURING_OMS_RETRY"
+        exception_type = ExceptionType.CRM_CHANGED_DURING_OMS_PENDING if status == OrderStatus.OMS_PENDING else ExceptionType.CRM_CHANGED_DURING_OMS_RETRY
         case = create_exception_case(
             session,
             order,
@@ -821,7 +517,7 @@ def handle_crm_cancel_confirmed(
         case = create_exception_case(
             session,
             order,
-            "CRM_CANCELLED_BEFORE_OMS_PUSH",
+            ExceptionType.CRM_CANCELLED_BEFORE_OMS_PUSH,
             "High",
             "CRM 订单已撤销/作废，未下推 OMS 的中台流程已取消。",
             [],
@@ -836,7 +532,7 @@ def handle_crm_cancel_confirmed(
         case = create_exception_case(
             session,
             order,
-            "CRM_CANCELLED_DURING_OMS_PENDING",
+            ExceptionType.CRM_CANCELLED_DURING_OMS_PENDING,
             "Critical",
             "CRM 订单在 OMS 待推送期间撤销，已取消待推任务并终止中台流程。",
             [],
@@ -851,7 +547,7 @@ def handle_crm_cancel_confirmed(
         case = create_exception_case(
             session,
             order,
-            "CRM_CANCELLED_DURING_OMS_RETRY",
+            ExceptionType.CRM_CANCELLED_DURING_OMS_RETRY,
             "Critical",
             "CRM 订单在 OMS 重试/阻断期间撤销，已停止自动重试，需确认下游是否已创建单据。",
             [],
@@ -859,7 +555,7 @@ def handle_crm_cancel_confirmed(
         )
         return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "exception_case_id": case.id, "cancelled": True}
 
-    case_type = "CRM_CANCELLED_AFTER_SHIPPED" if status in {OrderStatus.SHIPPED, OrderStatus.FULFILLMENT_ARCHIVED, OrderStatus.SIGNED, OrderStatus.FINANCE_CHECKING, OrderStatus.FINANCE_EXCEPTION} else "CRM_CANCELLED_AFTER_OMS_ACCEPTED"
+    case_type = ExceptionType.CRM_CANCELLED_AFTER_SHIPPED if status in {OrderStatus.SHIPPED, OrderStatus.FULFILLMENT_ARCHIVED, OrderStatus.SIGNED, OrderStatus.FINANCE_CHECKING, OrderStatus.FINANCE_EXCEPTION} else ExceptionType.CRM_CANCELLED_AFTER_OMS_ACCEPTED
     case = create_exception_case(
         session,
         order,
@@ -899,14 +595,14 @@ def crm_cancel_evidence(crm_order: CrmSalesOrder) -> dict[str, Any]:
     }
 
 
-def crm_change_exception_type(status: OrderStatus) -> str:
+def crm_change_exception_type(status: OrderStatus) -> ExceptionType:
     if status == OrderStatus.OMS_ACCEPTED:
-        return "CRM_CHANGED_AFTER_OMS_ACCEPTED"
+        return ExceptionType.CRM_CHANGED_AFTER_OMS_ACCEPTED
     if status == OrderStatus.PICKING:
-        return "CRM_CHANGED_DURING_PICKING"
+        return ExceptionType.CRM_CHANGED_DURING_PICKING
     if status in {OrderStatus.SHIPPED, OrderStatus.FULFILLMENT_ARCHIVED, OrderStatus.SIGNED, OrderStatus.FINANCE_CHECKING, OrderStatus.FINANCE_EXCEPTION}:
-        return "CRM_CHANGED_AFTER_SHIPPED"
-    return "CRM_CHANGED_AFTER_OMS_ACCEPTED"
+        return ExceptionType.CRM_CHANGED_AFTER_SHIPPED
+    return ExceptionType.CRM_CHANGED_AFTER_OMS_ACCEPTED
 
 
 def expire_delivery_notices(session: Session, order: MiddlePlatformOrder, *, reason: str, target_status: str = "Stale") -> int:
@@ -1181,9 +877,17 @@ def run_validation_chain(session: Session, order: MiddlePlatformOrder, rules: li
             continue
         result = rule.validate(context)
         results.append(result)
-        if result.blocker_level == BlockerLevel.CRITICAL:
-            break
     return results
+
+
+def validation_blocker_summary(validation_results: list[ValidationResult]) -> str:
+    failed = [result for result in validation_results if not result.passed]
+    if not failed:
+        return ""
+    critical = [result for result in failed if result.blocker_level == BlockerLevel.CRITICAL]
+    scoped = critical or failed
+    parts = [f"{result.rule_code}：{result.reason}" for result in scoped if result.reason]
+    return "；".join(parts) or scoped[0].reason
 
 
 def is_platform_fulfilled_order(order: MiddlePlatformOrder, crm_order: CrmSalesOrder) -> bool:
@@ -1284,6 +988,17 @@ def create_delivery_notice(session: Session, order: MiddlePlatformOrder) -> Deli
     notice_no = f"DN-{order.order_no.removeprefix('MP-')}"
     split_preview = build_delivery_split_preview(session, order, notice_no)
     payload = build_jackyun_delivery_payload(session, order, notice_no, split_preview)
+
+    # 多仓库路由：优先用地址自动推荐，其次用全局默认
+    from backend.app.services.rules.warehouse_routing import warehouse_routing as route_warehouse
+    routed_wh = route_warehouse(
+        session,
+        receipt_address=order.crm_order.receipt_address or "",
+        channel_code=order.channel_code or "",
+        shop_code=order.shop_code or "",
+    )
+    warehouse_code = routed_wh or config_value(session, "oms_warehouse_code", "").strip() or None
+
     notice = DeliveryNotice(
         notice_no=notice_no,
         order_id=order.id,
@@ -1293,7 +1008,7 @@ def create_delivery_notice(session: Session, order: MiddlePlatformOrder) -> Deli
         oms_idempotency_key=hashlib.sha256(f"{order.order_no}:{order.payload_hash}".encode("utf-8")).hexdigest(),
         oms_method=config_value(session, "oms_create_order_method", "wms.order.create") or "wms.order.create",
         owner_code=config_value(session, "oms_owner_code", "").strip() or None,
-        warehouse_code=config_value(session, "oms_warehouse_code", "").strip() or None,
+        warehouse_code=warehouse_code,
         shop_code=config_value(session, "oms_shop_code", "").strip() or None,
         logistic_code=config_value(session, "oms_logistic_code", "").strip() or None,
         split_preview_json=dumps(split_preview),
@@ -1449,7 +1164,7 @@ def confirm_delivery_notice(session: Session, notice: DeliveryNotice, *, confirm
         create_exception_case(
             session,
             order,
-            "OMS_REQUIRED_FIELDS_MISSING",
+            ExceptionType.OMS_REQUIRED_FIELDS_MISSING,
             "Critical",
             notice.last_error,
             [],
@@ -1850,7 +1565,7 @@ def handle_platform_fulfillment_sync_failure(session: Session, notice: DeliveryN
         logger = logging.getLogger(__name__)
         logger.error(f"[DLQ_ALERT] Platform fulfillment sync failed permanently for order {order.order_no} / platform_order_no {order.platform_order_no} after {max_retries} retries. Error: {message}")
         notice.platform_fulfillment_status = "Blocked"
-        create_exception_case(session, order, "OMS_STATUS_CONFLICT", "High", f"运单号回传平台失败：{message}", [], trace_id=trace_id or notice.id)
+        create_exception_case(session, order, ExceptionType.OMS_STATUS_CONFLICT, "High", f"运单号回传平台失败：{message}", [], trace_id=trace_id or notice.id)
         session.add(
             AuditEvent(
                 event_type="PlatformFulfillmentSyncBlocked",
@@ -2007,7 +1722,7 @@ def handle_oms_waybill_print_failure(session: Session, notice: DeliveryNotice, o
     max_retries = max(1, config_int(session, "oms_waybill_print_max_retries", 3))
     if notice.print_retry_count >= max_retries:
         notice.print_status = "Blocked"
-        create_exception_case(session, order, "OMS_STATUS_CONFLICT", "High", f"跨境面单打印失败：{message}", [], trace_id=trace_id or notice.id)
+        create_exception_case(session, order, ExceptionType.OMS_STATUS_CONFLICT, "High", f"跨境面单打印失败：{message}", [], trace_id=trace_id or notice.id)
         session.add(AuditEvent(event_type="OmsWaybillPrintBlocked", related_object_type="DeliveryNotice", related_object_id=notice.id, detail=dumps({"error": message, "retry_count": notice.print_retry_count})))
         record_integration_event(
             session,
@@ -2225,7 +1940,7 @@ def handle_oms_push_failure(session: Session, notice: DeliveryNotice, order: Mid
     if notice.retry_count >= max_retries:
         notice.status = "Blocked"
         transition_order(session, order, OrderEvent.RETRY_REACHED_MAX_RETRIES, detail={"notice_no": notice.notice_no, "error": message})
-        exception_case = create_exception_case(session, order, "OMS_BLOCKED", "Critical", message, [], trace_id=notice.oms_idempotency_key)
+        exception_case = create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "Critical", message, [], trace_id=notice.oms_idempotency_key)
         enqueue_oms_blocked_notification(session, order, notice, exception_case, message)
         record_integration_event(
             session,
@@ -2359,7 +2074,7 @@ def calculate_next_retry_at(session: Session, retry_count: int) -> datetime:
 def create_exception_case(
     session: Session,
     order: MiddlePlatformOrder,
-    exception_type: str,
+    exception_type: ExceptionType,
     severity: str,
     reason: str,
     validation_results: list[ValidationResult],
@@ -2382,7 +2097,7 @@ def create_exception_case(
     session.add(case)
     session.flush()
     enqueue_exception_diagnosis(session, case, source="order-middle-platform")
-    session.add(AuditEvent(event_type="ExceptionCaseCreated", related_object_type="MiddlePlatformOrder", related_object_id=order.id, detail=dumps({"exception_type": exception_type, "trace_id": trace_id})))
+    session.add(AuditEvent(event_type="ExceptionCaseCreated", related_object_type="MiddlePlatformOrder", related_object_id=order.id, detail=dumps({"exception_type": exception_type.value, "trace_id": trace_id})))
     return case
 
 
@@ -2406,7 +2121,7 @@ def enqueue_validation_failure_notification(
 ) -> OutboundMailJob | None:
     if not config_bool(session, "v2_validation_failure_notification_enabled", True):
         return None
-    to_addresses, cc_addresses = validation_failure_recipients(session)
+    to_addresses, cc_addresses = validation_failure_recipients_for_order(session, order)
     if not to_addresses:
         session.add(
             AuditEvent(
@@ -2419,14 +2134,45 @@ def enqueue_validation_failure_notification(
         return None
 
     failed = [result for result in validation_results if not result.passed]
-    digest_source = "|".join([order.order_no, order.payload_hash or "", ",".join(result.rule_code for result in failed)])
+    digest_source = "|".join(
+        [
+            order.order_no,
+            order.crm_order_no or "",
+            ";".join(f"{result.rule_code}:{result.reason}" for result in failed),
+        ]
+    )
     idempotency_key = f"v2-validation-failed:{hashlib.sha256(digest_source.encode('utf-8')).hexdigest()}"
-    existing = session.query(OutboundMailJob).filter(OutboundMailJob.idempotency_key == idempotency_key).first()
-    if existing is not None:
-        return existing
-
     subject = f"[订单预审未通过][{order.crm_order_no or order.order_no}] {order.customer_name or ''}".strip()
     body = build_validation_failure_mail_body(session, order, failed, exception_case)
+    existing = session.query(OutboundMailJob).filter(OutboundMailJob.idempotency_key == idempotency_key).first()
+    if existing is not None:
+        cancel_stale_pending_validation_failure_notifications(session, order, keep_idempotency_key=idempotency_key, trace_id=trace_id)
+        if existing.status in {"Cancelled", "Failed"}:
+            previous_status = existing.status
+            existing.to_json = dumps(to_addresses)
+            existing.cc_json = dumps(cc_addresses)
+            existing.subject = subject
+            existing.body = body
+            existing.status = "Pending"
+            existing.attempt_count = 0
+            existing.next_retry_at = None
+            existing.last_error = None
+            existing.locked_by = None
+            existing.locked_until = None
+            existing.sending_started_at = None
+            existing.sent_at = None
+            existing.priority = 20
+            session.add(
+                AuditEvent(
+                    event_type="ValidationFailureNotificationRequeued",
+                    related_object_type="MiddlePlatformOrder",
+                    related_object_id=order.id,
+                    detail=dumps({"to": to_addresses, "cc": cc_addresses, "exception_case_id": exception_case.id, "trace_id": trace_id, "previous_status": previous_status}),
+                )
+            )
+        return existing
+
+    cancel_stale_pending_validation_failure_notifications(session, order, keep_idempotency_key=idempotency_key, trace_id=trace_id)
     job = OutboundMailJob(
         mail_type="V2ValidationFailed",
         to_json=dumps(to_addresses),
@@ -2449,6 +2195,39 @@ def enqueue_validation_failure_notification(
     return job
 
 
+def cancel_stale_pending_validation_failure_notifications(
+    session: Session,
+    order: MiddlePlatformOrder,
+    *,
+    keep_idempotency_key: str,
+    trace_id: str = "",
+) -> int:
+    subject_prefix = f"[订单预审未通过][{order.crm_order_no or order.order_no}]"
+    stale_jobs = (
+        session.query(OutboundMailJob)
+        .filter(
+            OutboundMailJob.mail_type == "V2ValidationFailed",
+            OutboundMailJob.status == "Pending",
+            OutboundMailJob.subject.ilike(f"{subject_prefix}%"),
+            OutboundMailJob.idempotency_key != keep_idempotency_key,
+        )
+        .all()
+    )
+    for job in stale_jobs:
+        job.status = "Cancelled"
+        job.last_error = "superseded by newer validation failure notification"
+    if stale_jobs:
+        session.add(
+            AuditEvent(
+                event_type="ValidationFailureNotificationSuperseded",
+                related_object_type="MiddlePlatformOrder",
+                related_object_id=order.id,
+                detail=dumps({"cancelled_count": len(stale_jobs), "trace_id": trace_id}),
+            )
+        )
+    return len(stale_jobs)
+
+
 def validation_failure_recipients(session: Session) -> tuple[list[str], list[str]]:
     configured_to = config_list(session, "v2_validation_failure_to_json", [])
     configured_cc = config_list(session, "v2_validation_failure_cc_json", [])
@@ -2457,6 +2236,43 @@ def validation_failure_recipients(session: Session) -> tuple[list[str], list[str
     to_addresses = configured_to or ([ops] if ops else ([ceo] if ceo else []))
     cc_addresses = configured_cc or ([ceo] if ceo and ceo not in to_addresses else [])
     return unique_emails(to_addresses), unique_emails(cc_addresses)
+
+
+def validation_failure_recipients_for_order(session: Session, order: MiddlePlatformOrder) -> tuple[list[str], list[str]]:
+    sales_email = ""
+    if order.crm_order is not None:
+        sales_email = str(order.crm_order.sales_user_email or "").strip()
+    if not sales_email:
+        sales_email = str(getattr(order, "sales_user_email", "") or "").strip()
+    sales_to = unique_emails([sales_email])
+    if not sales_to:
+        system_owner_to = unique_emails([config_value(session, "crm_system_owner_email", "").strip()])
+        if system_owner_to:
+            return system_owner_to, []
+        configured_to, configured_cc = validation_failure_recipients(session)
+        return configured_to, configured_cc
+    return sales_to, []
+
+
+def exception_notify_recipients(session: Session, exception_type: ExceptionType) -> tuple[list[str], list[str]]:
+    """按异常类型查找通知邮箱配置。
+    优先级: 类型专属(v2_exception_{type}_to_json) > 大类(v2_exception_crm/oms_to_json) > 通用兜底
+    """
+    type_key = exception_type.value.lower()
+    to_list = config_list(session, f"v2_exception_{type_key}_to_json", [])
+    cc_list = config_list(session, f"v2_exception_{type_key}_cc_json", [])
+    if to_list or cc_list:
+        return unique_emails(to_list), unique_emails(cc_list)
+    # 大类回退
+    if exception_type.value.startswith("CRM_"):
+        to_list = config_list(session, "v2_exception_crm_to_json", [])
+        cc_list = config_list(session, "v2_exception_crm_cc_json", [])
+    elif exception_type.value.startswith("OMS_"):
+        to_list = config_list(session, "v2_exception_oms_to_json", [])
+        cc_list = config_list(session, "v2_exception_oms_cc_json", [])
+    if to_list or cc_list:
+        return unique_emails(to_list), unique_emails(cc_list)
+    return validation_failure_recipients(session)
 
 
 def unique_emails(values: list[str]) -> list[str]:
@@ -2542,6 +2358,7 @@ def build_validation_failure_mail_body(
         f"销售负责人：{order.sales_user_name or crm.sales_user_name or ''}",
         f"订单金额：{order.order_amount or ''} {order.currency or ''}".strip(),
         f"异常编号：{exception_case.id}",
+        f"预审时间：{format_beijing_time(exception_case.created_at or now_utc(), include_seconds=True)}（北京时间）",
         "",
         "缺少或需修正的基础资料：",
     ]
@@ -2556,14 +2373,12 @@ def build_validation_failure_mail_body(
         "预审失败项：",
     ])
     for result in failed:
-        refs = "；".join(result.evidence_refs or [])
-        suffix = f"（{refs}）" if refs else ""
-        lines.append(f"- {result.rule_code}：{result.reason}{suffix}")
+        lines.extend(format_validation_result_for_mail(result))
     lines.extend(
         [
             "",
             "处理建议：",
-            "- 请在 CRM 补齐缺失字段、修正未通过项或补充关键附件。",
+            "- 请按失败项分别补齐 CRM 字段、客户映射、商品/SKU 主数据、库存或附件资料。",
             "- 处理完成后重新同步该订单，系统会自动重新预审。",
             "",
             config_value(session, "bot_signature", "积木易搭AI机器人"),
@@ -2572,10 +2387,91 @@ def build_validation_failure_mail_body(
     return "\n".join(lines)
 
 
+def format_validation_result_for_mail(result: ValidationResult) -> list[str]:
+    if result.rule_code == "ATTACHMENT_PRODUCT_CONSISTENCY":
+        return format_attachment_consistency_result_for_mail(result)
+    refs = "；".join(result.evidence_refs or [])
+    suffix = f"（{refs}）" if refs else ""
+    return [f"- {result.rule_code}：{result.reason}{suffix}"]
+
+
+def format_attachment_consistency_result_for_mail(result: ValidationResult) -> list[str]:
+    issue_text = result.reason
+    prefix = "CRM 订单产品与附件解析内容不一致："
+    if issue_text.startswith(prefix):
+        issue_text = issue_text[len(prefix):]
+    rows = []
+    for raw_issue in [part.strip() for part in re.split(r"[；;]", issue_text) if part.strip()]:
+        rows.append(_attachment_consistency_issue_row(raw_issue))
+    lines = [
+        f"- {result.rule_code}：CRM 订单产品与附件解析内容不一致",
+    ]
+    if not rows:
+        return lines
+    lines.extend(
+        [
+            "  对比明细：",
+            "  | 商品 | 对比项 | CRM | 附件 | 结论 |",
+            "  | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            "  | "
+            + " | ".join(
+                _mail_table_cell(row[key])
+                for key in ["product", "field", "crm", "attachment", "conclusion"]
+            )
+            + " |"
+        )
+    return lines
+
+
+def _attachment_consistency_issue_row(raw_issue: str) -> dict[str, str]:
+    product, _, message = raw_issue.partition("：")
+    product = product.strip() or "-"
+    message = message.strip() or raw_issue.strip()
+    crm = _extract_issue_value(message, "CRM")
+    attachment = _extract_issue_value(message, "附件")
+    field = "商品名称/关键词"
+    conclusion = message
+    if "数量" in message:
+        field = "数量"
+    elif "单价" in message:
+        field = "单价"
+    elif "明细总价" in message or "总价" in message or "金额" in message:
+        field = "明细总价"
+
+    if "未出现可匹配的商品名称" in message:
+        conclusion = "附件未匹配到 CRM 商品关键词"
+        attachment = "未匹配"
+    elif "未识别到可比对" in message:
+        conclusion = "附件未识别到可比对字段"
+        attachment = "未识别"
+    elif "不一致" in message:
+        conclusion = "不一致"
+    return {
+        "product": product,
+        "field": field,
+        "crm": crm or "-",
+        "attachment": attachment or "-",
+        "conclusion": conclusion,
+    }
+
+
+def _extract_issue_value(message: str, label: str) -> str:
+    match = re.search(rf"{label}=([^，；;、)）]+)", message)
+    return match.group(1).strip() if match else ""
+
+
+def _mail_table_cell(value: str) -> str:
+    return str(value or "-").replace("|", "/").replace("\n", " ").strip()
+
+
 def build_context_pack(
     session: Session,
     order: MiddlePlatformOrder,
-    exception_type: str,
+    exception_type: ExceptionType,
     severity: str,
     reason: str,
     validation_results: list[ValidationResult],
@@ -2593,7 +2489,7 @@ def build_context_pack(
         "context_type": "V2_ORDER_EXCEPTION",
         "trace_id": trace_id,
         "exception": {
-            "type": exception_type,
+            "type": exception_type.value,
             "severity": severity,
             "summary": reason,
             "risk_level": severity,
@@ -2622,23 +2518,23 @@ def build_context_pack(
     }
 
 
-def exception_policy(exception_type: str, severity: str) -> dict[str, Any]:
-    policies: dict[str, dict[str, Any]] = {
-        "VALIDATION_BLOCKED": {"source_system": "CRM", "responsible_role": "商务/销售", "can_auto_retry": False, "freeze_order_flow": True},
-        "SKU_MAPPING_MISSING": {"source_system": "CRM", "responsible_role": "商品/主数据管理员", "can_auto_retry": False, "freeze_order_flow": True},
-        "OMS_REQUIRED_FIELDS_MISSING": {"source_system": "OMS", "responsible_role": "物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
-        "OMS_BLOCKED": {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": False, "freeze_order_flow": True},
-        "OMS_STATUS_CONFLICT": {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": True, "freeze_order_flow": True},
-        "CRM_CHANGED_AFTER_OMS_ACCEPTED": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CHANGED_DURING_OMS_PENDING": {"source_system": "CRM", "responsible_role": "商务/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CHANGED_DURING_OMS_RETRY": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CHANGED_DURING_PICKING": {"source_system": "CRM", "responsible_role": "商务主管/仓库/物流", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CANCELLED_AFTER_OMS_ACCEPTED": {"source_system": "CRM", "responsible_role": "商务主管/物流", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CANCELLED_DURING_OMS_PENDING": {"source_system": "CRM", "responsible_role": "商务/物流", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CANCELLED_DURING_OMS_RETRY": {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
-        "CRM_CHANGED_AFTER_SHIPPED": {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
-        "CRM_CANCELLED_AFTER_SHIPPED": {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
-        "MANUAL_REPLAY_WITHOUT_FIX": {"source_system": "Manual", "responsible_role": "商务/IT", "can_auto_retry": False, "freeze_order_flow": True},
+def exception_policy(exception_type: ExceptionType, severity: str) -> dict[str, Any]:
+    policies: dict[ExceptionType, dict[str, Any]] = {
+        ExceptionType.VALIDATION_BLOCKED: {"source_system": "CRM", "responsible_role": "商务/销售", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.SKU_MAPPING_MISSING: {"source_system": "CRM", "responsible_role": "商品/主数据管理员", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.OMS_REQUIRED_FIELDS_MISSING: {"source_system": "OMS", "responsible_role": "物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.OMS_BLOCKED: {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.OMS_STATUS_CONFLICT: {"source_system": "OMS", "responsible_role": "IT 运维/物流", "can_auto_retry": True, "freeze_order_flow": True},
+        ExceptionType.CRM_CHANGED_AFTER_OMS_ACCEPTED: {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CHANGED_DURING_OMS_PENDING: {"source_system": "CRM", "responsible_role": "商务/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CHANGED_DURING_OMS_RETRY: {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CHANGED_DURING_PICKING: {"source_system": "CRM", "responsible_role": "商务主管/仓库/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CANCELLED_AFTER_OMS_ACCEPTED: {"source_system": "CRM", "responsible_role": "商务主管/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CANCELLED_DURING_OMS_PENDING: {"source_system": "CRM", "responsible_role": "商务/物流", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CANCELLED_DURING_OMS_RETRY: {"source_system": "CRM", "responsible_role": "商务主管/物流/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.CRM_CHANGED_AFTER_SHIPPED: {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
+        ExceptionType.CRM_CANCELLED_AFTER_SHIPPED: {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
+        ExceptionType.MANUAL_REPLAY_WITHOUT_FIX: {"source_system": "Manual", "responsible_role": "商务/IT", "can_auto_retry": False, "freeze_order_flow": True},
     }
     default_source = "System" if severity in {"Low", "Medium"} else "CRM"
     return policies.get(
@@ -2647,8 +2543,8 @@ def exception_policy(exception_type: str, severity: str) -> dict[str, Any]:
     )
 
 
-def suggested_actions(exception_type: str, failed: list[dict[str, Any]]) -> list[str]:
-    if exception_type == "OMS_BLOCKED":
+def suggested_actions(exception_type: ExceptionType, failed: list[dict[str, Any]]) -> list[str]:
+    if exception_type == ExceptionType.OMS_BLOCKED:
         return ["检查 OMS 接口连通性与幂等键", "确认发货通知单字段是否满足 OMS 必填项", "修复后从异常台重放 OMS 下推"]
     if any(item.get("rule_code") == "KNOWN_ACTIVE_SKU" for item in failed):
         return ["在主数据维护 SKU 或补充 CRM 明细映射", "处理完成后重新触发订单预审"]
@@ -2664,7 +2560,7 @@ def order_dashboard(session: Session) -> dict[str, Any]:
     }
     open_exceptions = (
         session.query(ExceptionCase)
-        .filter(ExceptionCase.status == "Open", or_(ExceptionCase.exception_type == "VALIDATION_BLOCKED", ExceptionCase.exception_type == "OMS_BLOCKED"))
+        .filter(ExceptionCase.status == "Open", or_(ExceptionCase.exception_type == ExceptionType.VALIDATION_BLOCKED.value, ExceptionCase.exception_type == ExceptionType.OMS_BLOCKED.value))
         .count()
     )
     total = sum(status_counts.values())

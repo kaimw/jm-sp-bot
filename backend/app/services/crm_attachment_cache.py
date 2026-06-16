@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.models import OrderAttachment, SystemConfig
+from backend.app.services.crypto import decrypt_value
 from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.storage import safe_name, save_attachment, sha256_bytes
 
@@ -24,6 +25,13 @@ def local_storage_ref(attachment: OrderAttachment) -> str:
     return ""
 
 
+def replace_remote_url_with_local_ref(attachment: OrderAttachment, evidence: dict[str, Any], storage_ref: str) -> None:
+    current_url = str(attachment.file_url or "").strip()
+    if current_url and current_url != storage_ref and current_url.startswith(("http://", "https://", "//")):
+        evidence.setdefault("remote_file_url", current_url)
+    attachment.file_url = storage_ref
+
+
 def cache_order_attachment_file(
     session: Session,
     attachment: OrderAttachment,
@@ -34,6 +42,9 @@ def cache_order_attachment_file(
     evidence = loads(attachment.evidence_json, {})
     cached = local_storage_ref(attachment)
     if cached:
+        replace_remote_url_with_local_ref(attachment, evidence, cached)
+        attachment.evidence_json = dumps(evidence)
+        session.flush()
         return {"status": "Cached", "storage_ref": cached}
     if not attachment.file_url:
         evidence["download_cache"] = {"status": "Skipped", "reason": "missing file_url"}
@@ -49,6 +60,7 @@ def cache_order_attachment_file(
         evidence["local_file_hash"] = digest
         evidence["local_file_size"] = len(content)
         evidence["download_cache"] = {"status": "Cached", "storage_ref": storage_ref, "file_hash": digest, "file_size": len(content)}
+        replace_remote_url_with_local_ref(attachment, evidence, storage_ref)
         attachment.evidence_json = dumps(evidence)
         session.flush()
         return evidence["download_cache"]
@@ -67,6 +79,8 @@ def config_value(session: Session, key: str, default: str = "") -> str:
     row = session.get(SystemConfig, key)
     if row is None or row.value is None:
         return default
+    if row.is_secret:
+        return decrypt_value(str(row.value))
     return str(row.value)
 
 
@@ -120,6 +134,7 @@ def cache_order_attachment_file_via_browser(session: Session, attachment: OrderA
         "file_size": len(content),
         "via": "chrome_cdp",
     }
+    replace_remote_url_with_local_ref(attachment, evidence, storage_ref)
     attachment.evidence_json = dumps(evidence)
     session.flush()
     return evidence["download_cache"]

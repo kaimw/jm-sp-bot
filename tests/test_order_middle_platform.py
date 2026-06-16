@@ -9,10 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.database import Base
-from backend.app.models import AgentRunLog, AuditEvent, ChannelPricing, CrmOrderSnapshot, CrmSalesOrder, ExceptionCase, IntegrationEvent, MiddlePlatformOrder, ModelCallLog, ModelProviderConfig, OrderAttachment, OutboundMailJob, ProcessingJob, ProductInventorySnapshot, ProductSKU, ProductSPU
+from backend.app.models import AgentRunLog, AuditEvent, ChannelPricing, CrmOrderSnapshot, CrmSalesOrder, ExceptionCase, IntegrationEvent, MiddlePlatformOrder, ModelCallLog, ModelProviderConfig, OrderAttachment, OutboundMailJob, ProcessingJob, ProductInventorySnapshot, ProductSKU, ProductSPU, SystemConfig
 from backend.app.services.attachment_parser import parse_attachment
 from backend.app.services.bootstrap import seed_defaults, set_config
-from backend.app.services.crm_sync import retry_crm_order_detail_sync, upsert_crm_sales_orders
+from backend.app.services.crm_sync import config_value as crm_sync_config_value, retry_crm_order_detail_sync, sync_crm_products_as_skus, sync_customer_mapping_from_masters, upsert_crm_sales_orders
+from backend.app.services.crypto import encrypt_value
+from backend.app.services.customer_mapping import enqueue_oms_customer_missing_notification, find_customer_in_oms_response, query_oms_customer, upsert_customer_mapping
 from backend.app.services.crm_attachment_extraction import enrich_order_from_attachment_text
 from backend.app.services import crm_attachment_extraction
 from backend.app.services.jobs import run_pending_jobs
@@ -27,8 +29,8 @@ from backend.app.services.order_middle_platform import (
     transition_order,
 )
 from backend.app.services.jsonutil import dumps, loads
-from backend.app.main import exception_context, exception_diagnosis_feedback, list_agent_run_logs, list_model_call_logs, replay_v2_delivery_notice, serialize_crm_order, serialize_crm_order_with_flow, update_crm_config
-from backend.app.schemas import CrmRuntimeConfigUpdate
+from backend.app.main import exception_context, exception_diagnosis_feedback, list_agent_run_logs, list_model_call_logs, replay_v2_delivery_notice, serialize_crm_order, serialize_crm_order_with_flow, update_crm_config, update_oms_config
+from backend.app.schemas import CrmRuntimeConfigUpdate, OmsRuntimeConfigUpdate
 
 
 def make_session():
@@ -78,6 +80,7 @@ def valid_crm_order_row(**overrides):
         "crm_order_no": "SO-001",
         "customer_name": "亚马逊北美渠道",
         "sales_user_name": "Alice",
+        "sales_user_email": "alice@jimuyida.com",
         "owner_department": "商务一部",
         "life_status": "normal",
         "approval_status": "approved",
@@ -799,6 +802,30 @@ def test_crm_sync_merges_order_detail_fields_and_downloadable_attachments():
     assert any(item["has_download"] for item in detail["attachments"])
 
 
+def test_crm_sync_maps_detail_owner_and_owner_main_department_aliases():
+    session = make_session()
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                sales_user_name="",
+                owner_department="",
+                sales_user_email="",
+                owner_name="张负责人",
+                owner_main_department="商务一部",
+                owner_email="owner@example.com",
+            )
+        ],
+    )
+    session.commit()
+
+    assert result["queued_events"] == 1
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_001").one()
+    assert crm.sales_user_name == "张负责人"
+    assert crm.owner_department == "商务一部"
+    assert crm.sales_user_email == "owner@example.com"
+
+
 def test_retry_crm_order_detail_sync_refreshes_failed_detail(monkeypatch):
     import backend.app.services.crm_sync as crm_sync
 
@@ -856,6 +883,7 @@ def test_crm_attachment_extraction_fills_oms_receiver_fields_without_confusing_c
         crm_order_no="SO-EXTRACT",
         customer_name="附件客户",
         sales_user_name="Alice",
+        sales_user_email="alice@jimuyida.com",
         owner_department="商务一部",
         life_status="normal",
         approval_status="approved",
@@ -1087,6 +1115,7 @@ def test_crm_order_detail_dedupes_current_payload_attachments():
         crm_order_no="SO-DEDUPE",
         customer_name="去重客户",
         sales_user_name="Alice",
+        sales_user_email="alice@jimuyida.com",
         owner_department="商务一部",
         life_status="normal",
         approval_status="approved",
@@ -1215,8 +1244,273 @@ def test_crm_sync_ignores_out_of_scope_order_without_queueing_middle_platform():
     assert session.query(ProcessingJob).filter_by(job_type="CRM_ORDER_PARSED").count() == 0
 
 
+def test_crm_sync_skips_orders_before_configured_min_order_date():
+    session = make_session()
+    set_config(session, "crm_sync_min_order_date", "2026-06-15")
+
+    result = upsert_crm_sales_orders(
+        session,
+        [valid_crm_order_row(crm_order_id="crm_obj_old", crm_order_no="SO-OLD", order_date="2026-01-14")],
+    )
+    session.commit()
+
+    assert result["ignored"] == 1
+    assert result["queued_events"] == 0
+    assert session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_old").count() == 0
+    assert session.query(CrmOrderSnapshot).filter_by(crm_order_id="crm_obj_old").count() == 0
+    assert session.query(ProcessingJob).filter_by(job_type="CRM_ORDER_PARSED").count() == 0
+
+
+def test_crm_sync_config_value_decrypts_secret_password():
+    session = make_session()
+    set_config(session, "crm_password", encrypt_value("crm-secret"), is_secret=True)
+
+    assert crm_sync_config_value(session, "crm_password") == "crm-secret"
+
+
+def test_crm_detail_empty_dom_fallback_preserves_existing_raw_items_and_attachments():
+    session = make_session()
+    upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_degraded_detail",
+                crm_order_no="SO-DEGRADED-DETAIL",
+                items=[{"product_name": "Whale—overseas", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachments=[{"file_name": "客户PO.pdf", "file_url": "https://example.test/po.pdf"}],
+                attachment_files="客户PO.pdf",
+            )
+        ],
+    )
+    session.commit()
+
+    upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_degraded_detail",
+                "crm_order_no": "SO-DEGRADED-DETAIL",
+                "customer_name": "武汉尺子科技有限公司",
+                "sales_user_name": "毛总",
+                "owner_department": "项目部",
+                "order_amount": "50000.00",
+                "detail_source": "DomDetailFallback",
+                "order_items": [],
+                "attachments": [],
+                "attachment_files": "",
+            }
+        ],
+    )
+    session.commit()
+
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_degraded_detail").one()
+    raw = loads(crm.raw_json, {})
+    assert raw["order_items"][0]["product_name"] == "Whale—overseas"
+    assert raw["attachments"][0]["file_name"] == "客户PO.pdf"
+    assert loads(crm.attachment_files_json, []) == ["客户PO.pdf"]
+
+
+def test_crm_attachment_sync_reuses_previous_parsed_signed_po_for_new_payload():
+    session = make_session()
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_reuse_attachment_evidence",
+                crm_order_no="SO-REUSE-ATTACHMENT-EVIDENCE",
+                attachments=[{"file_name": "客户PO.pdf", "file_id": "file-001"}],
+                attachment_files="客户PO.pdf",
+            )
+        ],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    first = session.query(OrderAttachment).one()
+    first.parse_status = "Parsed"
+    first.evidence_json = dumps({"source": "crm_order_detail", "payload_hash": first.payload_hash, "parsed_text": "采购订单\n授权签字人：张三\n订单总金额 ¥125000"})
+    session.commit()
+
+    upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_reuse_attachment_evidence",
+                crm_order_no="SO-REUSE-ATTACHMENT-EVIDENCE",
+                attachments=[{"file_name": "客户PO.pdf", "file_id": "file-001"}],
+                attachment_files="客户PO.pdf",
+                remark="CRM 备注变化生成新快照",
+            )
+        ],
+    )
+    session.commit()
+
+    latest = session.query(OrderAttachment).order_by(OrderAttachment.created_at.desc()).first()
+    evidence = loads(latest.evidence_json, {})
+    assert latest.id != first.id
+    assert latest.parse_status == "Parsed"
+    assert "采购订单" in evidence["parsed_text"]
+    assert evidence["reused_from_attachment_id"] == first.id
+
+
+def test_crm_product_sync_clears_existing_skus_and_rebuilds_from_crm_products():
+    session = make_session()
+    seed_active_sku(session, "OLD-SKU")
+    session.commit()
+
+    result = sync_crm_products_as_skus(
+        session,
+        [
+            {"crm_product_id": "crm_prod_g500_single", "product_name": "睿数国内—空间扫描仪G500(单目)", "sku_code": "G500-SINGLE", "model": "G500 单目"},
+            {"crm_product_id": "crm_prod_g500_dual", "product_name": "睿数国内—空间扫描仪G500(双目)", "sku_code": "G500-DUAL", "model": "G500 双目"},
+        ],
+        clear_existing=True,
+    )
+    session.commit()
+
+    assert result["created_skus"] == 2
+    assert session.query(ProductSKU).filter_by(sku_id="OLD-SKU").count() == 0
+    assert session.query(ProductSKU).filter_by(sku_id="G500-SINGLE", status="Active").count() == 1
+    assert session.query(ProductSPU).filter(ProductSPU.name.ilike("%空间扫描仪G500%")).count() == 2
+
+
+def test_customer_mapping_sync_matches_crm_and_oms_by_customer_name():
+    session = make_session()
+
+    result = sync_customer_mapping_from_masters(
+        session,
+        [
+            {"customer_name": "武汉尺子科技有限公司", "customer_code": "CRM-CUST-001"},
+            {"customer_name": "未匹配客户", "customer_code": "CRM-CUST-002"},
+        ],
+        [{"customer_name": "武汉尺子科技有限公司", "customer_code": "OMS-CUST-8899"}],
+    )
+    session.commit()
+
+    mapping = loads(session.get(SystemConfig, "v2_customer_mapping_json").value, {})
+    unmatched = loads(session.get(SystemConfig, "v2_customer_mapping_unmatched_json").value, [])
+    assert result["matched_count"] == 1
+    assert mapping["武汉尺子科技有限公司"]["customer_code"] == "OMS-CUST-8899"
+    assert mapping["武汉尺子科技有限公司"]["crm_customer_code"] == "CRM-CUST-001"
+    assert unmatched[0]["customer_name"] == "未匹配客户"
+
+
+def test_customer_mapping_queries_oms_when_static_mapping_missing(monkeypatch):
+    import backend.app.services.customer_mapping as customer_mapping_service
+
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    set_config(session, "v2_customer_mapping_json", dumps({}))
+
+    def fake_query(_session, customer_name):
+        return {"customer_name": customer_name, "customer_code": "OMS-CUST-WH-CZ"}, {"status": "Found", "method": "mock.customer.query"}
+
+    monkeypatch.setattr(customer_mapping_service, "query_oms_customer", fake_query)
+
+    result = upsert_crm_sales_orders(
+        session,
+        [valid_crm_order_row(crm_order_id="crm_obj_oms_customer_found", crm_order_no="SO-OMS-CUSTOMER-FOUND", customer_name="武汉尺子科技有限公司")],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mapping = loads(session.get(SystemConfig, "v2_customer_mapping_json").value, {})
+    order = session.query(MiddlePlatformOrder).one()
+    assert mapping["武汉尺子科技有限公司"]["customer_code"] == "OMS-CUST-WH-CZ"
+    assert order.status != OrderStatus.VALIDATION_BLOCKED.value
+    assert session.query(OutboundMailJob).filter_by(mail_type="OmsCustomerMissing").count() == 0
+
+
+def test_customer_mapping_queries_customized_then_legacy_customer_list(monkeypatch):
+    import backend.app.services.customer_mapping as customer_mapping_service
+
+    session = make_session()
+    set_config(session, "oms_jackyun_app_key", "app-key")
+    set_config(session, "oms_jackyun_app_secret", "app-secret", is_secret=True)
+    set_config(session, "oms_customer_query_method", "crm.customer.list.customized,crm.customer.list")
+    calls = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def query_customers(self, method, payload):
+            calls.append((method, payload))
+            if method == "crm.customer.list.customized":
+                return {"ok": True, "data": {"customers": [{"nickname": "其他客户", "customerCode": "OMS-OTHER"}]}}
+            return {"ok": True, "data": {"customers": [{"nickname": "武汉尺子科技有限公司", "customerCode": "OMS-CUST-WH-CZ"}]}}
+
+    monkeypatch.setattr(customer_mapping_service, "JackyunClient", FakeClient)
+
+    customer, detail = query_oms_customer(session, "武汉尺子科技有限公司")
+
+    assert customer == {"customer_name": "武汉尺子科技有限公司", "customer_code": "OMS-CUST-WH-CZ"}
+    assert detail["status"] == "Found"
+    assert detail["method"] == "crm.customer.list"
+    assert [method for method, _payload in calls] == ["crm.customer.list.customized", "crm.customer.list"]
+    assert calls[0][1]["nickname"] == "武汉尺子科技有限公司"
+    assert calls[1][1]["nickname"] == "武汉尺子科技有限公司"
+
+
+def test_customer_mapping_notifies_oms_admin_when_oms_customer_missing(monkeypatch):
+    import backend.app.services.customer_mapping as customer_mapping_service
+
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    set_config(session, "v2_customer_mapping_json", dumps({}))
+    set_config(session, "oms_admin_email", "oms-admin@example.com")
+
+    def fake_query(_session, _customer_name):
+        return None, {"status": "NotFound", "method": "mock.customer.query"}
+
+    monkeypatch.setattr(customer_mapping_service, "query_oms_customer", fake_query)
+
+    result = upsert_crm_sales_orders(
+        session,
+        [valid_crm_order_row(crm_order_id="crm_obj_oms_customer_missing", crm_order_no="SO-OMS-CUSTOMER-MISSING", customer_name="OMS不存在客户")],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    order = session.query(MiddlePlatformOrder).one()
+    notice = session.query(OutboundMailJob).filter_by(mail_type="OmsCustomerMissing").one()
+    assert order.status == OrderStatus.VALIDATION_BLOCKED.value
+    assert loads(notice.to_json, []) == ["oms-admin@example.com"]
+    assert "OMS不存在客户" in notice.body
+
+
+def test_oms_config_requires_admin_email():
+    session = make_session()
+
+    with pytest.raises(HTTPException) as exc:
+        update_oms_config(OmsRuntimeConfigUpdate(oms_enabled=True), session=session)
+
+    assert exc.value.status_code == 400
+    assert "OMS 管理员邮箱为必填项" in exc.value.detail
+
+
+def test_oms_config_accepts_customer_query_options():
+    session = make_session()
+
+    update_oms_config(
+        OmsRuntimeConfigUpdate(
+            oms_admin_email="oms-admin@example.com",
+            oms_customer_query_method="mock.customer.query",
+            oms_customer_query_payload_json=dumps({"pageNo": 1, "pageSize": 20}),
+        ),
+        session=session,
+    )
+
+    assert session.get(SystemConfig, "oms_admin_email").value == "oms-admin@example.com"
+    assert session.get(SystemConfig, "oms_customer_query_method").value == "mock.customer.query"
+
+
 def test_crm_phase1_scope_config_can_be_updated_by_ops():
     session = make_session()
+    set_config(session, "crm_system_owner_email", "crm-owner@example.com")
     update_crm_config(
         CrmRuntimeConfigUpdate(
             v2_crm_phase1_scope_enabled=True,
@@ -1251,12 +1545,77 @@ def test_crm_phase1_scope_config_can_be_updated_by_ops():
 
 def test_crm_phase1_scope_config_rejects_invalid_json():
     session = make_session()
+    set_config(session, "crm_system_owner_email", "crm-owner@example.com")
 
     with pytest.raises(HTTPException) as exc:
         update_crm_config(CrmRuntimeConfigUpdate(v2_crm_phase1_scope_json="[]"), session=session)
 
     assert exc.value.status_code == 400
     assert "一期纳入范围配置" in exc.value.detail
+
+
+def test_crm_config_updates_system_owner_email():
+    session = make_session()
+
+    update_crm_config(CrmRuntimeConfigUpdate(crm_system_owner_email="crm-owner@example.com"), session=session)
+
+    assert session.get(SystemConfig, "crm_system_owner_email").value == "crm-owner@example.com"
+
+
+def test_crm_config_updates_browser_ops_options():
+    session = make_session()
+
+    update_crm_config(
+        CrmRuntimeConfigUpdate(
+            crm_system_owner_email="crm-owner@example.com",
+            crm_cdp_browser_mode="headed",
+            crm_cdp_port=9444,
+            crm_cdp_user_data_dir="/private/tmp/fxiaoke-cdp-profile-9444",
+            crm_chrome_bin="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ),
+        session=session,
+    )
+
+    assert session.get(SystemConfig, "crm_cdp_browser_mode").value == "headed"
+    assert session.get(SystemConfig, "crm_cdp_port").value == "9444"
+    assert session.get(SystemConfig, "crm_cdp_url").value == "http://127.0.0.1:9444"
+    assert session.get(SystemConfig, "crm_cdp_user_data_dir").value == "/private/tmp/fxiaoke-cdp-profile-9444"
+    assert session.get(SystemConfig, "crm_chrome_bin").value.endswith("Google Chrome")
+
+
+def test_crm_config_rejects_invalid_system_owner_email():
+    session = make_session()
+
+    with pytest.raises(HTTPException) as exc:
+        update_crm_config(CrmRuntimeConfigUpdate(crm_system_owner_email="crm-owner"), session=session)
+
+    assert exc.value.status_code == 400
+    assert "CRM 系统负责人邮箱" in exc.value.detail
+
+
+def test_crm_config_rejects_invalid_browser_ops_options():
+    session = make_session()
+    set_config(session, "crm_system_owner_email", "crm-owner@example.com")
+
+    with pytest.raises(HTTPException) as mode_exc:
+        update_crm_config(CrmRuntimeConfigUpdate(crm_cdp_browser_mode="stealth"), session=session)
+    with pytest.raises(HTTPException) as port_exc:
+        update_crm_config(CrmRuntimeConfigUpdate(crm_cdp_port=80), session=session)
+
+    assert mode_exc.value.status_code == 400
+    assert "浏览器模式" in mode_exc.value.detail
+    assert port_exc.value.status_code == 400
+    assert "CDP 端口" in port_exc.value.detail
+
+
+def test_crm_config_requires_system_owner_email():
+    session = make_session()
+
+    with pytest.raises(HTTPException) as exc:
+        update_crm_config(CrmRuntimeConfigUpdate(crm_sync_interval_seconds=3600), session=session)
+
+    assert exc.value.status_code == 400
+    assert "CRM 系统负责人邮箱为必填项" in exc.value.detail
 
 
 def test_crm_change_after_delivery_preview_blocks_and_expires_preview():
@@ -1401,6 +1760,7 @@ def test_validation_blocked_creates_context_pack_exception():
         crm_order_no="SO-002",
         customer_name="缺 SKU 客户",
         sales_user_name="Alice",
+        sales_user_email="alice@jimuyida.com",
         owner_department="商务一部",
         life_status="normal",
         approval_status="approved",
@@ -1415,7 +1775,7 @@ def test_validation_blocked_creates_context_pack_exception():
         receipt_phone="18600003333",
         receipt_address="上海市测试路 2 号",
         delivery_date="2026-06-25",
-        attachment_files_json=dumps(["采购订单.pdf"]),
+        attachment_files_json=dumps(["盖章采购订单.pdf"]),
         payload_hash="hash-002",
         raw_json=dumps({"items": [{"sku_code": "UNKNOWN-SKU", "quantity": 1}]}),
     )
@@ -1471,6 +1831,7 @@ def test_inventory_rule_blocks_when_available_quantity_is_short():
                 "crm_order_no": "SO-STOCK-SHORT",
                 "customer_name": "库存不足客户",
                 "sales_user_name": "Alice",
+                "sales_user_email": "alice@jimuyida.com",
                 "owner_department": "商务一部",
                 "life_status": "normal",
                 "approval_status": "approved",
@@ -1484,7 +1845,7 @@ def test_inventory_rule_blocks_when_available_quantity_is_short():
                 "receipt_phone": "18600004444",
                 "receipt_address": "广东省深圳市南山区测试路 3 号 501 室",
                 "delivery_date": "2026-06-28",
-                "attachment_files": "采购订单.pdf",
+                "attachment_files": "盖章采购订单.pdf",
                 "items": [{"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 2, "unit_price": "100", "line_amount": "200"}],
             }
         ],
@@ -1534,15 +1895,476 @@ def test_phase_one_missing_fields_interrupts_and_notifies_stakeholders():
     mail = session.query(OutboundMailJob).one()
     assert mail.mail_type == "V2ValidationFailed"
     assert "暂不会生成发货通知或下推 OMS" in mail.body
+    assert "预审时间：" in mail.body
+    assert "（北京时间）" in mail.body
     assert "缺少或需修正的基础资料：" in mail.body
     assert "证据来源：" in mail.body
+
+
+def test_validation_failure_notification_prefers_crm_owner_email():
+    session = make_session()
+    set_config(session, "v2_validation_failure_to_json", dumps(["stakeholder@example.com"]))
+    set_config(session, "v2_validation_failure_cc_json", dumps(["ops@example.com"]))
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_owner_email",
+                "crm_order_no": "SO-OWNER-EMAIL",
+                "customer_name": "负责人邮箱客户",
+                "sales_user_name": "张负责人",
+                "sales_user_email": "owner@example.com",
+                "owner_department": "商务一部",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert loads(mail.to_json, []) == ["owner@example.com"]
+    assert loads(mail.cc_json, []) == []
+
+
+def test_validation_failure_notification_falls_back_to_crm_system_owner_email():
+    session = make_session()
+    set_config(session, "crm_system_owner_email", "crm-owner@example.com")
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_system_owner_email",
+                "crm_order_no": "SO-SYSTEM-OWNER-EMAIL",
+                "customer_name": "CRM系统负责人兜底客户",
+                "sales_user_name": "张负责人",
+                "owner_department": "商务一部",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert loads(mail.to_json, []) == ["crm-owner@example.com"]
+
+
+def test_validation_failure_notification_dedupes_same_failure_across_payload_changes():
+    session = make_session()
+
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_dedupe_notice",
+                "crm_order_no": "SO-DEDUPE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    changed = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_dedupe_notice",
+                "crm_order_no": "SO-DEDUPE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+                "remark": "补充了不影响阻断原因的备注",
+            }
+        ],
+    )
+    session.commit()
+    assert changed["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mails = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").all()
+    assert len(mails) == 1
+
+
+def test_validation_failure_notification_cancels_stale_pending_for_same_order():
+    session = make_session()
+
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_supersede_notice",
+                "crm_order_no": "SO-SUPERSEDE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "sales_user_email": "owner@example.com",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+    first = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert first.status == "Pending"
+
+    changed = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_supersede_notice",
+                "crm_order_no": "SO-SUPERSEDE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "sales_user_email": "owner@example.com",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+                "items": [{"product_name": "未映射商品", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
+            }
+        ],
+    )
+    session.commit()
+    assert changed["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mails = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").order_by(OutboundMailJob.created_at).all()
+    assert [mail.status for mail in mails] == ["Cancelled", "Pending"]
+    assert mails[0].last_error == "superseded by newer validation failure notification"
+    assert "KNOWN_ACTIVE_SKU" in mails[1].body
+
+
+def test_validation_failure_notification_requeues_cancelled_same_digest():
+    session = make_session()
+
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_requeue_notice",
+                "crm_order_no": "SO-REQUEUE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "sales_user_email": "owner@example.com",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    mail.status = "Cancelled"
+    mail.last_error = "queue cleared by ops"
+    session.commit()
+
+    unchanged = upsert_crm_sales_orders(
+        session,
+        [
+            {
+                "crm_order_id": "crm_obj_requeue_notice",
+                "crm_order_no": "SO-REQUEUE-NOTICE",
+                "customer_name": "字段缺失客户",
+                "sales_user_email": "owner@example.com",
+                "order_amount": "100.00",
+                "settlement_method": "option1",
+            }
+        ],
+    )
+    session.commit()
+    assert unchanged["queued_events"] == 0
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_requeue_notice").one()
+    event = crm_order_parsed_event(crm, trace_id="requeue-cancelled-notice")
+    event["force_revalidate"] = True
+    process_crm_order_parsed_event(session, event)
+    session.commit()
+
+    session.refresh(mail)
+    assert mail.status == "Pending"
+    assert mail.last_error is None
+    assert mail.attempt_count == 0
+    assert "字段缺失客户" in mail.body
+    assert session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").count() == 1
+    assert session.query(AuditEvent).filter_by(event_type="ValidationFailureNotificationRequeued").count() == 1
+
+
+def test_registered_crm_attachments_enrich_receiver_fields_before_pre_review(monkeypatch):
+    import backend.app.services.order_middle_platform as omp
+
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                receipt_contact="",
+                receipt_phone="",
+                receipt_address="",
+                attachments=[{"file_name": "客户PO.pdf", "file_url": "https://example.test/po.pdf", "file_id": "file-001"}],
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_enrich(_session, crm_order):
+        crm_order.receipt_contact = "赵物流"
+        crm_order.receipt_phone = "18612345678"
+        crm_order.receipt_address = "广东省深圳市南山区科技园测试路 8 号"
+        raw = loads(crm_order.raw_json, {})
+        raw["oms_field_extraction"] = {"source": "attachment", "confidence": 91}
+        crm_order.raw_json = dumps(raw)
+        return SimpleNamespace(as_dict=lambda: raw["oms_field_extraction"])
+
+    monkeypatch.setattr(omp, "enrich_order_from_registered_attachments", fake_enrich)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_001").one()
+    order = session.query(MiddlePlatformOrder).one()
+    assert crm.receipt_contact == "赵物流"
+    assert crm.receipt_phone == "18612345678"
+    assert crm.receipt_address == "广东省深圳市南山区科技园测试路 8 号"
+    assert order.status == OrderStatus.DELIVERY_NOTICE_READY.value
+    assert session.query(AuditEvent).filter_by(event_type="CrmAttachmentOmsFieldsExtracted").count() == 1
+
+
+def test_pre_review_parses_registered_attachments_even_when_receiver_fields_complete(monkeypatch):
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_parse_attachment_for_review",
+                crm_order_no="SO-PARSE-ATTACHMENT-FOR-REVIEW",
+                order_amount="50000.00",
+                product_amount="50000.00",
+                received_amount="0.00",
+                receivable_amount="50000.00",
+                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachment_files="客户PO.pdf",
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_download(attachment):
+        return "采购订单\n授权签字人：张三\n采购明细：空间扫描仪 数量 1 单价 ¥50,000.00 明细总价 ¥50,000.00", {"status": "Parsed", "text_length": 58}
+
+    monkeypatch.setattr(crm_attachment_extraction, "download_attachment_text", fake_download)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    attachment = session.query(OrderAttachment).one()
+    evidence = loads(attachment.evidence_json, {})
+    assert attachment.parse_status == "Parsed"
+    assert "空间扫描仪" in evidence["parsed_text"]
+    assert session.query(MiddlePlatformOrder).one().status == OrderStatus.DELIVERY_NOTICE_READY.value
+
+
+def test_attachment_product_consistency_blocks_and_notifies_sales_owner(monkeypatch):
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_attachment_product_mismatch",
+                crm_order_no="SO-ATTACHMENT-PRODUCT-MISMATCH",
+                sales_user_email="owner@example.com",
+                order_amount="50000.00",
+                product_amount="50000.00",
+                received_amount="0.00",
+                receivable_amount="50000.00",
+                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachment_files="客户PO.pdf",
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_download(attachment):
+        return "采购订单\n授权签字人：张三\n采购明细：便携式打印机 数量 1 单价 ¥40,000.00 明细总价 ¥40,000.00", {"status": "Parsed", "text_length": 60}
+
+    monkeypatch.setattr(crm_attachment_extraction, "download_attachment_text", fake_download)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    order = session.query(MiddlePlatformOrder).one()
+    assert order.status == OrderStatus.VALIDATION_BLOCKED.value
+    detail = loads(session.query(ExceptionCase).one().detail, {})
+    failed_codes = [rule["rule_code"] for rule in detail["validation"]["failed_rules"]]
+    assert "ATTACHMENT_PRODUCT_CONSISTENCY" in failed_codes
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert loads(mail.to_json, []) == ["owner@example.com"]
+    assert loads(mail.cc_json, []) == []
+    assert "CRM 订单产品与附件解析内容不一致" in mail.body
+    assert "| 商品 | 对比项 | CRM | 附件 | 结论 |" in mail.body
+    assert "| 空间扫描仪 | 商品名称/关键词 | - | 未匹配 | 附件未匹配到 CRM 商品关键词 |" in mail.body
+
+
+def test_attachment_product_consistency_reads_po_table_amounts(monkeypatch):
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_po_table_amounts",
+                crm_order_no="SO-PO-TABLE-AMOUNTS",
+                sales_user_email="owner@example.com",
+                order_amount="50000.00",
+                product_amount="50000.00",
+                received_amount="0.00",
+                receivable_amount="50000.00",
+                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachment_files="客户PO.png",
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_download(attachment):
+        return (
+            "采购订单\n"
+            "序号 产品名称 规格型号 数量 单位 单价（未含税） 总金额（含税） 交期\n"
+            "1 三维扫描仪 Whale 基础款 Whale 基础款 1 台 ¥44,247.79 ¥50,000.00 乙方收到甲方全额货款后发货。\n"
+            "订单总金额（含税）：人民币 伍万元整（大写） ¥50,000.00（小写）\n"
+            "授权签字人：测试"
+        ), {"status": "Parsed", "text_length": 180}
+
+    monkeypatch.setattr(crm_attachment_extraction, "download_attachment_text", fake_download)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    detail = loads(session.query(ExceptionCase).one().detail, {})
+    failed = next(rule for rule in detail["validation"]["failed_rules"] if rule["rule_code"] == "ATTACHMENT_PRODUCT_CONSISTENCY")
+    assert "附件未出现可匹配的商品名称/关键词" in failed["reason"]
+    assert "附件未识别到可比对的数量" not in failed["reason"]
+    assert "附件未识别到可比对的单价" not in failed["reason"]
+    assert "附件未识别到可比对的明细总价" not in failed["reason"]
+    assert "附件单价与 CRM 不一致" not in failed["reason"]
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert "| 硬件设备—空间扫描仪 | 商品名称/关键词 | - | 未匹配 | 附件未匹配到 CRM 商品关键词 |" in mail.body
+
+
+def test_attachment_product_consistency_uses_order_total_when_table_ocr_degrades(monkeypatch):
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_po_ocr_degraded",
+                crm_order_no="SO-PO-OCR-DEGRADED",
+                sales_user_email="owner@example.com",
+                order_amount="50000.00",
+                product_amount="50000.00",
+                received_amount="0.00",
+                receivable_amount="50000.00",
+                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachment_files="客户PO.png",
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_download(attachment):
+        return (
+            "采购订单\n"
+            "[es | sane | sweronss [meat |e [tio Cex | 总金额《全各\n"
+            "js [amar [war [+ [+ | sus [mn |r\n"
+            "订单总金额 (AB : | AR 伍万元整 (大写) ¥50,000.00 (小写)\n"
+            "授权签字人 : 测试"
+        ), {"status": "Parsed", "text_length": 120}
+
+    monkeypatch.setattr(crm_attachment_extraction, "download_attachment_text", fake_download)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    detail = loads(session.query(ExceptionCase).one().detail, {})
+    failed = next(rule for rule in detail["validation"]["failed_rules"] if rule["rule_code"] == "ATTACHMENT_PRODUCT_CONSISTENCY")
+    assert "附件未出现可匹配的商品名称/关键词" in failed["reason"]
+    assert "附件未识别到可比对的数量" in failed["reason"]
+    assert "附件未识别到可比对的单价" not in failed["reason"]
+    assert "附件未识别到可比对的明细总价" not in failed["reason"]
+    assert "附件单价与 CRM 不一致" not in failed["reason"]
+
+
+def test_attachment_product_consistency_blocks_when_price_quantity_or_total_mismatch(monkeypatch):
+    session = make_session()
+    seed_active_sku(session)
+    seed_inventory(session, quantity=100)
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_attachment_amount_mismatch",
+                crm_order_no="SO-ATTACHMENT-AMOUNT-MISMATCH",
+                sales_user_email="owner@example.com",
+                order_amount="50000.00",
+                product_amount="50000.00",
+                received_amount="0.00",
+                receivable_amount="50000.00",
+                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                attachment_files="客户PO.pdf",
+            )
+        ],
+    )
+    session.commit()
+
+    def fake_download(attachment):
+        return "采购订单\n授权签字人：张三\n采购明细：空间扫描仪 数量 2 单价 ¥25,000.00 明细总价 ¥50,000.00", {"status": "Parsed", "text_length": 62}
+
+    monkeypatch.setattr(crm_attachment_extraction, "download_attachment_text", fake_download)
+
+    assert result["queued_events"] == 1
+    run_pending_jobs(session)
+
+    order = session.query(MiddlePlatformOrder).one()
+    assert order.status == OrderStatus.VALIDATION_BLOCKED.value
+    detail = loads(session.query(ExceptionCase).one().detail, {})
+    failed = next(rule for rule in detail["validation"]["failed_rules"] if rule["rule_code"] == "ATTACHMENT_PRODUCT_CONSISTENCY")
+    assert "附件数量与 CRM 不一致" in failed["reason"]
+    assert "附件单价与 CRM 不一致" in failed["reason"]
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert loads(mail.to_json, []) == ["owner@example.com"]
 
 
 def test_customer_mapping_failure_interrupts_and_notifies_with_evidence_summary():
     session = make_session()
     seed_active_sku(session)
     seed_inventory(session, quantity=100)
-    result = upsert_crm_sales_orders(session, [valid_crm_order_row(crm_order_id="crm_obj_unknown_customer", crm_order_no="SO-UNKNOWN-CUSTOMER", customer_name="未映射客户")])
+    result = upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_unknown_customer",
+                crm_order_no="SO-UNKNOWN-CUSTOMER",
+                customer_name="未映射客户",
+                items=[{"product_name": "未映射商品", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
+            )
+        ],
+    )
     session.commit()
 
     assert result["queued_events"] == 1
@@ -1553,13 +2375,17 @@ def test_customer_mapping_failure_interrupts_and_notifies_with_evidence_summary(
     detail = loads(session.query(ExceptionCase).one().detail, {})
     failed_rules = detail["validation"]["failed_rules"]
     assert any(rule["rule_code"] == "CUSTOMER_MAPPING" for rule in failed_rules)
+    assert any(rule["rule_code"] == "KNOWN_ACTIVE_SKU" for rule in failed_rules)
     assert "客户资料/客户主数据映射" in detail["validation"]["missing_materials"]
+    assert "商品明细、SKU 主数据或数量" in detail["validation"]["missing_materials"]
     assert any("采购订单.pdf" in item for item in detail["validation"]["evidence_summary"])
     mail = session.query(OutboundMailJob).one()
     assert mail.mail_type == "V2ValidationFailed"
     assert "客户资料/客户主数据映射" in mail.body
+    assert "商品明细、SKU 主数据或数量" in mail.body
     assert "附件：采购订单.pdf" in mail.body
     assert "CUSTOMER_MAPPING" in mail.body
+    assert "KNOWN_ACTIVE_SKU" in mail.body
 
 
 def test_validation_exception_queues_and_writes_diagnosis():

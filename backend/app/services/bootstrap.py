@@ -141,8 +141,14 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "crm_username", "", is_secret=False)
     ensure_config(session, "crm_password", "", is_secret=True)
     ensure_config(session, "crm_api_key", "", is_secret=True)
+    ensure_config(session, "crm_system_owner_email", "", is_secret=False)
     ensure_config(session, "crm_sync_interval_seconds", "3600", is_secret=False)
+    ensure_config(session, "crm_sync_min_order_date", "", is_secret=False)
     ensure_config(session, "crm_cdp_url", "http://127.0.0.1:9333", is_secret=False)
+    ensure_config(session, "crm_cdp_browser_mode", "headless", is_secret=False)
+    ensure_config(session, "crm_cdp_port", "9333", is_secret=False)
+    ensure_config(session, "crm_cdp_user_data_dir", "/private/tmp/fxiaoke-cdp-profile-9333", is_secret=False)
+    ensure_config(session, "crm_chrome_bin", "", is_secret=False)
     ensure_config(session, "crm_fxiaoke_request_file", "", is_secret=False)
     ensure_config(session, "crm_fxiaoke_request_json", "", is_secret=True)
     ensure_config(session, "crm_fxiaoke_detail_request_file", "", is_secret=False)
@@ -182,6 +188,9 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "oms_jackyun_gateway_url", "https://open.jackyun.com/open/openapi/do", is_secret=False)
     ensure_config(session, "oms_jackyun_app_key", "", is_secret=False)
     ensure_config(session, "oms_jackyun_app_secret", "", is_secret=True)
+    ensure_config(session, "oms_admin_email", "", is_secret=False)
+    ensure_config(session, "oms_customer_query_method", "crm.customer.list.customized,crm.customer.list", is_secret=False)
+    ensure_config(session, "oms_customer_query_payload_json", "{}", is_secret=False)
     ensure_config(session, "oms_jackyun_version", "1.0", is_secret=False)
     ensure_config(session, "oms_jackyun_content_type", "json", is_secret=False)
     ensure_config(session, "oms_jackyun_timeout_seconds", "20", is_secret=False)
@@ -309,4 +318,3 @@ def seed_defaults(session: Session) -> None:
             role="it_ops",
             department="Logistics"
         ))
-

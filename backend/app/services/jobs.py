@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from typing import Any
+from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -11,9 +12,12 @@ from backend.app.models import MailMessage, ProcessingJob, now_utc
 from backend.app.services.crm_sync import run_crm_sales_order_sync
 from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.exception_diagnosis import diagnose_exception_case
-from backend.app.services.jsonutil import loads
+from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.order_middle_platform import DuplicateEventException, poll_oms_status_updates, process_crm_order_parsed_event, process_oms_push_notice, process_oms_status_update, process_oms_waybill_print, process_platform_fulfillment_sync
 from backend.app.services.workflow import process_inbound_mail
+
+
+REPEATABLE_JOB_TYPES = {"OMS_PUSH_NOTICE", "PLATFORM_FULFILLMENT_SYNC", "sync_crm_sales_orders", "OMS_STATUS_POLL"}
 
 
 def run_platform_sync_async(job_id: str, payload: dict) -> None:
@@ -45,6 +49,37 @@ def run_platform_sync_async(job_id: str, payload: dict) -> None:
                 job.updated_at = now_utc()
                 db_session.commit()
             logger.exception(f"Async platform fulfillment sync failed for job {job_id}: {exc}")
+
+
+def schedule_oms_status_poll_if_due(session: Session) -> dict[str, Any]:
+    """OMS 状态轮询定时调度。每分钟由 Worker 调用一次。"""
+    from backend.app.services.order_middle_platform import config_bool, config_int, config_value
+    from backend.app.services.bootstrap import set_config
+    if not config_bool(session, "oms_enabled", False):
+        return {"queued": False, "reason": "oms_disabled"}
+    if config_bool(session, "oms_mock_success", True):
+        return {"queued": False, "reason": "oms_mock_mode"}
+    interval = max(60, config_int(session, "oms_status_poll_interval_seconds", 300))
+    last_poll = config_value(session, "oms_status_last_poll_at", "").strip()
+    if last_poll:
+        try:
+            last = datetime.fromisoformat(last_poll)
+            if (datetime.now(timezone.utc) - last).total_seconds() < interval:
+                return {"queued": False, "reason": "not due"}
+        except ValueError:
+            pass
+    existing = (
+        session.query(ProcessingJob)
+        .filter(ProcessingJob.job_type == "OMS_STATUS_POLL", ProcessingJob.status.in_(["Pending", "Running"]))
+        .first()
+    )
+    if existing is not None:
+        return {"queued": False, "reason": "already queued"}
+    job = ProcessingJob(job_type="OMS_STATUS_POLL", payload_json=dumps({"limit": 50, "source": "scheduled"}), status="Pending")
+    session.add(job)
+    set_config(session, "oms_status_last_poll_at", datetime.now(timezone.utc).isoformat())
+    session.commit()
+    return {"queued": True, "job_id": job.id}
 
 
 def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
@@ -90,7 +125,7 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
         if job is None:
             continue
         duplicate = None
-        if job.job_type != "OMS_PUSH_NOTICE" and job.job_type != "PLATFORM_FULFILLMENT_SYNC":
+        if job.job_type not in REPEATABLE_JOB_TYPES:
             duplicate = (
                 session.query(ProcessingJob)
                 .filter(

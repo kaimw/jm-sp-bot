@@ -71,7 +71,7 @@ async function api(path, options = {}) {
 
 function toast(message) {
   const node = $("#toast");
-  node.textContent = message;
+  node.textContent = String(message || "操作已完成");
   node.classList.add("show");
   setTimeout(() => node.classList.remove("show"), 2600);
 }
@@ -2724,9 +2724,8 @@ async function openCrmOrderDetail(orderId) {
   try {
     const row = await api(`/api/crm/orders/${orderId}`);
     $("#crm-order-detail-title").textContent = row.crm_order_no || row.crm_order_id || "订单详情";
-    const canRetryDetail = row.crm_detail_status === "detail_failed" || row.crm_detail_status === "list_only";
     $("#crm-order-detail-meta").innerHTML = `${h(row.source_system || "CRM")} · 同步时间 ${row.synced_at ? h(formatTime(row.synced_at)) : "未同步"} · ${h(row.crm_detail_message || "")}${
-      canRetryDetail ? ` <button class="button ghost mini" data-action="retry-crm-detail-sync" data-id="${h(row.id)}">重试详情同步</button>` : ""
+      ` <button class="button ghost mini" data-action="retry-crm-detail-sync" data-id="${h(row.id)}">强制重试详情同步</button>`
     }`;
     $("#crm-order-detail-summary").innerHTML = [
       ["订单金额", formatAmountHtml(row.order_amount, row.currency), row.currency || "CNY"],
@@ -2948,7 +2947,7 @@ function renderExceptionContextPanel(data = {}) {
         </div>
       </section>
       <section>
-        <h3>${h(order.order_no || crm.crm_order_no || "订单")}</h3>
+        <h3>${crm.crm_order_no ? `<a class="exception-order-link" style="font-weight: 600; color: var(--accent); cursor: pointer;" onclick="navigateToCrmOrder('${h(crm.crm_order_no)}')">${h(order.order_no || crm.crm_order_no)}</a>` : h(order.order_no || crm.crm_order_no || "订单")}</h3>
         <p>${h(order.customer_name || crm.customer_name || "-")} · ${h(order.status || "-")}</p>
         <small>${h(order.channel_code || "")}${order.shop_code ? ` · ${h(order.shop_code)}` : ""}${order.platform_order_no ? ` · ${h(order.platform_order_no)}` : ""}</small>
       </section>
@@ -3072,7 +3071,7 @@ function formatTime(value) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString("zh-CN", { hour12: false });
+  return date.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
 }
 
 function formatAmount(value, currency = "") {
@@ -3179,11 +3178,15 @@ async function refreshExceptions() {
         (row) => {
           const diagnosis = exceptionDiagnosis(row.detail);
           const materials = exceptionMaterials(row.detail);
+          const crmOrderNo = row.crm_order_no || row.order_no || "";
+          const orderNoDisplay = crmOrderNo
+            ? `<a class="exception-order-link" style="font-weight: 600; color: var(--accent); cursor: pointer;" onclick="navigateToCrmOrder('${h(crmOrderNo)}')">${h(crmOrderNo)}</a>`
+            : `<small>${h(row.id)}</small>`;
           return `
           <div class="row exception-row">
             <div>
               <strong>${h(row.exception_type)}</strong><br />
-              <small>${h(row.id)}</small><br />
+              ${orderNoDisplay}<br />
               <span class="status-pill ${statusPillClass(row.status)}">${h(row.status)}</span>
               <span class="status-pill ${slaPillClass(row.sla_status)}">SLA ${h(row.sla_status || "none")}</span>
             </div>
@@ -4066,6 +4069,7 @@ async function saveCrmConfig() {
   if (!values.crm_fxiaoke_request_json) delete values.crm_fxiaoke_request_json;
   if (!values.crm_fxiaoke_detail_request_json) delete values.crm_fxiaoke_detail_request_json;
   if (!values.v2_crm_phase1_scope_json) delete values.v2_crm_phase1_scope_json;
+  if (!values.crm_sync_min_order_date) delete values.crm_sync_min_order_date;
   values.crm_sync_enabled = formNode.elements.crm_sync_enabled.checked;
   values.v2_crm_phase1_scope_enabled = formNode.elements.v2_crm_phase1_scope_enabled.checked;
   await api("/api/config/crm", {
@@ -4085,11 +4089,62 @@ $("#crm-sync-config-form")?.addEventListener("submit", async (event) => {
   }
 });
 
+async function runCrmBrowserAction(endpoint, body, pendingText, successText) {
+  const resultNode = $("#crm-sync-result");
+  if (resultNode) {
+    resultNode.classList.add("show");
+    resultNode.textContent = pendingText;
+  }
+  try {
+    if (endpoint !== "/api/crm/browser/stop") {
+      await saveCrmConfig();
+    }
+    const result = await api(endpoint, {
+      method: "POST",
+      body: JSON.stringify(body || {}),
+    });
+    if (resultNode) resultNode.textContent = JSON.stringify(result, null, 2);
+    toast(successText || "CRM 浏览器操作完成");
+    await refreshConfig();
+  } catch (error) {
+    notifyError(error, ["系统接入", "CRM 浏览器操作失败"]);
+    if (resultNode) resultNode.textContent = messageFromError(error);
+  }
+}
+
+$("#crm-browser-start")?.addEventListener("click", async () => {
+  await runCrmBrowserAction(
+    "/api/crm/browser/start",
+    {},
+    "正在按当前配置启动 CRM 专用浏览器...",
+    "CRM 专用浏览器已启动"
+  );
+});
+
+$("#crm-browser-login")?.addEventListener("click", async () => {
+  await runCrmBrowserAction(
+    "/api/crm/browser/start",
+    { mode: "headed" },
+    "正在切换到可视人工登录模式；登录完成后可再启动无头模式接管...",
+    "已切换到人工登录模式"
+  );
+});
+
+$("#crm-browser-stop")?.addEventListener("click", async () => {
+  await runCrmBrowserAction(
+    "/api/crm/browser/stop",
+    {},
+    "正在停止 CRM 专用浏览器...",
+    "CRM 专用浏览器已停止"
+  );
+});
+
 async function saveOmsConfig() {
   const formNode = $("#oms-config-form");
   const form = new FormData(formNode);
   const values = Object.fromEntries(form.entries());
   if (!values.oms_jackyun_app_secret) delete values.oms_jackyun_app_secret;
+  if (!values.oms_customer_query_payload_json) delete values.oms_customer_query_payload_json;
   values.oms_enabled = formNode.elements.oms_enabled.checked;
   values.oms_mock_success = formNode.elements.oms_mock_success.checked;
   values.oms_auto_confirm_delivery_notice = formNode.elements.oms_auto_confirm_delivery_notice.checked;
@@ -4926,6 +4981,16 @@ $("#exceptions-list").addEventListener("click", async (event) => {
 });
 
 window.addEventListener("hashchange", () => setActivePage());
+
+function navigateToCrmOrder(crmOrderNo) {
+  tableStates.crmOrders.q = crmOrderNo;
+  tableStates.crmOrders.page = 1;
+  // 同步搜索框的值
+  const searchInput = document.querySelector("#crm-orders-filter-form [name=q]");
+  if (searchInput) searchInput.value = crmOrderNo;
+  window.location.hash = "crm-orders";
+  refreshCrmOrders();
+}
 
 function formatE2EResult(result) {
   const lines = [

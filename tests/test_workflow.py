@@ -156,8 +156,10 @@ def configure_crm_oms_access(session):
     set_config(session, "crm_sync_enabled", "true", is_secret=False)
     set_config(session, "crm_username", "crm-user", is_secret=False)
     set_config(session, "crm_password", "crm-secret", is_secret=True)
+    set_config(session, "crm_system_owner_email", "crm-owner@example.com", is_secret=False)
     set_config(session, "oms_enabled", "true", is_secret=False)
     set_config(session, "oms_mock_success", "false", is_secret=False)
+    set_config(session, "oms_admin_email", "oms-admin@example.com", is_secret=False)
     set_config(session, "oms_jackyun_app_key", "oms-app-key", is_secret=False)
     set_config(session, "oms_jackyun_app_secret", "oms-app-secret", is_secret=True)
     session.commit()
@@ -726,8 +728,10 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert "生产部门主送邮箱" in readiness["missing"]
     assert "CRM同步未启用" in readiness["missing"]
     assert "CRM账号密码或API Key" in readiness["missing"]
+    assert "CRM系统负责人邮箱" in readiness["missing"]
     assert "OMS接入未启用" in readiness["missing"]
     assert "OMS真实下推未启用" in readiness["missing"]
+    assert "OMS管理员邮箱" in readiness["missing"]
     assert "OMS AppKey" in readiness["missing"]
     assert "OMS AppSecret" in readiness["missing"]
 
@@ -739,6 +743,7 @@ def test_system_enable_requires_model_bot_and_department_config():
     assert "bot邮箱密码" in exc.value.detail
     assert "生产部门主送邮箱" in exc.value.detail
     assert "CRM同步未启用" in exc.value.detail
+    assert "CRM系统负责人邮箱" in exc.value.detail
     assert "OMS接入未启用" in exc.value.detail
     assert session.get(SystemConfig, "bot_enabled").value == "false"
 
@@ -2291,7 +2296,7 @@ def test_llm_fallback_can_classify_and_extract_natural_sales_order(monkeypatch):
     assert as_list(ack.to_json) == ["sales@jimuyida.com"]
 
 
-def test_llm_fallback_non_target_is_recorded_as_conversation_exception(monkeypatch):
+def test_llm_fallback_non_target_is_ignored_without_exception(monkeypatch):
     session = make_session()
     model = session.query(ModelProviderConfig).one()
     set_config(session, "model_api_key", "runtime-secret", is_secret=True)
@@ -2307,11 +2312,33 @@ def test_llm_fallback_non_target_is_recorded_as_conversation_exception(monkeypat
     process_mail_direct(session, mail)
     session.commit()
 
-    case = session.query(ExceptionCase).filter_by(exception_type="NonTarget").one()
-    detail = loads(case.detail, {})
-    assert detail["rule_classification"] == "NonTarget"
+    assert session.query(ExceptionCase).filter_by(exception_type="NonTarget").count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="NonTargetMailIgnored", related_object_id=mail.id).one()
+    detail = loads(audit.detail, {})
     assert detail["llm_classification"] == "NonTarget"
     assert detail["llm_reason"] == "与订单沟通无关"
+
+
+def test_legacy_order_cancel_mail_without_task_is_ignored_without_exception():
+    session = make_session()
+    mail = create_inbound_mail(
+        session,
+        from_address="sales@jimuyida.com",
+        subject="取消订单 PT-20260511-0002",
+        body_text="取消订单 PT-20260511-0002，请暂停处理。",
+    )
+    mail.classification = "OrderCancelRequest"
+    mail.classification_confidence = 99
+
+    result = process_mail_direct(session, mail)
+    session.commit()
+
+    assert result is None
+    assert session.query(ExceptionCase).filter_by(exception_type="OrderCancelTaskLinkFailed").count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesDemandWithdrawRejected").count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderMutationIgnored", related_object_id=mail.id).one()
+    detail = loads(audit.detail, {})
+    assert detail["classification"] == "OrderCancelRequest"
 
 
 def test_source_mail_exceptions_are_merged_into_one_record():

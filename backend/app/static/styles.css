@@ -3972,11 +3972,12 @@ label,
   position: fixed;
   right: 28px;
   bottom: 28px;
-  z-index: 20;
+  z-index: 80;
   max-width: min(360px, calc(100vw - 40px));
   padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
-  background: var(--nav);
+  background: #101828;
   color: #fff;
   opacity: 0;
   transform: translateY(8px);
@@ -4642,4 +4643,3 @@ label,
   background: transparent;
   padding: 0;
 }
-

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>商务订单中台智能体 MVP</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260613-shipnexus" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260615-toast" />
   </head>
   <body>
     <section id="login-screen" class="login-screen" hidden>
@@ -567,11 +567,32 @@
             <label class="wide">CRM API Key
               <input name="crm_api_key" type="password" placeholder="账号密码方式可留空；留空不修改" autocomplete="off" />
             </label>
+            <label class="wide">CRM 系统负责人邮箱
+              <input name="crm_system_owner_email" type="email" placeholder="负责人/创建人/修改人邮箱均取不到时的通知兜底邮箱" autocomplete="off" />
+            </label>
             <label>同步间隔(秒)
               <input name="crm_sync_interval_seconds" type="number" min="60" step="60" />
             </label>
+            <label>最早下单日期
+              <input name="crm_sync_min_order_date" type="date" placeholder="2026-06-15" />
+            </label>
             <label>Chrome CDP 地址
               <input name="crm_cdp_url" placeholder="http://127.0.0.1:9333" />
+            </label>
+            <label>托管浏览器模式
+              <select name="crm_cdp_browser_mode">
+                <option value="headless">无头运行（默认）</option>
+                <option value="headed">可视运行</option>
+              </select>
+            </label>
+            <label>CDP 端口
+              <input name="crm_cdp_port" type="number" min="1024" max="65535" placeholder="9333" />
+            </label>
+            <label class="wide">浏览器 Profile 目录
+              <input name="crm_cdp_user_data_dir" placeholder="/private/tmp/fxiaoke-cdp-profile-9333" />
+            </label>
+            <label class="wide">Chrome 可执行文件
+              <input name="crm_chrome_bin" placeholder="可选：默认自动查找 Chrome" />
             </label>
             <label>请求配置文件
               <input name="crm_fxiaoke_request_file" placeholder="/private/tmp/fxiaoke-sales-order-list-request.json" />
@@ -600,6 +621,9 @@
             </label>
             <div class="actions wide">
               <button type="submit" class="button">保存 CRM 配置</button>
+              <button id="crm-browser-start" type="button" class="button ghost">启动专用浏览器</button>
+              <button id="crm-browser-login" type="button" class="button ghost">人工登录模式</button>
+              <button id="crm-browser-stop" type="button" class="button ghost">停止浏览器</button>
               <button id="crm-sync-queue" type="button" class="button ghost">入队同步</button>
               <button id="crm-sync-run" type="button" class="button ghost">立即同步</button>
               <button id="crm-sync-test" type="button" class="button ghost">接入测试</button>
@@ -644,6 +668,9 @@
           <label>AppSecret
             <input name="oms_jackyun_app_secret" type="password" placeholder="留空不修改" autocomplete="current-password" />
           </label>
+          <label>OMS 管理员邮箱
+            <input name="oms_admin_email" type="email" placeholder="客户缺失、OMS主数据异常时通知" />
+          </label>
           <label>接口版本
             <input name="oms_jackyun_version" placeholder="1.0" />
           </label>
@@ -673,6 +700,12 @@
               <option value="wms.order.create">wms.order.create</option>
               <option value="wms-ods.order.create">wms-ods.order.create</option>
             </select>
+          </label>
+          <label>客户查询接口
+            <input name="oms_customer_query_method" placeholder="crm.customer.list.customized,crm.customer.list" />
+          </label>
+          <label class="wide">客户查询参数 JSON
+            <textarea name="oms_customer_query_payload_json" rows="3" placeholder='{"pageSize":50,"hasTotal":1}'></textarea>
           </label>
           <label>重试基数秒
             <input name="oms_retry_base_delay_seconds" type="number" min="1" />
@@ -1566,6 +1599,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260613-shipnexus"></script>
+    <script src="/static/app.js?v=20260616-crm-retry"></script>
   </body>
 </html>

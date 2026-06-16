@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import Header, decode_header
 from email.message import EmailMessage
 from email.policy import default
-from email.utils import encode_rfc2231, formataddr, getaddresses, parsedate_to_datetime
+from email.utils import encode_rfc2231, format_datetime, formataddr, getaddresses, parsedate_to_datetime
 from html import unescape
 import re
 
@@ -28,6 +28,7 @@ from backend.app.services.mail_throttle import (
 from backend.app.services.parser import classify_mail, normalize_latest_reply
 from backend.app.services.storage import save_attachment
 from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
+from backend.app.services.time_utils import to_beijing_time
 from backend.app.services.workflow import (
     add_audit,
     bot_enabled,
@@ -813,6 +814,8 @@ def send_outbound_jobs_with_account(
                     if as_list(job.cc_json):
                         msg["Cc"] = ", ".join(as_list(job.cc_json))
                     msg["Subject"] = job.subject
+                    sent_at = datetime.now(timezone.utc)
+                    msg["Date"] = format_datetime(to_beijing_time(sent_at))
                     msg.set_content(job.body)
                     attach_original_order_files(session, msg, job)
                     smtp.send_message(msg, from_addr=username, to_addrs=recipients)
@@ -823,7 +826,7 @@ def send_outbound_jobs_with_account(
                     session.commit()
                     continue  # 继续发下一封
                 job.status = "Sent"
-                job.sent_at = datetime.now(timezone.utc)
+                job.sent_at = sent_at
                 _clear_outbound_lock(job)
                 add_audit(session, "OutboundMailSent", "OutboundMailJob", job.id, {"recipients": recipients, "mail_type": job.mail_type})
                 sent_ids.add(job.id)

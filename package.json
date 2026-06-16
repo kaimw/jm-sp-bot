@@ -7,6 +7,8 @@
     "test:e2e": "playwright test",
     "test:e2e:reuse": "E2E_SKIP_WEBSERVER=1 playwright test",
     "test:e2e:headed": "playwright test --headed",
+    "crm:chrome": "node scripts/fxiaoke_start_cdp_chrome.mjs",
+    "crm:chrome:headed": "node scripts/fxiaoke_start_cdp_chrome.mjs --headed",
     "test:crm": "node scripts/fxiaoke_integration_smoke.mjs",
     "playwright:install": "playwright install chromium"
   },

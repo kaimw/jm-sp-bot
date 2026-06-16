@@ -11,7 +11,7 @@ from backend.app.database import SessionLocal
 from backend.app.models import OutboundMailJob, ProcessingJob
 from backend.app.services.crm_sync import schedule_crm_order_sync_if_due
 from backend.app.services.erp.material_sync import erp_material_sync_due
-from backend.app.services.jobs import run_pending_jobs
+from backend.app.services.jobs import run_pending_jobs, schedule_oms_status_poll_if_due
 from backend.app.services.jsonutil import dumps
 from backend.app.services.mail_adapter import (
     AUTO_WORKFLOW_MAIL_TYPES,
@@ -63,6 +63,7 @@ def run_mail_auto_worker_once() -> dict:
                 "enabled": True,
                 "erp_material_sync": schedule_erp_material_sync_if_due(session),
                 "crm_order_sync": schedule_crm_order_sync_if_due(session),
+                "oms_status_poll": schedule_oms_status_poll_if_due(session),
                 "synced": {"imported": 0, "queued": 0},
                 "processed": {"completed": 0, "failed": 0, "total": 0},
                 "high_priority_mails": {"sent": 0, "failed": 0, "total": 0},

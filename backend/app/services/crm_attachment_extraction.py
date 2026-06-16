@@ -359,8 +359,6 @@ def enrich_order_from_registered_attachments(session: Session, order: CrmSalesOr
         or (key == "receipt_phone" and not is_valid_receipt_phone(getattr(order, key, "")))
         or (key == "receipt_address" and not is_detailed_receipt_address(getattr(order, key, "")))
     ]
-    if not missing:
-        return None
     attachments = (
         session.query(OrderAttachment)
         .filter(OrderAttachment.source_system == order.source_system, OrderAttachment.crm_order_id == order.crm_order_id, OrderAttachment.payload_hash == order.payload_hash)
@@ -385,6 +383,8 @@ def enrich_order_from_registered_attachments(session: Session, order: CrmSalesOr
         elif attachment.parse_status == "Registered":
             attachment.parse_status = "ParseFailed" if parse_info.get("status") == "Failed" else attachment.parse_status
     if not texts:
+        return None
+    if not missing:
         return None
     result = enrich_order_from_attachment_text(session, order, texts)
     for attachment, _text in texts:

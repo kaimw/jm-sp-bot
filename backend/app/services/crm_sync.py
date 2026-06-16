@@ -4,17 +4,17 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from backend.app.models import AuditEvent, CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
+from backend.app.models import AuditEvent, ChannelPricing, CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, ProductInventorySnapshot, ProductSKU, ProductSPU, PromotionRule, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
 from backend.app.services.crm_attachment_cache import cache_order_attachment_file
-from backend.app.services.crm_attachment_extraction import enrich_order_from_registered_attachments
 from backend.app.services.bootstrap import set_config
+from backend.app.services.crypto import decrypt_value
 from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.order_middle_platform import enqueue_crm_order_parsed_event
 
@@ -27,6 +27,8 @@ def config_value(session: Session, key: str, default: str = "") -> str:
     row = session.get(SystemConfig, key)
     if row is None or row.value is None:
         return default
+    if row.is_secret:
+        return decrypt_value(str(row.value))
     return str(row.value)
 
 
@@ -176,10 +178,17 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
             temp_detail_request_path.write_text(detail_request_json, encoding="utf-8")
             detail_request_path = str(temp_detail_request_path)
         command = [node_bin, str(script_path), f"--single-row={single_row_path}", f"--detail-request={detail_request_path}"]
+        env = {
+            "FXIAOKE_CDP_URL": cdp_url,
+            "FXIAOKE_PAGE_SIZE": "1",
+            "FXIAOKE_DETAIL_ENABLED": "true",
+            "FXIAOKE_USERNAME": config_value(session, "crm_username", "").strip(),
+            "FXIAOKE_PASSWORD": config_value(session, "crm_password", "").strip(),
+        }
         completed = subprocess.run(
             command,
             cwd=str(Path(__file__).resolve().parents[3]),
-            env={**os.environ, "FXIAOKE_CDP_URL": cdp_url, "FXIAOKE_PAGE_SIZE": "1"},
+            env={**os.environ, **env},
             capture_output=True,
             text=True,
             timeout=max(30, config_int(session, "crm_sync_timeout_seconds", 120)),
@@ -195,7 +204,13 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
         rows = data.get("rows") or []
         if not rows:
             raise RuntimeError("CRM 单条详情同步未返回订单详情")
-        return rows[0], {"cdp_url": cdp_url, "detail_request_file": detail_request_path, "json_path": json_path, "detail_pages": output.get("detailPages", [])}
+        row = rows[0]
+        if str(row.get("detail_sync_status") or "").lower() == "failed":
+            raise RuntimeError(str(row.get("detail_sync_error") or "CRM 单条详情同步失败"))
+        failed_detail = next((item for item in output.get("detailPages", []) if item.get("status") == "Failed"), None)
+        if failed_detail is not None:
+            raise RuntimeError(str(failed_detail.get("error") or "CRM 单条详情同步失败"))
+        return row, {"cdp_url": cdp_url, "detail_request_file": detail_request_path, "json_path": json_path, "detail_pages": output.get("detailPages", [])}
     finally:
         try:
             single_row_path.unlink()
@@ -280,6 +295,7 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
     cdp_url = config_value(session, "crm_cdp_url", DEFAULT_CDP_URL).strip() or DEFAULT_CDP_URL
     node_bin = config_value(session, "crm_node_bin", "node").strip() or "node"
     page_size = str(max(1, config_int(session, "crm_sync_page_size", 20)))
+    max_pages = str(max(0, config_int(session, "crm_sync_max_pages", 0)))
     script_path = Path(__file__).resolve().parents[3] / "scripts" / "fxiaoke_replay_sales_orders.mjs"
 
     if not script_path.exists():
@@ -302,7 +318,15 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
         command = [node_bin, str(script_path), f"--request={request_path}"]
         if detail_request_path:
             command.append(f"--detail-request={detail_request_path}")
-        env = {"FXIAOKE_CDP_URL": cdp_url, "FXIAOKE_PAGE_SIZE": page_size}
+        env = {
+            "FXIAOKE_CDP_URL": cdp_url,
+            "FXIAOKE_PAGE_SIZE": page_size,
+            "FXIAOKE_MAX_PAGES": max_pages,
+            "FXIAOKE_DETAIL_ENABLED": "true" if config_bool(session, "crm_sync_detail_enabled", True) else "false",
+            "FXIAOKE_REQUEST_TIMEOUT_MS": str(max(1000, config_int(session, "crm_sync_request_timeout_ms", 15000))),
+            "FXIAOKE_USERNAME": config_value(session, "crm_username", "").strip(),
+            "FXIAOKE_PASSWORD": config_value(session, "crm_password", "").strip(),
+        }
         completed = subprocess.run(
             command,
             cwd=str(Path(__file__).resolve().parents[3]),
@@ -349,6 +373,87 @@ def payload_hash(row: dict[str, Any]) -> str:
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
+def protect_degraded_detail_row(session: Session, existing: CrmSalesOrder | None, row: dict[str, Any]) -> dict[str, Any]:
+    """Avoid replacing a richer CRM detail snapshot with an empty DOM fallback."""
+    if existing is None or not existing.raw_json:
+        return row
+    existing_raw = loads(existing.raw_json, {})
+    if not isinstance(existing_raw, dict):
+        return row
+    protected = dict(row)
+    raw_sources = [existing_raw]
+    snapshots = (
+        session.query(CrmOrderSnapshot)
+        .filter(
+            CrmOrderSnapshot.source_system == existing.source_system,
+            CrmOrderSnapshot.crm_order_id == existing.crm_order_id,
+        )
+        .order_by(CrmOrderSnapshot.version.desc())
+        .limit(10)
+        .all()
+    )
+    for snapshot in snapshots:
+        snapshot_raw = loads(snapshot.raw_json, {})
+        if isinstance(snapshot_raw, dict):
+            raw_sources.append(snapshot_raw)
+
+    def first_raw_value(key: str) -> Any:
+        for source in raw_sources:
+            value = source.get(key)
+            if isinstance(value, list):
+                if value:
+                    return value
+            elif str(value or "").strip():
+                return value
+        return None
+
+    previous_items = first_raw_value("order_items") or first_raw_value("items")
+    if isinstance(previous_items, list) and previous_items:
+        for key in ["order_items", "items"]:
+            incoming = protected.get(key)
+            if not isinstance(incoming, list) or not incoming:
+                protected[key] = previous_items
+    scalar_keys = [
+        "customer_name",
+        "opportunity_name",
+        "life_status",
+        "approval_status",
+        "order_date",
+        "settlement_method",
+        "order_amount",
+        "received_amount",
+        "receivable_amount",
+        "invoice_amount",
+        "product_amount",
+        "sales_user_name",
+        "sales_user_email",
+        "owner_department",
+        "receipt_contact",
+        "receipt_phone",
+        "receipt_address",
+    ]
+    for key in scalar_keys:
+        if str(protected.get(key) or "").strip():
+            continue
+        previous = first_raw_value(key)
+        if str(previous or "").strip():
+            protected[key] = previous
+            continue
+        current = getattr(existing, key, None)
+        if str(current or "").strip():
+            protected[key] = current
+    for key in ["attachments"]:
+        incoming = protected.get(key)
+        previous = first_raw_value(key)
+        if (not isinstance(incoming, list) or not incoming) and isinstance(previous, list) and previous:
+            protected[key] = previous
+    if not str(protected.get("attachment_files") or "").strip():
+        previous_attachment_files = first_raw_value("attachment_files")
+        if str(previous_attachment_files or "").strip():
+            protected["attachment_files"] = previous_attachment_files
+    return protected
+
+
 def normalized_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -364,7 +469,172 @@ def config_json(session: Session, key: str, default: Any) -> Any:
         return default
 
 
+def normalize_master_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().split()).lower()
+
+
+def first_non_empty(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def clear_product_sku_master(session: Session) -> dict[str, int]:
+    counts = {
+        "promotion_rules": session.query(PromotionRule).count(),
+        "channel_pricings": session.query(ChannelPricing).count(),
+        "inventory_snapshots": session.query(ProductInventorySnapshot).count(),
+        "skus": session.query(ProductSKU).count(),
+        "spus": session.query(ProductSPU).count(),
+    }
+    session.query(PromotionRule).delete(synchronize_session=False)
+    session.query(ChannelPricing).delete(synchronize_session=False)
+    session.query(ProductInventorySnapshot).delete(synchronize_session=False)
+    session.query(ProductSKU).delete(synchronize_session=False)
+    session.query(ProductSPU).delete(synchronize_session=False)
+    session.add(AuditEvent(event_type="ProductSkuMasterCleared", related_object_type="SystemConfig", related_object_id="master-data", detail=dumps(counts)))
+    return counts
+
+
+def crm_product_row_to_sku(row: dict[str, Any], index: int) -> dict[str, str]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else row
+    product_name = first_non_empty(row, "product_name", "name", "商品名称", "产品名称") or first_non_empty(raw, "product_name", "name", "商品名称", "产品名称")
+    sku_code = first_non_empty(row, "sku_code", "sku_id", "product_code", "商品编码", "产品编码", "code") or first_non_empty(raw, "sku_code", "sku_id", "product_code", "商品编码", "产品编码", "code")
+    crm_product_id = first_non_empty(row, "crm_product_id", "product_id", "id", "商品ID", "产品ID") or first_non_empty(raw, "crm_product_id", "product_id", "id")
+    if not sku_code:
+        sku_code = crm_product_id or f"CRM-PRODUCT-{index + 1:06d}"
+    if not product_name:
+        product_name = sku_code
+    return {
+        "spu_id": crm_product_id or sku_code,
+        "sku_id": sku_code,
+        "name": product_name,
+        "model": first_non_empty(row, "model", "specification", "规格", "型号") or first_non_empty(raw, "model", "specification", "规格", "型号"),
+        "category": first_non_empty(row, "category", "商品分类", "产品分类") or first_non_empty(raw, "category", "商品分类", "产品分类") or "成品",
+        "raw": dumps(row),
+    }
+
+
+def sync_crm_products_as_skus(session: Session, rows: list[dict[str, Any]], *, clear_existing: bool = True) -> dict[str, int]:
+    if clear_existing:
+        clear_product_sku_master(session)
+    created_spus = 0
+    created_skus = 0
+    updated_skus = 0
+    for index, row in enumerate(rows):
+        normalized = crm_product_row_to_sku(row, index)
+        spu = session.query(ProductSPU).filter_by(spu_id=normalized["spu_id"]).one_or_none()
+        if spu is None:
+            spu = ProductSPU(spu_id=normalized["spu_id"], name=normalized["name"], category=normalized["category"], status="Active")
+            session.add(spu)
+            session.flush()
+            created_spus += 1
+        else:
+            spu.name = normalized["name"]
+            spu.category = normalized["category"] or spu.category
+            spu.status = "Active"
+            spu.updated_at = now_utc()
+        extended = loads(spu.extended_info_json, {})
+        extended["crm"] = {"source": DEFAULT_SOURCE_SYSTEM, "raw": row, "synced_at": now_utc().isoformat()}
+        spu.extended_info_json = dumps(extended)
+        sku = session.query(ProductSKU).filter_by(sku_id=normalized["sku_id"]).one_or_none()
+        if sku is None:
+            sku = ProductSKU(
+                spu_uuid=spu.id,
+                sku_id=normalized["sku_id"],
+                model=normalized["model"] or None,
+                attributes_json=dumps({"source": DEFAULT_SOURCE_SYSTEM, "crm_raw": row}),
+                status="Active",
+            )
+            session.add(sku)
+            created_skus += 1
+        else:
+            sku.spu_uuid = spu.id
+            sku.model = normalized["model"] or sku.model
+            sku.attributes_json = dumps({"source": DEFAULT_SOURCE_SYSTEM, "crm_raw": row})
+            sku.status = "Active"
+            sku.updated_at = now_utc()
+            updated_skus += 1
+    session.add(AuditEvent(event_type="CrmProductSkuSynced", related_object_type="SystemConfig", related_object_id="master-data", detail=dumps({"source_total": len(rows), "created_spus": created_spus, "created_skus": created_skus, "updated_skus": updated_skus, "cleared": clear_existing})))
+    return {"source_total": len(rows), "created_spus": created_spus, "created_skus": created_skus, "updated_skus": updated_skus}
+
+
+def normalize_customer_row(row: dict[str, Any], source: str) -> dict[str, str]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else row
+    name = first_non_empty(row, "customer_name", "name", "客户名称") or first_non_empty(raw, "customer_name", "name", "客户名称")
+    code = first_non_empty(row, "customer_code", "code", "客户编码", "customer_id", "id") or first_non_empty(raw, "customer_code", "code", "客户编码", "customer_id", "id")
+    return {"source": source, "customer_name": name, "customer_code": code}
+
+
+def build_customer_mapping_from_masters(crm_rows: list[dict[str, Any]], oms_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    oms_by_name: dict[str, dict[str, str]] = {}
+    for row in oms_rows:
+        item = normalize_customer_row(row, "OMS")
+        key = normalize_master_name(item["customer_name"])
+        if key and item["customer_code"]:
+            oms_by_name[key] = item
+    mapping: dict[str, Any] = {}
+    unmatched_crm: list[dict[str, str]] = []
+    for row in crm_rows:
+        crm = normalize_customer_row(row, "CRM")
+        key = normalize_master_name(crm["customer_name"])
+        if not key:
+            continue
+        oms = oms_by_name.get(key)
+        if oms is None:
+            unmatched_crm.append(crm)
+            continue
+        mapping[crm["customer_name"]] = {
+            "customer_code": oms["customer_code"],
+            "customer_name": oms["customer_name"],
+            "crm_customer_code": crm["customer_code"],
+            "mapping_source": "crm_oms_name_exact",
+        }
+    return {"mapping": mapping, "unmatched_crm": unmatched_crm, "matched_count": len(mapping)}
+
+
+def sync_customer_mapping_from_masters(session: Session, crm_rows: list[dict[str, Any]], oms_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result = build_customer_mapping_from_masters(crm_rows, oms_rows)
+    set_config(session, "v2_customer_mapping_json", dumps(result["mapping"]), is_secret=False)
+    set_config(session, "v2_customer_mapping_unmatched_json", dumps(result["unmatched_crm"]), is_secret=False)
+    session.add(AuditEvent(event_type="CustomerMappingSynced", related_object_type="SystemConfig", related_object_id="customer-mapping", detail=dumps({"matched_count": result["matched_count"], "unmatched_count": len(result["unmatched_crm"])})))
+    return result
+
+
+def parse_order_date_value(value: Any) -> date | None:
+    text = normalized_text(value)
+    if not text:
+        return None
+    for token in ("T", " "):
+        if token in text:
+            text = text.split(token, 1)[0]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def min_order_date_scope_result(session: Session, row: dict[str, Any]) -> tuple[bool, str | None]:
+    min_date_text = config_value(session, "crm_sync_min_order_date", "").strip()
+    if not min_date_text:
+        min_date_text = normalized_text(config_json(session, "v2_crm_phase1_scope_json", {}).get("min_order_date"))
+    if not min_date_text:
+        return True, None
+    min_date = parse_order_date_value(min_date_text)
+    order_date = parse_order_date_value(row.get("order_date"))
+    if min_date is None or order_date is None:
+        return True, None
+    if order_date < min_date:
+        return False, f"order_date_before_crm_sync_min_order_date:{row.get('order_date')}<{min_date.isoformat()}"
+    return True, None
+
+
 def phase_one_scope_result(session: Session, row: dict[str, Any], existing: CrmSalesOrder | None) -> tuple[bool, str | None]:
+    date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
+    if not date_in_scope:
+        return False, date_ignore_reason
     if not config_bool(session, "v2_crm_phase1_scope_enabled", True):
         return True, None
     scope = config_json(session, "v2_crm_phase1_scope_json", {})
@@ -401,7 +671,6 @@ def upsert_crm_sales_orders(session: Session, rows: list[dict[str, Any]]) -> dic
         crm_order_no = str(row.get("crm_order_no") or "").strip()
         if not crm_order_id and not crm_order_no:
             continue
-        digest = payload_hash(row)
         filters = []
         if crm_order_id:
             filters.append(CrmSalesOrder.crm_order_id == crm_order_id)
@@ -412,6 +681,12 @@ def upsert_crm_sales_orders(session: Session, rows: list[dict[str, Any]]) -> dic
             .filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, or_(*filters))
             .first()
         )
+        date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
+        if not date_in_scope and existing is None:
+            ignored += 1
+            continue
+        row = protect_degraded_detail_row(session, existing, row)
+        digest = payload_hash(row)
         was_new = existing is None
         row_changed = False
         if existing is None:
@@ -435,7 +710,6 @@ def upsert_crm_sales_orders(session: Session, rows: list[dict[str, Any]]) -> dic
         snapshot = save_order_snapshot(session, existing, row, digest)
         existing.latest_snapshot_id = snapshot.id
         sync_order_attachments(session, existing, row, digest)
-        enrich_order_from_registered_attachments(session, existing)
         in_scope, ignore_reason = phase_one_scope_result(session, row, None if was_new else existing)
         if in_scope:
             existing.scope_status = "InScope"
@@ -601,8 +875,45 @@ def sync_order_attachments(session: Session, order: CrmSalesOrder, row: dict[str
         else:
             for key, value in payload.items():
                 setattr(existing, key, value)
+        reuse_previous_attachment_evidence(session, existing)
         if existing.file_url:
             cache_order_attachment_file(session, existing)
+
+
+def reuse_previous_attachment_evidence(session: Session, attachment: OrderAttachment) -> None:
+    evidence = loads(attachment.evidence_json, {})
+    if evidence.get("parsed_text") or evidence.get("local_storage_ref"):
+        return
+    query = (
+        session.query(OrderAttachment)
+        .filter(
+            OrderAttachment.source_system == attachment.source_system,
+            OrderAttachment.crm_order_id == attachment.crm_order_id,
+            OrderAttachment.id != attachment.id,
+        )
+    )
+    if attachment.source_file_id:
+        query = query.filter(OrderAttachment.source_file_id == attachment.source_file_id)
+    else:
+        query = query.filter(OrderAttachment.file_name == attachment.file_name)
+    previous = None
+    for candidate in query.order_by(OrderAttachment.created_at.desc()).limit(20):
+        candidate_evidence = loads(candidate.evidence_json, {})
+        if candidate_evidence.get("parsed_text") or candidate_evidence.get("local_storage_ref"):
+            previous = candidate
+            evidence = candidate_evidence
+            break
+    if previous is None:
+        return
+    reused = dict(evidence)
+    reused["source"] = "crm_order_detail"
+    reused["payload_hash"] = attachment.payload_hash
+    reused["reused_from_attachment_id"] = previous.id
+    reused["reused_from_payload_hash"] = previous.payload_hash
+    attachment.evidence_json = dumps(reused)
+    if previous.file_url and (str(previous.file_url).startswith("data/attachments/") or not attachment.file_url):
+        attachment.file_url = previous.file_url
+    attachment.parse_status = previous.parse_status if previous.parse_status in {"Parsed", "Cached"} else attachment.parse_status
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -640,6 +951,14 @@ def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> N
         existing = str(current or "").strip()
         return existing or None
 
+    def keep_existing_any(keys: list[str], current: Any) -> str | None:
+        for key in keys:
+            value = str(row.get(key) or "").strip()
+            if value:
+                return value
+        existing = str(current or "").strip()
+        return existing or None
+
     order.crm_order_id = keep_existing("crm_order_id", order.crm_order_id) or ""
     order.crm_order_no = keep_existing("crm_order_no", order.crm_order_no) or ""
     order.customer_id = keep_existing("customer_id", order.customer_id)
@@ -647,8 +966,25 @@ def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> N
     order.opportunity_id = keep_existing("opportunity_id", order.opportunity_id)
     order.opportunity_name = keep_existing("opportunity_name", order.opportunity_name)
     order.sales_user_id = keep_existing("sales_user_id", order.sales_user_id)
-    order.sales_user_name = keep_existing("sales_user_name", order.sales_user_name)
-    order.owner_department = keep_existing("owner_department", order.owner_department)
+    order.sales_user_name = keep_existing_any(["sales_user_name", "owner_name", "ownerName", "owner__r", "owner_display_name"], order.sales_user_name)
+    # 销售邮箱优先从 CRM 负责人链接页/人员对象提取；取不到时由通知路由走系统兜底人。
+    order.sales_user_email = keep_existing_any(
+        [
+            "sales_user_email",
+            "owner_email",
+            "ownerEmail",
+            "owner_mail",
+            "ownerMail",
+            "created_by_email",
+            "creator_email",
+            "last_modified_by_email",
+            "modifier_email",
+            "email",
+            "salesEmail",
+        ],
+        order.sales_user_email,
+    )
+    order.owner_department = keep_existing_any(["owner_department", "owner_main_department", "ownerMainDepartment", "main_department", "department"], order.owner_department)
     order.life_status = keep_existing("life_status", order.life_status)
     order.approval_status = keep_existing("approval_status", order.approval_status)
     order.order_date = keep_existing("order_date", order.order_date)

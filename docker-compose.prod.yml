@@ -24,6 +24,7 @@ services:
       APP_ENV: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-jm_sp_bot}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-jm_sp_bot}
       ATTACHMENT_STORAGE_DIR: /app/data/attachments
+      CONFIG_ENCRYPTION_KEY: ${CONFIG_ENCRYPTION_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

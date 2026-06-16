@@ -64,12 +64,61 @@ def seed_oms_required_config(session) -> None:
     session.commit()
 
 
+def test_periodic_crm_sync_job_runs_even_when_same_payload_completed(monkeypatch):
+    import backend.app.services.jobs as jobs_service
+
+    session = make_test_session()
+    payload = dumps({"source": "auto"})
+    session.add(ProcessingJob(job_type="sync_crm_sales_orders", payload_json=payload, status="Completed"))
+    pending = ProcessingJob(job_type="sync_crm_sales_orders", payload_json=payload, status="Pending")
+    session.add(pending)
+    session.commit()
+    calls = []
+
+    def fake_sync(_session, trigger="job"):
+        calls.append(trigger)
+        return {"total": 0}
+
+    monkeypatch.setattr(jobs_service, "run_crm_sales_order_sync", fake_sync)
+
+    result = run_pending_jobs(session)
+
+    assert result["completed"] == 1
+    assert calls == ["auto"]
+    assert session.get(ProcessingJob, pending.id).error_message is None
+
+
+def test_periodic_oms_status_poll_job_runs_even_when_same_payload_completed(monkeypatch):
+    import backend.app.services.jobs as jobs_service
+
+    session = make_test_session()
+    payload = dumps({"limit": 50, "source": "scheduled"})
+    session.add(ProcessingJob(job_type="OMS_STATUS_POLL", payload_json=payload, status="Completed"))
+    pending = ProcessingJob(job_type="OMS_STATUS_POLL", payload_json=payload, status="Pending")
+    session.add(pending)
+    session.commit()
+    calls = []
+
+    def fake_poll(_session, limit=50):
+        calls.append(limit)
+        return {"checked": 0}
+
+    monkeypatch.setattr(jobs_service, "poll_oms_status_updates", fake_poll)
+
+    result = run_pending_jobs(session)
+
+    assert result["completed"] == 1
+    assert calls == [50]
+    assert session.get(ProcessingJob, pending.id).error_message is None
+
+
 def valid_crm_order_row(**overrides):
     row = {
         "crm_order_id": "crm_addr_01",
         "crm_order_no": "SO-ADDR-01",
         "customer_name": "亚马逊北美渠道",
         "sales_user_name": "Alice",
+        "sales_user_email": "alice@jimuyida.com",
         "owner_department": "商务一部",
         "life_status": "normal",
         "approval_status": "approved",

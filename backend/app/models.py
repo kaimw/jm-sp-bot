@@ -27,6 +27,36 @@ class SystemConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
+from sqlalchemy import event
+from sqlalchemy.orm.attributes import set_committed_value
+
+@event.listens_for(SystemConfig, "load")
+@event.listens_for(SystemConfig, "refresh")
+def decrypt_config_on_load(target, context):
+    if target.is_secret and target.value and target.value.startswith("enc:"):
+        from backend.app.services.crypto import decrypt_value
+        decrypted = decrypt_value(target.value)
+        set_committed_value(target, "value", decrypted)
+
+
+
+
+@event.listens_for(SystemConfig, "before_insert")
+@event.listens_for(SystemConfig, "before_update")
+def encrypt_config_on_save(mapper, connection, target):
+    if target.is_secret and target.value and not target.value.startswith("enc:"):
+        from backend.app.services.crypto import encrypt_value
+        target.value = encrypt_value(target.value)
+
+@event.listens_for(SystemConfig, "after_insert")
+@event.listens_for(SystemConfig, "after_update")
+def decrypt_config_after_save(mapper, connection, target):
+    if target.is_secret and target.value and target.value.startswith("enc:"):
+        from backend.app.services.crypto import decrypt_value
+        decrypted = decrypt_value(target.value)
+        set_committed_value(target, "value", decrypted)
+
+
 class MailTemplate(Base):
     __tablename__ = "mail_templates"
     __table_args__ = (UniqueConstraint("template_code", "version", name="uq_template_code_version"),)
@@ -559,6 +589,7 @@ class CrmSalesOrder(Base):
     opportunity_name: Mapped[str | None] = mapped_column(String(255))
     sales_user_id: Mapped[str | None] = mapped_column(String(128))
     sales_user_name: Mapped[str | None] = mapped_column(String(128))
+    sales_user_email: Mapped[str | None] = mapped_column(String(255))
     owner_department: Mapped[str | None] = mapped_column(String(128))
     life_status: Mapped[str | None] = mapped_column(String(64))
     approval_status: Mapped[str | None] = mapped_column(String(64))

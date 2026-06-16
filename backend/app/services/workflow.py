@@ -53,6 +53,7 @@ from backend.app.services.products import (
     extract_order_products_for_review,
     review_order_products,
 )
+from backend.app.services.time_utils import format_beijing_time, to_beijing_time
 
 
 TASK_NO_PATTERN = re.compile(r"PT-\d{8}-\d{4}", re.IGNORECASE)
@@ -76,7 +77,6 @@ SALES_ACK_CLASSIFICATIONS = {
 }
 OUTBOUND_PRIORITY_TASK = 30
 OUTBOUND_PRIORITY_LOGISTICS = 25
-REPORT_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -3560,29 +3560,14 @@ def handle_classified_mail(session: Session, mail: MailMessage) -> object | None
 
     task = find_task_for_mail(session, mail)
     if task is None:
-        if mail.classification == "OrderCancelRequest":
-            text = f"{mail.subject}\n{mail.body_text}"
-            requested_task_nos = query_requested_task_nos(text)
-            reason = (
-                f"当前系统未找到任务号 {'、'.join(sorted(requested_task_nos))}。"
-                if requested_task_nos
-                else "未识别到任务号，请按“撤回需求 + 任务号”格式发送。"
-            )
-            record_exception_case(
+        if mail.classification in {"OrderCancelRequest", "OrderChangeRequest"}:
+            add_audit(
                 session,
-                exception_type="OrderCancelTaskLinkFailed",
-                severity="Medium",
-                detail={
-                    "source_mail_id": mail.id,
-                    "classification": mail.classification,
-                    "subject": mail.subject,
-                    "requested_task_nos": sorted(requested_task_nos),
-                    "message": reason,
-                },
-                source_mail_id=mail.id,
+                "LegacyMailOrderMutationIgnored",
+                "MailMessage",
+                mail.id,
+                {"classification": mail.classification, "reason": "一期订单流由 CRM 详情驱动，不再处理销售邮件变更/撤销建单链路。"},
             )
-            enqueue_sales_withdraw_unlinked_rejected_notice(session, mail, requested_task_nos=requested_task_nos, reason=reason)
-            add_audit(session, "OrderCancelTaskLinkFailed", "MailMessage", mail.id, {"requested_task_nos": sorted(requested_task_nos)})
             return None
         record_exception_case(
             session,
@@ -3637,23 +3622,19 @@ def record_non_target_exception(
     llm_result: LLMMailClassification | None = None,
 ) -> None:
     task = find_task_for_mail(session, mail)
-    detail = {
-        "source_mail_id": mail.id,
-        "subject": mail.subject,
-        "from_address": mail.from_address,
-        "rule_classification": "NonTarget",
-        "llm_classification": llm_result.classification if llm_result else "Unavailable",
-        "llm_reason": llm_result.reason if llm_result else "",
-        "conversation_task_id": task.id if task else None,
-        "task_no": task.task_no if task else None,
-    }
-    record_exception_case(
+    add_audit(
         session,
-        related_task_id=task.id if task else None,
-        exception_type="NonTarget",
-        severity="Low",
-        detail=detail,
-        source_mail_id=mail.id,
+        "NonTargetMailIgnored",
+        "MailMessage",
+        mail.id,
+        {
+            "subject": mail.subject,
+            "from_address": mail.from_address,
+            "llm_classification": llm_result.classification if llm_result else "Unavailable",
+            "llm_reason": llm_result.reason if llm_result else "",
+            "conversation_task_id": task.id if task else None,
+            "task_no": task.task_no if task else None,
+        },
     )
 
 
@@ -3701,29 +3682,14 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
 
     task = find_task_for_mail(session, mail)
     if task is None:
-        if mail.classification == "OrderCancelRequest":
-            text = f"{mail.subject}\n{mail.body_text}"
-            requested_task_nos = query_requested_task_nos(text)
-            reason = (
-                f"当前系统未找到任务号 {'、'.join(sorted(requested_task_nos))}。"
-                if requested_task_nos
-                else "未识别到任务号，请按“撤回需求 + 任务号”格式发送。"
-            )
-            record_exception_case(
+        if mail.classification in {"OrderCancelRequest", "OrderChangeRequest"}:
+            add_audit(
                 session,
-                exception_type="OrderCancelTaskLinkFailed",
-                severity="Medium",
-                detail={
-                    "source_mail_id": mail.id,
-                    "classification": mail.classification,
-                    "subject": mail.subject,
-                    "requested_task_nos": sorted(requested_task_nos),
-                    "message": reason,
-                },
-                source_mail_id=mail.id,
+                "LegacyMailOrderMutationIgnored",
+                "MailMessage",
+                mail.id,
+                {"classification": mail.classification, "reason": "一期订单流由 CRM 详情驱动，不再处理销售邮件变更/撤销建单链路。"},
             )
-            enqueue_sales_withdraw_unlinked_rejected_notice(session, mail, requested_task_nos=requested_task_nos, reason=reason)
-            add_audit(session, "OrderCancelTaskLinkFailed", "MailMessage", mail.id, {"requested_task_nos": sorted(requested_task_nos)})
             return None
         record_exception_case(
             session,
@@ -4187,13 +4153,11 @@ def dashboard(session: Session) -> dict:
 
 
 def report_local_time(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(REPORT_TIMEZONE)
+    return to_beijing_time(value)
 
 
 def format_report_time(value: datetime) -> str:
-    return report_local_time(value).strftime("%Y-%m-%d %H:%M")
+    return format_beijing_time(value)
 
 
 def format_report_period(start_at: datetime, end_at: datetime) -> str:

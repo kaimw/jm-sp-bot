@@ -1,13 +1,38 @@
 import { chromium } from "playwright";
 import { execFile } from "node:child_process";
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const CRM_PORT = Number(process.env.FXIAOKE_MOCK_PORT || "19431");
-const CDP_PORT = Number(process.env.FXIAOKE_TEST_CDP_PORT || "19334");
 const HOST = "127.0.0.1";
+let CRM_PORT = Number(process.env.FXIAOKE_MOCK_PORT || "0");
+let CDP_PORT = Number(process.env.FXIAOKE_TEST_CDP_PORT || "0");
+
+function listen(server, port, host) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve(server.address());
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  });
+}
+
+async function freePort(preferred = 0) {
+  const server = net.createServer();
+  const address = await listen(server, preferred, HOST);
+  const port = typeof address === "object" && address ? address.port : preferred;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -158,7 +183,8 @@ async function startMockCrm() {
     res.writeHead(404);
     res.end("not found");
   });
-  await new Promise((resolve) => server.listen(CRM_PORT, HOST, resolve));
+  const address = await listen(server, CRM_PORT, HOST);
+  if (typeof address === "object" && address?.port) CRM_PORT = address.port;
   return server;
 }
 
@@ -195,6 +221,8 @@ function assert(condition, message) {
 }
 
 async function main() {
+  if (!CRM_PORT) CRM_PORT = await freePort();
+  if (!CDP_PORT) CDP_PORT = await freePort();
   const mockServer = await startMockCrm();
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "fxiaoke-integration-"));
   const userDataDir = path.join(tempDir, "chrome-profile");

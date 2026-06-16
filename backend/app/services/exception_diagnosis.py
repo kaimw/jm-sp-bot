@@ -94,12 +94,29 @@ def exception_diagnosis_context(case: ExceptionCase, detail: dict[str, Any]) -> 
     }
 
 
+def _get_agent_system_prompt(session: Session) -> str:
+    """获取 AI 诊断 System Prompt。优先从配置表读取，未配置时使用默认模板。"""
+    from backend.app.models import SystemConfig
+    row = session.get(SystemConfig, "v2_agent_exception_diagnosis_system_prompt")
+    if row and row.value:
+        return str(row.value)
+    # 默认模板
+    return (
+        "你是商务订单中台异常诊断 Agent。只返回 JSON，不要 Markdown。"
+        "不要暴露 SQL、堆栈、NullPointerException 等技术黑话。"
+        "所有结论必须来自输入 ContextPack。"
+        "如果你发现异常是由于收货地址不规范、城市名拼写错误、地址过短、脱敏、邮编格式错误或电话号码缺失/异常等收货信息问题引起的，"
+        "你必须分析并生成地址、联系人及电话的修正建议，并写入返回 JSON 的 address_correction 字段中。"
+    )
+
+
 def diagnose_exception_with_llm(session: Session, case: ExceptionCase, detail: dict[str, Any]) -> dict[str, Any] | None:
     config = active_model_config(session)
     if not model_ready(session, config):
         return None
     assert config is not None
     context = exception_diagnosis_context(case, detail)
+    system_prompt = _get_agent_system_prompt(session)
     output = call_model(
         session,
         config,
@@ -110,13 +127,7 @@ def diagnose_exception_with_llm(session: Session, case: ExceptionCase, detail: d
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "你是商务订单中台异常诊断 Agent。只返回 JSON，不要 Markdown。"
-                    "不要暴露 SQL、堆栈、NullPointerException 等技术黑话。"
-                    "所有结论必须来自输入 ContextPack。"
-                    "如果你发现异常是由于收货地址不规范、城市名拼写错误、地址过短、脱敏、邮编格式错误或电话号码缺失/异常等收货信息问题引起的，"
-                    "你必须分析并生成地址、联系人及电话的修正建议，并写入返回 JSON 的 address_correction 字段中。"
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
