@@ -38,6 +38,7 @@ backend/app/static/app.js
 - Do not expose saved secrets; use masked placeholders.
 - Destructive or irreversible actions need explicit confirmation and clear feedback.
 - Exception takeover, fulfillment retry, OMS push, mailbox sending, and skill activation are high-risk flows.
+- All visible times in admin UI must be Beijing time (`Asia/Shanghai`), including flow cards, queue/audit pages, dashboards, modals, timelines, and table rows. Never display raw backend timestamp fields directly; always route through the shared time formatter.
 
 ## Preferred Patterns
 - Tables for repeated records.

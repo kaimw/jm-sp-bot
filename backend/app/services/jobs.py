@@ -158,6 +158,9 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
                 process_inbound_mail(session, mail)
             elif job.job_type == "sync_erp_materials":
                 sync_erp_materials(session)
+            elif job.job_type == "sync_oms_materials":
+                from backend.app.services.oms.material_sync import sync_oms_materials
+                sync_oms_materials(session)
             elif job.job_type == "sync_crm_sales_orders":
                 payload = loads(job.payload_json, {})
                 run_crm_sales_order_sync(session, trigger=str(payload.get("source") or "job"))

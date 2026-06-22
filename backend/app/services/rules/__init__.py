@@ -12,7 +12,9 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
+from backend.app.models import SystemConfig
 from backend.app.models import CrmSalesOrder, MiddlePlatformOrder, MiddlePlatformOrderItem
+from backend.app.services.jsonutil import loads
 
 
 class BlockerLevel(str, Enum):
@@ -85,6 +87,103 @@ DEFAULT_RULES: list[OrderValidationRule] = [
     AttachmentProductConsistencyRule(),
     LocalInventoryAvailableRule(),
 ]
+
+V2_REVIEW_RULE_STATES_KEY = "v2_review_rule_states_json"
+
+RULE_METADATA: dict[str, dict[str, str]] = {
+    "REQUIRED_HEAD_FIELDS": {
+        "name": "订单头基础字段",
+        "description": "检查中台订单头基础字段是否存在，例如订单号、来源系统、CRM 订单 ID 和客户名称。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "PHASE1_COMPLETE_PRE_REVIEW_FIELDS": {
+        "name": "一期完整性预审",
+        "description": "检查销售、归属部门、订单日期、结算方式、收货三要素、币种、附件和商品明细等一期必备信息。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "CUSTOMER_MAPPING": {
+        "name": "客户主数据映射",
+        "description": "检查 CRM 客户是否能映射或查询到 OMS 客户主数据。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "POSITIVE_ORDER_AMOUNT": {
+        "name": "订单金额有效性",
+        "description": "检查订单金额存在且大于 0。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "AMOUNT_CONSISTENCY": {
+        "name": "金额一致性",
+        "description": "检查订单金额、商品金额、已收和应收金额之间是否一致。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "HAS_ORDER_ITEMS": {
+        "name": "订单商品明细",
+        "description": "检查订单明细存在，且数量合法。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "KNOWN_ACTIVE_SKU": {
+        "name": "SKU 主数据启用",
+        "description": "检查订单 SKU 是否存在且在商品主数据中启用；缺 SKU 时要求人工映射。",
+        "default_blocker_level": "HIGH",
+    },
+    "RULE_SKU_BOM_MATCH": {
+        "name": "SKU/BOM 匹配",
+        "description": "检查 CRM 商品名称或型号是否能匹配标准 SKU/BOM 主数据。",
+        "default_blocker_level": "HIGH",
+    },
+    "RULE_CONTRACT_AMOUNT_CONSISTENCY": {
+        "name": "合同金额一致性",
+        "description": "检查附件或合同中识别出的金额与 CRM 订单金额是否一致。",
+        "default_blocker_level": "HIGH",
+    },
+    "ATTACHMENT_PRODUCT_CONSISTENCY": {
+        "name": "附件商品一致性",
+        "description": "检查 CRM 订单产品与附件解析出的产品、数量、金额是否一致。",
+        "default_blocker_level": "CRITICAL",
+    },
+    "LOCAL_INVENTORY_AVAILABLE": {
+        "name": "本地库存可用量",
+        "description": "检查本地库存快照是否满足订单发货数量。",
+        "default_blocker_level": "HIGH",
+    },
+}
+
+
+def review_rule_states(session: Session) -> dict[str, dict[str, Any]]:
+    row = session.get(SystemConfig, V2_REVIEW_RULE_STATES_KEY)
+    parsed = loads(row.value if row is not None else "{}", {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def is_review_rule_enabled(session: Session, rule_code: str) -> bool:
+    states = review_rule_states(session)
+    state = states.get(rule_code)
+    if isinstance(state, dict) and "enabled" in state:
+        return bool(state.get("enabled"))
+    return True
+
+
+def review_rule_config(session: Session) -> dict[str, Any]:
+    states = review_rule_states(session)
+    rules: list[dict[str, Any]] = []
+    for index, rule in enumerate(DEFAULT_RULES, start=1):
+        code = rule.get_rule_code()
+        meta = RULE_METADATA.get(code, {})
+        state = states.get(code) if isinstance(states.get(code), dict) else {}
+        enabled = bool(state.get("enabled", True))
+        rules.append(
+            {
+                "id": f"v2:{code}",
+                "code": code,
+                "name": meta.get("name") or code,
+                "description": meta.get("description") or "",
+                "default_blocker_level": meta.get("default_blocker_level") or "",
+                "enabled": enabled,
+                "order": index,
+                "is_v2_review_rule": True,
+            }
+        )
+    return {"rules": rules}
 
 
 def register_rule(rule: OrderValidationRule, *, before: str | None = None, after: str | None = None):

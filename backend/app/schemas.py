@@ -117,6 +117,7 @@ class MailRuntimeConfigUpdate(BaseModel):
     non_target_retention_days: int | None = None
     bot_enabled: bool | None = None
     llm_fallback_enabled: bool | None = None
+    crm_attachment_llm_allow_external_sensitive: bool | None = None
     conversation_max_rounds: int | None = None
     outbound_failed_alert_threshold: int | None = None
     outbound_pending_age_alert_seconds: int | None = None
@@ -170,6 +171,8 @@ class OmsRuntimeConfigUpdate(BaseModel):
     oms_auto_confirm_delivery_notice: bool | None = None
     oms_inventory_review_enabled: bool | None = None
     oms_inventory_missing_blocks: bool | None = None
+    oms_material_sync_enabled: bool | None = None
+    oms_material_sync_interval_seconds: int | None = None
     v2_validation_failure_notification_enabled: bool | None = None
     v2_oms_blocked_notification_enabled: bool | None = None
     v2_validation_failure_to_json: str | None = None
@@ -223,6 +226,15 @@ class InitialReviewConfigUpdate(BaseModel):
     enabled: bool = True
     required_fields: list[str] = []
     rules: list[InitialReviewRuleUpdate] = []
+
+
+class V2ReviewRuleStateUpdate(BaseModel):
+    code: str
+    enabled: bool = True
+
+
+class V2ReviewRulesUpdate(BaseModel):
+    rules: list[V2ReviewRuleStateUpdate] = []
 
 
 class ModelProviderUpdate(BaseModel):

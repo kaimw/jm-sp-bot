@@ -110,6 +110,10 @@ class JackyunClient:
     def search_skus(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.call_api("erp-goods.goods.sku.search", payload)
 
+    def search_goods(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """调用 erp.storage.goodslist 分页查询货品信息（含英文名称、别名等完整字段）"""
+        return self.call_api("erp.storage.goodslist", payload)
+
     def query_sku_stock(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.call_api("erp-stock.stock.skulist", payload)
 

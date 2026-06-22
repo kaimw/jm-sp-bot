@@ -1,5 +1,6 @@
 from backend.app.models import ProductSKU
 from backend.app.services.rules import BlockerLevel, OrderContext, ValidationResult
+from backend.app.services.jsonutil import loads
 
 
 class KnownSkuRule:
@@ -12,6 +13,25 @@ class KnownSkuRule:
     def validate(self, context: OrderContext) -> ValidationResult:
         sku_codes = sorted({str(item.sku_code or "").strip() for item in context.items if str(item.sku_code or "").strip()})
         if not sku_codes:
+            evidence = []
+            for item in context.items:
+                raw = loads(item.raw_json, {})
+                mapping = raw.get("sku_mapping") if isinstance(raw, dict) else None
+                if isinstance(mapping, dict) and mapping.get("source") == "product_name_semantic":
+                    reason = str(mapping.get("reason") or "unknown")
+                    product_name = str(mapping.get("product_name") or item.product_name or "").strip()
+                    candidates = mapping.get("candidates") if isinstance(mapping.get("candidates"), list) else []
+                    top = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+                    if reason == "low_confidence":
+                        evidence.append(
+                            f"{product_name}：语义检索置信度过低，候选 {top.get('sku_id') or '-'}({top.get('confidence') or 0})"
+                        )
+                    elif reason == "ambiguous":
+                        evidence.append(f"{product_name}：语义检索存在多个同置信候选，需人工确认")
+                    else:
+                        evidence.append(f"{product_name}：语义检索未命中标准物料")
+            if evidence:
+                return ValidationResult(self.get_rule_code(), False, BlockerLevel.HIGH, "订单产品未能自动匹配标准 SKU，需人工确认：" + "；".join(evidence[:5]), evidence)
             return ValidationResult(self.get_rule_code(), False, BlockerLevel.HIGH, "订单明细未提供 SKU 编码，需人工映射。")
         known = {
             row[0]

@@ -386,7 +386,7 @@ def list_inventory_snapshots(
     page: int = 1,
     page_size: int = 20,
 ) -> dict[str, Any]:
-    query = session.query(ProductInventorySnapshot).join(
+    query = session.query(ProductInventorySnapshot).outerjoin(
         ProductSPU,
         ProductSPU.spu_id == ProductInventorySnapshot.material_code,
     )
@@ -639,7 +639,7 @@ def inventory_summary(
     measure_type: str = "",
     inventory_scope: str = "",
 ) -> dict[str, Any]:
-    base_query = session.query(ProductInventorySnapshot).join(
+    base_query = session.query(ProductInventorySnapshot).outerjoin(
         ProductSPU,
         ProductSPU.spu_id == ProductInventorySnapshot.material_code,
     )
@@ -857,23 +857,71 @@ def normalize_material_name(name: str) -> str:
 
 
 def serialize_inventory_snapshot(row: ProductInventorySnapshot, *, threshold: float = 1) -> dict[str, Any]:
+    import json
+    import datetime
     if row.base_qty <= 0:
         alert_level = "zero"
     elif row.base_qty <= threshold:
         alert_level = "low"
     else:
         alert_level = "ok"
+
+    in_transit_qty = 0.0
+    warning_status = "正常"
+    model = ""
+    english_name = ""
+    
+    if row.source_payload_json:
+        try:
+            payload = json.loads(row.source_payload_json)
+            in_transit_qty = payload.get("in_transit_qty") or 0.0
+            warning_status = payload.get("warning_status") or "正常"
+            model = payload.get("model") or ""
+            english_name = payload.get("english_name") or ""
+        except Exception:
+            pass
+
+    # Try to load English Name from SPU/SKU master data
+    from sqlalchemy.orm import object_session
+    from backend.app.models import ProductSKU, ProductSPU
+    session = object_session(row)
+    if session:
+        try:
+            sku = session.query(ProductSKU).filter(ProductSKU.sku_id == row.material_code).first()
+            if sku:
+                attrs = json.loads(sku.attributes_json) if sku.attributes_json else {}
+                db_en = attrs.get("oms_en_name") or ""
+                if db_en:
+                    english_name = db_en
+            if not english_name:
+                spu = session.query(ProductSPU).filter(ProductSPU.spu_id == row.material_code).first()
+                if spu and spu.name_en:
+                    english_name = spu.name_en
+        except Exception:
+            pass
+
+    synced_at_dt = row.synced_at
+    if synced_at_dt.tzinfo is None:
+        synced_at_dt = synced_at_dt.replace(tzinfo=datetime.timezone.utc)
+    updated_at_dt = row.updated_at
+    if updated_at_dt.tzinfo is None:
+        updated_at_dt = updated_at_dt.replace(tzinfo=datetime.timezone.utc)
+
     return {
         "id": row.id,
         "material_code": row.material_code,
         "material_name": row.material_name,
+        "english_name": english_name,
         "warehouse_code": row.warehouse_code,
         "warehouse_name": row.warehouse_name,
         "base_qty": row.base_qty,
         "qty": row.qty,
+        "in_transit_qty": in_transit_qty,
+        "warning_status": warning_status,
+        "model": model,
         "alert_level": alert_level,
-        "synced_at": row.synced_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
+        "synced_at": synced_at_dt.isoformat(),
+        "updated_at": updated_at_dt.isoformat(),
     }
 
 

@@ -308,3 +308,171 @@ def confirm_excel_import(data: Dict[str, Any], session: Session) -> Dict[str, in
         counts["pricing"] += 1
         
     return counts
+
+
+def import_inventory_excel(file_path: str, session: Session) -> dict[str, Any]:
+    import openpyxl
+    from backend.app.models import ProductInventorySnapshot, now_utc
+    
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    # Find the correct sheet
+    sheet_name = next((name for name in ["海外库存总表", "Sheet1"] if name in wb.sheetnames), wb.sheetnames[0])
+    sheet = wb[sheet_name]
+    
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("Excel 文件是空的")
+        
+    header = [str(cell or "").strip() for cell in rows[0]]
+    
+    # Map headers to indices
+    material_code_idx = -1
+    english_name_idx = -1
+    wh_idx = -1
+    name_idx = -1
+    qty_idx = -1
+    in_transit_idx = -1
+    warning_idx = -1
+    model_idx = -1
+    
+    # Match headers
+    for idx, h_name in enumerate(header):
+        h_clean = h_name.replace("\n", " ").replace("/", " ").strip()
+        h_clean_lower = h_clean.lower()
+        
+        if h_clean_lower == "sku":
+            english_name_idx = idx
+        elif "material code" in h_clean_lower or "料号" in h_clean_lower:
+            material_code_idx = idx
+        elif "仓库" in h_clean:
+            wh_idx = idx
+        elif "chinese description" in h_clean_lower or "中文品名" in h_clean or "品名" in h_clean:
+            name_idx = idx
+        elif "库存数量" in h_clean or "库存" in h_clean:
+            if qty_idx == -1:
+                qty_idx = idx
+        elif "在途数量" in h_clean or "在途" in h_clean:
+            in_transit_idx = idx
+        elif "预警" in h_clean or "warning" in h_clean_lower:
+            warning_idx = idx
+        elif "型号" in h_clean or "model" in h_clean_lower:
+            model_idx = idx
+
+    # If any essential column is missing, try fallback positions
+    if material_code_idx == -1:
+        material_code_idx = 3 if len(header) > 3 else 0
+    if english_name_idx == -1:
+        english_name_idx = 1 if len(header) > 1 else 0
+    if wh_idx == -1:
+        wh_idx = 2
+    if name_idx == -1:
+        name_idx = 4
+    if qty_idx == -1:
+        qty_idx = 8
+        
+    # Read the data rows
+    data_rows = rows[1:]
+    synced_at = now_utc()
+    
+    # Delete existing inventory snapshots before importing new ones
+    session.query(ProductInventorySnapshot).delete()
+    
+    # Aggregate by (material_code, warehouse_code) to prevent UniqueConstraint violations
+    aggregated = {}
+    for row in data_rows:
+        if len(row) <= max(material_code_idx, wh_idx):
+            continue
+            
+        material_code_val = row[material_code_idx]
+        wh_val = row[wh_idx]
+        if material_code_val is None or wh_val is None:
+            continue
+            
+        material_code_str = str(material_code_val).strip()
+        wh_str = str(wh_val).strip()
+        if not material_code_str or not wh_str:
+            continue
+            
+        # Parse quantities
+        qty_val = 0.0
+        if qty_idx < len(row) and row[qty_idx] is not None:
+            try:
+                qty_val = float(row[qty_idx])
+            except ValueError:
+                pass
+                
+        in_transit_val = 0.0
+        if in_transit_idx != -1 and in_transit_idx < len(row) and row[in_transit_idx] is not None:
+            try:
+                in_transit_val = float(row[in_transit_idx])
+            except ValueError:
+                pass
+                
+        warning_str = "正常"
+        if warning_idx != -1 and warning_idx < len(row) and row[warning_idx] is not None:
+            warning_str = str(row[warning_idx]).strip()
+            
+        name_str = material_code_str
+        if name_idx < len(row) and row[name_idx] is not None:
+            name_str = str(row[name_idx]).strip()
+            
+        english_name_str = ""
+        if english_name_idx != -1 and english_name_idx < len(row) and row[english_name_idx] is not None:
+            english_name_str = str(row[english_name_idx]).strip()
+            
+        model_str = ""
+        if model_idx != -1 and model_idx < len(row) and row[model_idx] is not None:
+            model_str = str(row[model_idx]).strip()
+            
+        key = (material_code_str, wh_str)
+        if key not in aggregated:
+            aggregated[key] = {
+                "material_name": name_str,
+                "english_name": english_name_str,
+                "qty": qty_val,
+                "in_transit_qty": in_transit_val,
+                "warning_status": warning_str,
+                "model": model_str
+            }
+        else:
+            # Aggregate quantities
+            aggregated[key]["qty"] += qty_val
+            aggregated[key]["in_transit_qty"] += in_transit_val
+            if warning_str != "正常":
+                aggregated[key]["warning_status"] = warning_str
+            if model_str:
+                aggregated[key]["model"] = model_str
+            if english_name_str:
+                aggregated[key]["english_name"] = english_name_str
+                
+    imported_count = 0
+    import json
+    for (material_code_str, wh_str), data in aggregated.items():
+        payload = {
+            "in_transit_qty": data["in_transit_qty"],
+            "warning_status": data["warning_status"],
+            "model": data["model"],
+            "english_name": data["english_name"]
+        }
+        
+        snapshot = ProductInventorySnapshot(
+            material_code=material_code_str,
+            material_name=data["material_name"],
+            warehouse_code=wh_str,
+            warehouse_name=wh_str,
+            qty=data["qty"],
+            base_qty=data["qty"],
+            source_payload_json=json.dumps(payload),
+            status="Active",
+            synced_at=synced_at,
+            created_at=synced_at,
+            updated_at=synced_at
+        )
+        session.add(snapshot)
+        imported_count += 1
+        
+    session.flush()
+    return {
+        "ok": True,
+        "imported_count": imported_count
+    }

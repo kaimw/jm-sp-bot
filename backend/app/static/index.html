@@ -156,36 +156,25 @@
       </section>
 
       <section class="page product-page" data-page="products" data-title="物料中心" data-subtitle="维护 SKU、库存、价格和别名映射，为订单预审和 OMS 下推提供主数据。">
-        <div class="product-workbench-head">
-          <div class="product-workbench-copy">
-            <small>主数据工作台</small>
-            <h2>物料中心</h2>
-            <p>围绕订单预审和履约下推维护 SPU、SKU、库存、价格与促销规则。</p>
-          </div>
-          <div id="product-center-summary" class="metrics compact-metrics product-center-summary">
-            <div class="metric"><small>成品 SPU</small><strong>-</strong><span>商品主档</span></div>
-            <div class="metric"><small>存货 SKU</small><strong>-</strong><span>履约粒度</span></div>
-            <div class="metric warn"><small>库存预警</small><strong>-</strong><span>低库存记录</span></div>
-            <div class="metric danger"><small>零库存</small><strong>-</strong><span>阻断风险</span></div>
-          </div>
-        </div>
-        <div class="product-tabs-shell">
+
+        <div class="product-page-toolbar">
           <div class="tabs" id="products-tabs">
-            <button type="button" class="active" data-tab="spu">成品 SPU</button>
-            <button type="button" data-tab="sku">存货 SKU</button>
+            <button type="button" class="active" data-tab="sku">物料维护</button>
             <button type="button" data-tab="inventory">库存管理</button>
             <button type="button" data-tab="pricing">渠道价格</button>
             <button type="button" data-tab="promotions">促销规则</button>
-            <button type="button" data-tab="review">预审测试</button>
+            <button type="button" data-tab="review">预审体检</button>
           </div>
-          <div class="product-tabs-hint">
+          <div class="product-page-toolbar-hint">
             <strong>维护优先级</strong>
             <span>先补别名和价格，再处理库存预警。</span>
           </div>
+          <div id="product-tab-metrics" class="product-tab-metrics"></div>
         </div>
 
-        <div class="tab-content is-active" id="products-spu-tab">
-          <div class="table-filter-bar">
+        <!-- SPU tab (仅 JS 内部导航触发) -->
+        <div class="tab-content" id="products-spu-tab" hidden>
+          <div class="filter-bar">
             <form id="products-spu-filter-form" class="inline-form">
               <input type="text" name="q" list="products-spu-suggestions" autocomplete="off" placeholder="搜索成品名称 / 代码 / 预审别名..." />
               <button type="submit" class="button ghost">搜索</button>
@@ -209,29 +198,85 @@
           <div id="products-spu-pagination" class="pagination" data-table-pagination="productsSpu"></div>
         </div>
 
-        <div class="tab-content" id="products-sku-tab" hidden>
-          <div class="table-filter-bar">
+        <!-- SKU 物料维护 tab (默认激活) -->
+        <div class="tab-content is-active" id="products-sku-tab">
+          <div class="filter-bar">
             <form id="products-sku-filter-form" class="inline-form">
-              <input type="text" name="q" list="products-sku-suggestions" autocomplete="off" placeholder="搜索 SKU / 成品 / 预审别名..." />
-              <button type="submit" class="button ghost">过滤</button>
+              <input type="text" name="q" list="products-sku-suggestions" autocomplete="off" placeholder="搜索物料编码 / 名称 / 别名..." />
+              <label class="checkbox-inline">
+                <input type="checkbox" name="crm_semantic" value="true" />
+                <span>CRM 语义匹配</span>
+              </label>
+              <button type="submit" class="button ghost">搜索</button>
             </form>
-            <button class="button" data-action="new-sku">新增 SKU</button>
+            <div>
+              <button id="sync-oms-materials" class="button ghost" type="button">同步 OMS 物料</button>
+            </div>
           </div>
           <datalist id="products-sku-suggestions"></datalist>
           <div class="data-table product-table product-sku-table">
             <div class="head row product-row">
-              <div>SKU代码</div>
-              <div>所属 SPU</div>
-              <div>状态</div>
-              <div>创建时间</div>
+              <div>名称</div>
+              <div>英文名称</div>
+              <div>别名</div>
+              <div>规格 / 品牌</div>
+              <div>操作</div>
             </div>
             <div id="products-sku-list" class="list"></div>
           </div>
           <div id="products-sku-pagination" class="pagination" data-table-pagination="productsSku"></div>
         </div>
 
+        <!-- 库存管理 tab -->
+        <div class="tab-content" id="products-inventory-tab" hidden>
+
+          <div class="filter-bar inventory-filter-bar" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: nowrap; overflow: visible;">
+            <form id="products-inventory-filter-form" class="inline-form" data-table-filter="productsInventory" style="display: flex; gap: 8px; align-items: center; flex-wrap: nowrap;">
+              <input type="text" name="q" placeholder="搜索物料编码、中文品名..." style="width: 200px; height: 36px; min-height: 36px; padding: 6px 10px;" />
+              <select name="warehouse_code" id="inventory-warehouse-select" style="width: 160px; height: 36px; min-height: 36px; padding: 6px 10px;">
+                <option value="">全部仓库</option>
+              </select>
+              <button type="submit" class="button" style="height: 36px; padding: 0 16px; display: flex; align-items: center; justify-content: center;">查询</button>
+              <button type="button" class="button ghost" data-filter-reset style="height: 36px; padding: 0 16px; display: flex; align-items: center; justify-content: center;">重置</button>
+            </form>
+            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: nowrap;">
+              <input type="file" id="inventory-excel-file" accept=".xlsx,.xls" style="display: none;" />
+              <button id="btn-trigger-import-excel" class="button" type="button" style="background-color: var(--accent); border-color: var(--accent); height: 36px; padding: 0 16px; white-space: nowrap; display: flex; align-items: center; justify-content: center;">导入海外库存 Excel</button>
+              <button id="sync-erp-inventory" class="button" type="button" disabled style="background-color: var(--line); border-color: var(--line); color: var(--muted); cursor: not-allowed; opacity: 0.7; height: 36px; padding: 0 16px; white-space: nowrap; display: flex; align-items: center; justify-content: center;" title="同步 ERP 库存暂时不可用">同步 ERP 库存 (暂时不可用)</button>
+            </div>
+          </div>
+          
+          <div class="inventory-sections" style="display: block;">
+            <section class="inventory-section" style="width: 100%; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+              <div id="products-inventory-summary" class="inventory-section-metrics" style="display: flex; gap: 16px; margin-bottom: 16px;">
+                <!-- JS dynamic summary -->
+              </div>
+              <div class="data-table product-table product-inventory-table">
+                <div class="head row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; font-weight: 600; border-bottom: 2px solid var(--line); padding-bottom: 8px; font-size: 13px;">
+                  <div>物料编码</div>
+                  <div>中文品名</div>
+                  <div>英文品名</div>
+                  <div>型号</div>
+                  <div>仓库</div>
+                  <div>库存数量</div>
+                  <div>在途数量</div>
+                  <div>库存预警</div>
+                  <div>更新时间</div>
+                </div>
+                <div id="products-inventory-list" class="list" style="font-size: 13px; line-height: 1.4;">
+                  <!-- JS dynamic rows -->
+                </div>
+              </div>
+              <div id="products-inventory-pagination" class="pagination" data-table-pagination="productsInventory">
+                <!-- JS dynamic pagination -->
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- 渠道价格 tab -->
         <div class="tab-content" id="products-pricing-tab" hidden>
-          <div class="table-filter-bar">
+          <div class="filter-bar">
             <form id="products-pricing-filter-form" class="inline-form">
               <input type="text" name="q" list="products-sku-suggestions" autocomplete="off" placeholder="搜索 SKU / 成品 / 预审别名..." />
               <button type="submit" class="button ghost">过滤</button>
@@ -250,74 +295,31 @@
           <div id="products-pricing-pagination" class="pagination" data-table-pagination="productsPricing"></div>
         </div>
 
-        <div class="tab-content" id="products-inventory-tab" hidden>
-          <div class="table-filter-bar product-inventory-toolbar">
-            <form id="products-inventory-filter-form" class="inline-form" data-table-filter="productsInventory">
-              <input type="text" name="q" placeholder="搜索物料中类 / 大类 / 仓库..." />
-              <input type="text" name="warehouse_code" list="inventory-warehouse-suggestions" autocomplete="off" placeholder="仓库编码 / 名称" />
-              <select name="low_stock_only">
-                <option value="">全部库存</option>
-                <option value="true">只看预警</option>
-              </select>
-              <select name="measure_type">
-                <option value="countable">可计数物料</option>
-                <option value="length">按长度计物料</option>
-                <option value="weight">按重量计物料</option>
-              </select>
-              <input type="number" name="threshold" min="0" step="1" value="1" placeholder="预警阈值" />
-              <button type="submit" class="button ghost">查询</button>
-              <button type="button" class="button ghost" data-filter-reset>重置</button>
+        <!-- 促销规则 tab -->
+        <div class="tab-content" id="products-promotions-tab" hidden>
+          <div class="filter-bar">
+            <form id="products-promotions-filter-form" class="inline-form">
+              <input type="text" name="q" list="products-sku-suggestions" autocomplete="off" placeholder="搜索促销 / SKU / 成品 / 绑定状态..." />
+              <button type="submit" class="button ghost">搜索</button>
             </form>
-            <button id="inventory-classification-diagnostics" class="button ghost" type="button">分类诊断</button>
-            <button id="sync-erp-inventory" class="button" type="button">同步 ERP 库存</button>
+            <button class="button" data-action="new-promotion">新增促销</button>
           </div>
-          <pre id="erp-inventory-sync-result" class="test-result"></pre>
-          <datalist id="inventory-warehouse-suggestions"></datalist>
-          <div class="inventory-split-lists">
-            <section class="inventory-list-section">
-              <div class="inventory-list-head">
-                <div>
-                  <h3>成品库存</h3>
-                  <p>ERP 物料大类为成品的整机、套装和成品 SKU。</p>
-                </div>
-              </div>
-              <div id="products-finished-inventory-summary" class="metrics compact-metrics inventory-list-metrics"></div>
-              <div class="data-table product-table product-inventory-table">
-                <div class="head row product-row">
-                  <div>成品类型</div>
-                  <div>包含范围</div>
-                  <div>库存合计</div>
-                  <div>预警 / 同步</div>
-                </div>
-                <div id="products-finished-inventory-list" class="list"></div>
-              </div>
-              <div id="products-finished-inventory-pagination" class="pagination" data-table-pagination="productsFinishedInventory"></div>
-            </section>
-            <section class="inventory-list-section">
-              <div class="inventory-list-head">
-                <div>
-                  <h3>材料库存</h3>
-                  <p>自制半成品、委外半成品和其他零件材料。</p>
-                </div>
-              </div>
-              <div id="products-inventory-summary" class="metrics compact-metrics inventory-list-metrics"></div>
-              <div class="data-table product-table product-inventory-table">
-                <div class="head row product-row">
-                  <div>物料中类</div>
-                  <div>包含范围</div>
-                  <div>库存合计</div>
-                  <div>预警 / 同步</div>
-                </div>
-                <div id="products-inventory-list" class="list"></div>
-              </div>
-              <div id="products-inventory-pagination" class="pagination" data-table-pagination="productsInventory"></div>
-            </section>
+          <div class="data-table product-table product-promotions-table">
+            <div class="head row product-row">
+              <div>规则名称 / 成品</div>
+              <div>优惠内容</div>
+              <div>有效期</div>
+              <div>状态</div>
+            </div>
+            <div id="products-promotions-list" class="list"></div>
           </div>
+          <div id="products-promotions-pagination" class="pagination" data-table-pagination="productsPromotions"></div>
         </div>
 
+        <!-- 预审体检 tab -->
         <div class="tab-content" id="products-review-tab" hidden>
           <div class="product-review-readiness">
-            <div class="inventory-list-head">
+            <div class="inventory-section-head">
               <div>
                 <h3>预审准备度体检</h3>
                 <p>检查成品 SKU 的渠道价格、人工别名和重复别名，提前发现会影响订单预审准确性的缺口。</p>
@@ -345,26 +347,6 @@
               <div class="empty-note">粘贴订单文本后，可查看系统将如何匹配成品 SKU 和执行价格审查。</div>
             </div>
           </div>
-        </div>
-
-        <div class="tab-content" id="products-promotions-tab" hidden>
-          <div class="table-filter-bar">
-            <form id="products-promotions-filter-form" class="inline-form">
-              <input type="text" name="q" list="products-sku-suggestions" autocomplete="off" placeholder="搜索促销 / SKU / 成品 / 绑定状态..." />
-              <button type="submit" class="button ghost">搜索</button>
-            </form>
-            <button class="button" data-action="new-promotion">新增促销</button>
-          </div>
-          <div class="data-table product-table product-promotions-table">
-            <div class="head row product-row">
-              <div>规则名称 / 成品</div>
-              <div>优惠内容</div>
-              <div>有效期</div>
-              <div>状态</div>
-            </div>
-            <div id="products-promotions-list" class="list"></div>
-          </div>
-          <div id="products-promotions-pagination" class="pagination" data-table-pagination="productsPromotions"></div>
         </div>
       </section>
       <section class="page skill-page" data-page="skill-lab" data-settings-section="true" data-title="技能实验室" data-subtitle="面向运维和管理员的 Agent 扩展入口，新增技能前先小范围验证。">
@@ -470,12 +452,12 @@
       <section class="page" data-page="review-rules" data-settings-section="true" data-title="预审规则" data-subtitle="管理订单进入履约前的字段完整性、业务防呆和人工补充规则。">
         <div class="section-head">
           <h2>规则与阻断条件</h2>
-          <p>一期订单完整预审由后端规则链强制执行；这里保留可配置规则，辅助历史邮件流和流程专项校验。</p>
+          <p>当前订单预审链路中的规则会按顺序执行；停用后不会参与后续预审。</p>
         </div>
         <form id="initial-review-rules-filter-form" class="table-filter-bar" data-table-filter="reviewRules">
           <div class="filter-search">
             <span aria-hidden="true">⌕</span>
-            <input name="q" aria-label="搜索初审规则" placeholder="规则名称 / 字段 / 规则值 / 原因" />
+            <input name="q" aria-label="搜索预审规则" placeholder="规则名称 / 编码 / 说明 / 等级" />
           </div>
           <select name="status" aria-label="启用状态">
             <option value="">全部状态</option>
@@ -483,7 +465,6 @@
             <option value="disabled">停用</option>
           </select>
           <button type="submit" class="icon-button filter-action" title="查询" aria-label="查询">⌕</button>
-          <button id="initial-review-rule-open" type="button" class="icon-button filter-action" title="增加规则" aria-label="增加规则">＋</button>
           <button type="button" class="icon-button filter-action" title="重置" aria-label="重置" data-filter-reset>↺</button>
         </form>
         <div id="initial-review-rules-list" class="list rule-list"></div>
@@ -562,10 +543,10 @@
               <input name="crm_username" autocomplete="off" />
             </label>
             <label>CRM 密码
-              <input name="crm_password" type="password" placeholder="留空不修改" autocomplete="current-password" />
+              <input name="crm_password" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" />
             </label>
             <label class="wide">CRM API Key
-              <input name="crm_api_key" type="password" placeholder="账号密码方式可留空；留空不修改" autocomplete="off" />
+              <input name="crm_api_key" type="text" class="secure-input" placeholder="账号密码方式可留空；留空不修改" autocomplete="off" />
             </label>
             <label class="wide">CRM 系统负责人邮箱
               <input name="crm_system_owner_email" type="email" placeholder="负责人/创建人/修改人邮箱均取不到时的通知兜底邮箱" autocomplete="off" />
@@ -666,7 +647,7 @@
             <input name="oms_jackyun_app_key" autocomplete="off" />
           </label>
           <label>AppSecret
-            <input name="oms_jackyun_app_secret" type="password" placeholder="留空不修改" autocomplete="current-password" />
+            <input name="oms_jackyun_app_secret" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" />
           </label>
           <label>OMS 管理员邮箱
             <input name="oms_admin_email" type="email" placeholder="客户缺失、OMS主数据异常时通知" />
@@ -736,7 +717,7 @@
         </div>
         <form id="runtime-mail-form" class="form-grid">
           <label>机器人邮箱 <input name="bot_email" /></label>
-          <label>邮箱密码 <input name="bot_email_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
+          <label>邮箱密码 <input name="bot_email_password" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" /></label>
           <label>显示名称 <input name="bot_display_name" /></label>
           <label>默认签名 <input name="bot_signature" /></label>
           <label>IMAP 主机 <input name="imap_host" /></label>
@@ -752,7 +733,7 @@
           <label>最大沟通轮数 <input name="conversation_max_rounds" type="number" min="1" /></label>
           <label>外发失败告警阈值 <input name="outbound_failed_alert_threshold" type="number" min="1" /></label>
           <label>Pending 超时告警秒数 <input name="outbound_pending_age_alert_seconds" type="number" min="60" step="60" /></label>
-          <label>百度地图 AK <input name="baidu_map_ak" type="password" placeholder="留空不修改" autocomplete="off" /></label>
+          <label>百度地图 AK <input name="baidu_map_ak" type="text" class="secure-input" placeholder="留空不修改" autocomplete="off" /></label>
           <div class="status-readout">
             <span>机器人邮箱监听/发送</span>
             <strong id="runtime-bot-enabled-status">随服务启动自动开启</strong>
@@ -760,6 +741,10 @@
           <label class="switch-line">
             <input name="llm_fallback_enabled" type="checkbox" />
             <span>启用 LLM 兜底识别</span>
+          </label>
+          <label class="switch-line">
+            <input name="crm_attachment_llm_allow_external_sensitive" type="checkbox" />
+            <span>允许外部 LLM 处理 CRM 附件联系人信息</span>
           </label>
           <button type="submit" class="button">保存邮箱配置</button>
         </form>
@@ -774,7 +759,7 @@
           <label>数据中心 ID <input name="erp_acct_id" /></label>
           <label>用户名称 <input name="erp_username" /></label>
           <label>应用 ID <input name="erp_app_id" /></label>
-          <label>应用密钥 <input name="erp_app_sec" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
+          <label>应用密钥 <input name="erp_app_sec" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" /></label>
           <label>LCID <input name="erp_lcid" type="number" value="2052" /></label>
           <label>物料 FormID <input name="erp_material_form_id" placeholder="BD_MATERIAL" /></label>
           <label>物料字段 <input name="erp_material_field_keys" placeholder="FNumber,FName,FSpecification,FMaterialGroup.FName,FForbidStatus" /></label>
@@ -826,9 +811,9 @@
         <div class="tab-content" id="integration-test-mail-tab" hidden>
         <form id="e2e-mail-form" class="form-grid compact-form">
           <label>销售测试邮箱 <input name="e2e_sales_email" value="bot.sales@jimuyida.com" /></label>
-          <label>销售邮箱密码 <input name="e2e_sales_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
+          <label>销售邮箱密码 <input name="e2e_sales_password" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" /></label>
           <label>生产测试邮箱 <input name="e2e_production_email" value="bot.production@jimuyida.com" /></label>
-          <label>生产邮箱密码 <input name="e2e_production_password" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
+          <label>生产邮箱密码 <input name="e2e_production_password" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" /></label>
           <button type="submit" class="button">保存测试账号</button>
           <button id="run-e2e-mail" type="button" class="button ghost">运行端到端测试</button>
         </form>
@@ -840,7 +825,7 @@
           <label>服务类型 <input name="provider" /></label>
           <label>模型名称 <input name="model_name" /></label>
           <label>API Base <input name="api_base" /></label>
-          <label class="wide">API Key <input name="api_key" type="password" placeholder="留空不修改" autocomplete="current-password" /></label>
+          <label class="wide">API Key <input name="api_key" type="text" class="secure-input" placeholder="留空不修改" autocomplete="new-password" /></label>
           <button type="submit" class="button">保存模型配置</button>
         </form>
         <div class="section-head">
@@ -1509,6 +1494,54 @@
           <label class="wide">预审别名 <textarea name="aliases" rows="7" placeholder="每行一个别名，例如：JMK1 RTK&#10;JMK1RTK套装"></textarea></label>
           <button type="submit" class="button wide">保存别名</button>
         </form>
+      </section>
+    </div>
+
+    <div id="product-detail-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-detail-title" style="max-width: 680px;">
+        <div class="modal-head">
+          <div><small>物料中心</small><h2 id="product-detail-title">物料详情</h2></div>
+          <button id="product-detail-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <div class="modal-body" style="padding: 16px 24px 24px;">
+          <div class="product-detail-info">
+            <div class="detail-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+              <div><strong>物料编码：</strong><span id="detail-sku-id">-</span></div>
+              <div><strong>标准名称：</strong><span id="detail-spu-name">-</span></div>
+              <div><strong>规格型号：</strong><span id="detail-model">-</span></div>
+              <div><strong>品牌：</strong><span id="detail-brand">-</span></div>
+              <div><strong>品类分类：</strong><span id="detail-category">-</span></div>
+              <div style="grid-column: 1 / -1;"><strong>预审别名：</strong><span id="detail-aliases">-</span></div>
+            </div>
+          </div>
+          <hr style="margin: 16px 0; border: none; border-top: 1px solid var(--line);" />
+          <h3 style="font-size: 14px; margin-bottom: 12px; color: var(--ink);">OMS 实时仓库库存</h3>
+          <div id="detail-stock-container">
+            <!-- Loading Indicator -->
+            <div class="stock-loader" style="display: flex; align-items: center; gap: 8px; padding: 16px 0; color: var(--muted); font-size: 13px;">
+              <div class="spinner"></div>
+              <span>正在实时查询 OMS 最新库存，请稍候...</span>
+            </div>
+            <!-- Stock Table (initially hidden) -->
+            <div id="detail-stock-table-wrapper" hidden>
+              <table class="stock-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+                <thead>
+                  <tr style="border-bottom: 1px solid var(--line); color: var(--color-text-secondary);">
+                    <th style="padding: 8px 6px;">仓库编码</th>
+                    <th style="padding: 8px 6px;">仓库名称</th>
+                    <th style="padding: 8px 6px;">账面库存</th>
+                    <th style="padding: 8px 6px;">可用库存</th>
+                    <th style="padding: 8px 6px;">复核库存 (Excel)</th>
+                  </tr>
+                </thead>
+                <tbody id="detail-stock-rows">
+                  <!-- JS dynamic rows -->
+                </tbody>
+              </table>
+            </div>
+            <div id="detail-stock-error" class="error-tip" style="color: var(--danger); padding: 8px 0; font-size: 13px;" hidden></div>
+          </div>
+        </div>
       </section>
     </div>
 

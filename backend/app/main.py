@@ -79,6 +79,7 @@ from backend.app.schemas import (
     ModelProviderUpdate,
     OmsRuntimeConfigUpdate,
     OutboundBulkCancelRequest,
+    V2ReviewRulesUpdate,
     ProductionFeedbackRequest,
     ProductionQuestionRequest,
     TaskClearRequest,
@@ -137,11 +138,13 @@ from backend.app.services.initial_review import (
 )
 from backend.app.services.jsonutil import as_list, dumps, loads
 from backend.app.services.jobs import run_pending_jobs
+from backend.app.services.rules import DEFAULT_RULES, V2_REVIEW_RULE_STATES_KEY, review_rule_config
 from backend.app.services.mail_adapter import AUTO_WORKFLOW_MAIL_TYPES, backfill_mail_received_at, send_pending_smtp, sync_imap_mailbox
 from backend.app.services.mail_worker import configured_mail_worker_interval_seconds, get_mail_worker_status, run_mail_auto_worker_once
 from backend.app.services.mail_throttle import clamp_mail_interval_seconds
 from backend.app.services.model_provider import call_model, extract_chat_content, resolve_api_key
 from backend.app.services.operations import cleanup_preview, create_backup, execute_cleanup, storage_usage, weekly_report_csv
+from backend.app.services.time_utils import format_beijing_time, to_beijing_time
 from backend.app.services.order_middle_platform import (
     confirm_delivery_notice,
     enqueue_crm_order_parsed_event,
@@ -829,6 +832,17 @@ def seconds_since(value: datetime | None) -> int | None:
     return max(0, int((now - value).total_seconds()))
 
 
+def format_display_time(value: datetime | str | None) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    return f"{format_beijing_time(value)}（北京时间）"
+
+
 def config_int(session: Session, key: str, default: int) -> int:
     row = session.get(SystemConfig, key)
     try:
@@ -1337,6 +1351,25 @@ def update_initial_review_rules(payload: InitialReviewConfigUpdate, session: Ses
     set_config(session, "initial_review_rules_json", dumps(rules))
     session.commit()
     return initial_review_config(session, include_workflow_rules=True)
+
+
+@app.get("/api/v2-review/rules")
+def get_v2_review_rules(session: Session = Depends(get_session), current_user: User = Depends(require_role(["admin", "business_owner"]))) -> dict:
+    return review_rule_config(session)
+
+
+@app.put("/api/v2-review/rules")
+def update_v2_review_rules(payload: V2ReviewRulesUpdate, session: Session = Depends(get_session), current_user: User = Depends(require_role(["admin", "business_owner"]))) -> dict:
+    allowed_codes = {rule.get_rule_code() for rule in DEFAULT_RULES}
+    states = {}
+    for item in payload.rules:
+        code = str(item.code or "").strip()
+        if code not in allowed_codes:
+            raise HTTPException(status_code=400, detail=f"unsupported v2 review rule: {code}")
+        states[code] = {"enabled": bool(item.enabled)}
+    set_config(session, V2_REVIEW_RULE_STATES_KEY, dumps(states), is_secret=False)
+    session.commit()
+    return review_rule_config(session)
 
 
 @app.post("/api/workflows/import")
@@ -2720,7 +2753,7 @@ def outbound_pending_diagnosis(session: Session, row: OutboundMailJob) -> dict |
     if expected_wait_seconds:
         details.append(f"按当前限速预计至少等待 {expected_wait_seconds} 秒")
     if worker.get("last_finished_at"):
-        details.append(f"最近 worker 完成时间：{worker['last_finished_at']}")
+        details.append(f"最近 worker 完成时间：{format_display_time(worker['last_finished_at'])}")
     else:
         details.append("当前进程尚未记录 worker 完成时间")
 
@@ -2870,7 +2903,7 @@ def outbound_mail_diagnostics_data(session: Session, *, hours: int = 24, limit: 
         detail = loads(case.detail, {})
         mail_type = str(detail.get("mail_type") or "Unknown")
         by_type[mail_type] = by_type.get(mail_type, 0) + 1
-        bucket = case.created_at.strftime("%Y-%m-%d %H:00")
+        bucket = to_beijing_time(case.created_at).strftime("%Y-%m-%d %H:00")
         trend[bucket] = trend.get(bucket, 0) + 1
         if len(recent_failures) < limit:
             recent_failures.append(
@@ -2965,7 +2998,7 @@ def notify_outbound_diagnostics(
     if existing is not None:
         return {"queued": False, "outbound_job_id": existing.id, "status": existing.status, "reason": "already queued in this hour"}
 
-    subject = f"[外发队列告警][{now.strftime('%Y-%m-%d %H:%M')}] 请处理异常邮件队列"
+    subject = f"[外发队列告警][{format_beijing_time(now)}] 请处理异常邮件队列"
     body_lines = [
         "运维同事好，",
         "",
@@ -5169,7 +5202,7 @@ def crm_order_flow_steps(row: CrmSalesOrder, middle_order: MiddlePlatformOrder |
         {"key": "crm", "label": "CRM 同步", "status": "done", "description": "CRM 订单已同步并查重", "time": row.synced_at.isoformat() if row.synced_at else None},
         {"key": "imported", "label": "进入中台", "status": step_status(status, ["CRM_APPROVED"], ["IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED", "DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED", "CANCELLED"]), "description": f"中台订单号：{middle_order.order_no}", "time": middle_order.imported_at.isoformat() if middle_order.imported_at else middle_order.created_at.isoformat()},
         {"key": "validation", "label": "完整预审", "status": validation_step_status(status), "description": validation_step_description(middle_order), "time": middle_order.validated_at.isoformat() if middle_order.validated_at else None},
-        {"key": "notice", "label": "发货预览", "status": delivery_notice_step_status(status, notice), "description": delivery_notice_step_description(notice), "time": notice.created_at.isoformat() if notice and notice.created_at else None},
+        {"key": "notice", "label": "发货预览", "status": delivery_notice_step_status(status, notice), "description": delivery_notice_step_description(status, notice), "time": notice.created_at.isoformat() if status not in {"CRM_APPROVED", "IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED"} and notice and notice.created_at else None},
         {"key": "oms", "label": "OMS 下推", "status": oms_step_status(status, notice), "description": oms_step_description(status, notice), "time": notice.pushed_at.isoformat() if notice and notice.pushed_at else None},
         {"key": "fulfillment", "label": "履约归档", "status": fulfillment_step_status(status), "description": fulfillment_step_description(status), "time": middle_order.updated_at.isoformat() if status in {"PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED", "CANCELLED"} and middle_order.updated_at else None},
     ]
@@ -5214,8 +5247,10 @@ def validation_step_description(order: MiddlePlatformOrder) -> str:
 def delivery_notice_step_status(status: str, notice: DeliveryNotice | None) -> str:
     if status == "CANCELLED":
         return "cancelled"
+    if status in {"CRM_APPROVED", "IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED"}:
+        return "pending"
     if notice is None:
-        return "pending" if status in {"CRM_APPROVED", "IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED"} else "active"
+        return "active"
     if notice.status in {"Stale", "Cancelled", "Blocked"}:
         return "blocked" if notice.status != "Cancelled" else "cancelled"
     if status in {"DELIVERY_NOTICE_READY", "OMS_PENDING", "OMS_RETRYING", "OMS_BLOCKED", "OMS_ACCEPTED", "PICKING", "SHIPPED", "FULFILLMENT_ARCHIVED", "CLOSED"}:
@@ -5223,8 +5258,8 @@ def delivery_notice_step_status(status: str, notice: DeliveryNotice | None) -> s
     return "active"
 
 
-def delivery_notice_step_description(notice: DeliveryNotice | None) -> str:
-    if notice is None:
+def delivery_notice_step_description(status: str, notice: DeliveryNotice | None) -> str:
+    if notice is None or status in {"CRM_APPROVED", "IMPORTED", "VALIDATING", "VALIDATION_BLOCKED", "VALIDATED"}:
         return "尚未生成发货通知"
     return f"{notice.notice_no} · {notice.status}"
 
@@ -6160,6 +6195,14 @@ def sync_products_from_erp(session: Session = Depends(get_session)) -> dict:
     return result
 
 
+@app.post("/api/products/oms-sync")
+def sync_products_from_oms(session: Session = Depends(get_session)) -> dict:
+    from backend.app.services.oms.material_sync import sync_oms_materials
+    result = sync_oms_materials(session)
+    session.commit()
+    return result
+
+
 @app.post("/api/products/review-preview")
 def preview_product_review_api(payload: dict, session: Session = Depends(get_session)) -> dict:
     text = str(payload.get("text") or payload.get("product_summary") or "").strip()
@@ -6314,9 +6357,29 @@ def update_inventory_classification_rules(payload: dict, session: Session = Depe
 
 @app.post("/api/products/inventory/erp-sync")
 def sync_inventory_from_erp(session: Session = Depends(get_session)) -> dict:
-    result = sync_inventory_snapshots(session)
-    session.commit()
+    raise HTTPException(status_code=400, detail="同步 ERP 库存功能暂时不可用")
+
+
+@app.post("/api/products/inventory/import-excel")
+def api_import_inventory_excel(file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        contents = file.file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+    
+    try:
+        from backend.app.services.excel_import import import_inventory_excel
+        result = import_inventory_excel(tmp_path, session)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
     return result
+
 
 
 @app.get("/api/products/sku")
@@ -6324,21 +6387,34 @@ def list_products_sku_api(
     spu_id: str = Query(None, description="所属 SPU ID (Code)"),
     spu_uuid: str = Query(None, description="所属 SPU UUID"),
     q: str = Query("", description="搜索 SKU、SPU、成品名称或预审别名"),
+    crm_semantic: bool = Query(False, description="是否启用 CRM 语义匹配"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     session: Session = Depends(get_session)
 ) -> dict:
+    if not isinstance(crm_semantic, bool):
+        crm_semantic = False
+    if not isinstance(q, str):
+        q = ""
+    if not isinstance(spu_id, str):
+        spu_id = None
+    if not isinstance(spu_uuid, str):
+        spu_uuid = None
     skip = (page - 1) * page_size
-    items, total = get_skus(session, skip=skip, limit=page_size, spu_id=spu_id, spu_uuid=spu_uuid, query=q)
+    items, total = get_skus(session, skip=skip, limit=page_size, spu_id=spu_id, spu_uuid=spu_uuid, query=q, crm_semantic=crm_semantic)
     return {
         "items": [
             {
                 "id": sku.id,
-                "spu_id": sku.spu.spu_id,
-                "spu_name": sku.spu.name,
+                "spu_uuid": sku.spu.id if sku.spu else None,
+                "spu_id": sku.spu.spu_id if sku.spu else None,
+                "spu_name": sku.spu.name if sku.spu else None,
                 "sku_id": sku.sku_id,
+                "model": sku.model,
+                "brand": sku.spu.brand if sku.spu else None,
+                "category": sku.spu.category if sku.spu else None,
                 "status": sku.status,
-                "review_aliases": spu_review_aliases(sku.spu),
+                "review_aliases": spu_review_aliases(sku.spu) if sku.spu else [],
                 "attributes": loads(sku.attributes_json, {}),
                 "created_at": sku.created_at.isoformat(),
             } for sku in items
@@ -6348,6 +6424,71 @@ def list_products_sku_api(
         "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size)
     }
+
+@app.get("/api/products/sku/{sku_id}/realtime-stock")
+def get_sku_realtime_stock_api(sku_id: str, session: Session = Depends(get_session)) -> dict:
+    from backend.app.models import ProductSKU, ProductInventorySnapshot
+    sku = session.query(ProductSKU).filter_by(sku_id=sku_id).first()
+    if sku is None:
+        raise HTTPException(status_code=404, detail="SKU 在中台主数据中不存在")
+    try:
+        from backend.app.services.oms.material_sync import query_oms_realtime_stock
+        stocks = query_oms_realtime_stock(session, sku_id)
+        
+        # Query Excel stock snapshots
+        excel_snapshots = session.query(ProductInventorySnapshot).filter_by(material_code=sku_id).all()
+        
+        matched_excel_ids = set()
+        for item in stocks:
+            wh_code = item.get("warehouse_code") or ""
+            wh_name = item.get("warehouse_name") or ""
+            
+            # Find matching excel snapshot
+            matched_s = None
+            # 1. Exact match
+            for s in excel_snapshots:
+                if s.id in matched_excel_ids:
+                    continue
+                if wh_code.lower() == s.warehouse_code.lower() or wh_name.lower() == s.warehouse_name.lower():
+                    matched_s = s
+                    break
+            # 2. Try mappings/substrings
+            if not matched_s:
+                for s in excel_snapshots:
+                    if s.id in matched_excel_ids:
+                        continue
+                    s_name = s.warehouse_name.lower().strip()
+                    # Alias rules
+                    mappings = {"c1": "美西", "c3": "德国", "b1": "amazon us", "b2": "amazon de", "b3": "amazon uk", "b5": "cz amazon us"}
+                    kw = mappings.get(wh_code.lower())
+                    if (kw and kw in s_name) or (s_name in wh_name.lower() or wh_name.lower() in s_name):
+                        matched_s = s
+                        break
+            
+            if matched_s:
+                item["excel_qty"] = int(matched_s.base_qty)
+                matched_excel_ids.add(matched_s.id)
+            else:
+                item["excel_qty"] = None
+                
+        # Append unmatched excel snapshots
+        for s in excel_snapshots:
+            if s.id not in matched_excel_ids:
+                stocks.append({
+                    "warehouse_code": s.warehouse_code,
+                    "warehouse_name": s.warehouse_name,
+                    "quantity": None,
+                    "usable_quantity": None,
+                    "excel_qty": int(s.base_qty)
+                })
+                
+        return {
+            "ok": True,
+            "sku_id": sku_id,
+            "stocks": stocks
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.post("/api/products/sku")
 def create_product_sku_api(payload: ProductSKUCreate, session: Session = Depends(get_session)) -> dict:

@@ -252,6 +252,19 @@ def _extract_po_table_values(text: str) -> dict[str, list[Decimal]]:
             line_amount.append(total)
             implied_unit_price.append(total / qty)
 
+    for row in _extract_pipe_table_rows(text):
+        qty = row.get("quantity")
+        unit = row.get("unit_price")
+        total = row.get("line_amount")
+        if qty is None or qty <= 0:
+            continue
+        quantity.append(qty)
+        if unit is not None:
+            unit_price.append(unit)
+        if total is not None:
+            line_amount.append(total)
+            implied_unit_price.append(total / qty)
+
     total_patterns = [
         re.compile(rf"订单总金额(?:（含税）)?\s*[:：]?[^\d¥￥]{{0,120}}{money}", re.IGNORECASE),
         re.compile(rf"总金额(?:（含税）)?[^\d¥￥]{{0,120}}{money}", re.IGNORECASE),
@@ -268,3 +281,37 @@ def _extract_po_table_values(text: str) -> dict[str, list[Decimal]]:
         "line_amount": _merge_decimals(line_amount),
         "implied_unit_price": _merge_decimals(implied_unit_price),
     }
+
+
+def _extract_pipe_table_rows(text: str) -> list[dict[str, Decimal | None]]:
+    lines = [line.strip() for line in re.split(r"[\r\n]+", text) if "|" in line]
+    header: list[str] | None = None
+    results: list[dict[str, Decimal | None]] = []
+    for line in lines:
+        cells = [cell.strip() for cell in line.split("|")]
+        normalized_cells = [_normalize(cell) for cell in cells]
+        if "数量" in normalized_cells and any("单价" in cell for cell in normalized_cells) and any("金额" in cell for cell in normalized_cells):
+            header = normalized_cells
+            continue
+        if not header or len(cells) < len(header):
+            continue
+        quantity_index = header.index("数量") if "数量" in header else -1
+        unit_price_index = next((index for index, cell in enumerate(header) if "单价" in cell), -1)
+        line_amount_index = next((index for index, cell in enumerate(header) if "总金额" in cell or "明细总价" in cell or cell == "金额"), -1)
+        if quantity_index < 0:
+            continue
+        results.append(
+            {
+                "quantity": _parse_table_decimal(cells[quantity_index]),
+                "unit_price": _parse_table_decimal(cells[unit_price_index]) if unit_price_index >= 0 and unit_price_index < len(cells) else None,
+                "line_amount": _parse_table_decimal(cells[line_amount_index]) if line_amount_index >= 0 and line_amount_index < len(cells) else None,
+            }
+        )
+    return results
+
+
+def _parse_table_decimal(value: Any) -> Decimal | None:
+    match = re.search(r"(?:¥|￥|CNY|RMB|人民币)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{1,2})?|[0-9]+(?:\.\d{1,2})?)", str(value or ""), re.IGNORECASE)
+    if not match:
+        return None
+    return parse_decimal(match.group(1))

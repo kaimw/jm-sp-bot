@@ -440,3 +440,133 @@ def oms_material_sync_due(session: Session, *, now: datetime | None = None) -> b
     except ValueError:
         return True
     return ((now or now_utc()) - last_dt).total_seconds() >= interval
+
+def query_oms_realtime_stock(session: Session, sku_id: str) -> list[dict[str, Any]]:
+    # 如果 mock 模式开启
+    if config_bool(session, "oms_mock_success", True):
+        if "PRO" in sku_id.upper():
+            return [
+                {"warehouse_code": "WH-SZ", "warehouse_name": "深圳总仓", "quantity": 80, "usable_quantity": 70},
+                {"warehouse_code": "WH-WH", "warehouse_name": "武汉分仓", "quantity": 20, "usable_quantity": 15}
+            ]
+        elif "LITE" in sku_id.upper():
+            return [
+                {"warehouse_code": "WH-SZ", "warehouse_name": "深圳总仓", "quantity": 40, "usable_quantity": 35},
+                {"warehouse_code": "WH-GZ", "warehouse_name": "广州分仓", "quantity": 10, "usable_quantity": 8}
+            ]
+        else:
+            return [
+                {"warehouse_code": "WH-SZ", "warehouse_name": "深圳总仓", "quantity": 100, "usable_quantity": 90}
+            ]
+            
+    # 真实 API 同步模式
+    if not config_bool(session, "oms_enabled", False):
+        raise RuntimeError("OMS 服务未开启且未处于 Mock 模式")
+        
+    import concurrent.futures
+    
+    # 收集核心与历史仓库列表
+    warehouses = {
+        "A1": "武汉工厂仓",
+        "A2": "潜江工厂仓",
+        "B1": "Amazon US Warehouse",
+        "B2": "Amazon DE Warehouse",
+        "B3": "Amazon UK Warehouse",
+        "B5": "CZ Amazon US Warehouse",
+        "C1": "谷仓-美西",
+        "C2": "EU-卢森堡仓库",
+        "C3": "谷仓-德国",
+        "E1": "货代临时仓",
+    }
+    
+    # 从本地库存快照表中提取发生过库存业务的仓库
+    try:
+        from sqlalchemy import text
+        rows = session.execute(text("select warehouse_code, warehouse_name from product_inventory_snapshots group by warehouse_code, warehouse_name")).fetchall()
+        for r in rows:
+            code = str(r[0] or "").strip()
+            name = str(r[1] or "").strip()
+            if code and code not in warehouses:
+                warehouses[code] = name
+    except Exception as e:
+        logger.warning("从库存快照提取仓库字典失败: %s", e)
+        
+    # 从发货通知表中提取发生过业务的仓库
+    try:
+        from sqlalchemy import text
+        rows = session.execute(text("select warehouse_code from delivery_notices where warehouse_code is not null and warehouse_code != '' group by warehouse_code")).fetchall()
+        for r in rows:
+            code = str(r[0] or "").strip()
+            if code and code not in warehouses:
+                warehouses[code] = f"仓库({code})"
+    except Exception as e:
+        logger.warning("从发货通知提取仓库字典失败: %s", e)
+        
+    client = jackyun_client_from_session(session)
+    cols = "skuCode,skuNo,warehouseCode,warehouseName,quantity,usableQuantity,currentQuantity,canUseQuantity"
+    
+    stocks = []
+    
+    def fetch_stock(wh_code: str, wh_name: str) -> list[dict[str, Any]]:
+        # 使用 goodsNo 精准过滤该商品在吉客云中的库存，避免拉取该仓库下所有商品
+        payload = {
+            "goodsNo": sku_id,
+            "warehouseCode": wh_code,
+            "cols": cols
+        }
+        try:
+            res = client.query_sku_stock(payload)
+            if not res.get("ok"):
+                logger.warning("吉客云查询仓库 %s 库存返回错误: %s", wh_code, res.get("message"))
+                return []
+            data_list = res.get("data") or []
+            if isinstance(data_list, dict):
+                if "data" in data_list:
+                    data_list = data_list["data"]
+                elif "rows" in data_list:
+                    data_list = data_list["rows"]
+                elif "stocks" in data_list:
+                    data_list = data_list["stocks"]
+                else:
+                    data_list = [data_list]
+            elif not isinstance(data_list, list):
+                data_list = []
+                
+            wh_stocks = []
+            for row in data_list:
+                if not isinstance(row, dict):
+                    continue
+                w_code = str(row.get("warehouseCode") or row.get("warehouse_code") or wh_code).strip()
+                w_name = str(row.get("warehouseName") or row.get("warehouse_name") or wh_name).strip()
+                
+                # 兼容吉客云真实 API 的 currentQuantity (账面库存) / canUseQuantity (可用库存)
+                qty = row.get("currentQuantity") or row.get("current_quantity") or row.get("quantity") or row.get("qty") or 0
+                usable_qty = row.get("canUseQuantity") or row.get("can_use_quantity") or row.get("usableQuantity") or row.get("usable_qty") or qty
+                
+                if not w_code:
+                    continue
+                wh_stocks.append({
+                    "warehouse_code": w_code,
+                    "warehouse_name": w_name,
+                    "quantity": int(float(qty)),
+                    "usable_quantity": int(float(usable_qty))
+                })
+            return wh_stocks
+        except Exception as ex:
+            logger.error("并发查询吉客云仓库 %s 库存抛出异常: %s", wh_code, ex)
+            return []
+            
+    # 使用线程池并发查询各物理仓库的库存情况
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(warehouses))) as executor:
+        futures = {executor.submit(fetch_stock, code, name): code for code, name in warehouses.items()}
+        for future in concurrent.futures.as_completed(futures):
+            wh_code = futures[future]
+            try:
+                res_stocks = future.result()
+                stocks.extend(res_stocks)
+            except Exception as e:
+                logger.error("线程拉取仓库 %s 库存失败: %s", wh_code, e)
+                
+    # 按照可用库存及账面库存降序排列展示
+    stocks.sort(key=lambda x: (x["usable_quantity"], x["quantity"]), reverse=True)
+    return stocks

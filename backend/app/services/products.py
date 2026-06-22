@@ -51,7 +51,10 @@ def normalize_product_review_aliases(values) -> list[str]:
     if isinstance(values, str):
         raw_values = re.split(r"[\n,，、;；]+", values)
     elif isinstance(values, list):
-        raw_values = values
+        raw_values = []
+        for item in values:
+            if isinstance(item, str):
+                raw_values.extend(re.split(r"[\n,，、;；]+", str(item)))
     else:
         raw_values = []
     aliases: list[str] = []
@@ -151,11 +154,16 @@ def _sku_search_score(sku: ProductSKU, query: str) -> int:
     if not normalized_query:
         return 0
     spu = sku.spu
+    # 从 attributes_json 提取 OMS 英文名称作为可搜索字段
+    attrs = loads(sku.attributes_json, {}) if sku.attributes_json else {}
+    oms_en_name = attrs.get("oms_en_name", "") if isinstance(attrs, dict) else ""
     fields = [
         ("sku_id", sku.sku_id, 110),
         ("spu_id", spu.spu_id if spu else "", 95),
         ("name", spu.name if spu else "", 90),
+        ("model", sku.model or "", 85),
         ("alias", spu_review_aliases(spu) if spu else [], 95),
+        ("en_name", oms_en_name, 80),
         ("brand", spu.brand if spu else "", 60),
         ("category", spu.category if spu else "", 50),
     ]
@@ -181,13 +189,24 @@ def _sku_search_score(sku: ProductSKU, query: str) -> int:
     return best_score
 
 
-def get_skus(session: Session, skip: int = 0, limit: int = 100, spu_id: str = None, spu_uuid: str = None, query: str = None) -> tuple[list[ProductSKU], int]:
-    q = filter_finished_inventory_skus(session.query(ProductSKU))
+def get_skus(session: Session, skip: int = 0, limit: int = 100, spu_id: str = None, spu_uuid: str = None, query: str = None, crm_semantic: bool = False) -> tuple[list[ProductSKU], int]:
+    query = str(query or "").strip()
+    if crm_semantic and query:
+        matched_skus = semantic_match_skus(session, query, limit=limit * 2)
+        if matched_skus:
+            # 过滤以满足 spu_uuid / spu_id 条件
+            if spu_uuid:
+                matched_skus = [sku for sku in matched_skus if sku.spu_uuid == spu_uuid]
+            if spu_id:
+                matched_skus = [sku for sku in matched_skus if sku.spu and sku.spu.spu_id == spu_id]
+            total = len(matched_skus)
+            return matched_skus[skip:skip + limit], total
+
+    q = session.query(ProductSKU).join(ProductSPU, ProductSKU.spu_uuid == ProductSPU.id).filter(ProductSKU.status == "Active", ProductSPU.category == FINISHED_CATEGORY)
     if spu_uuid:
         q = q.where(ProductSKU.spu_uuid == spu_uuid)
     if spu_id:
         q = q.where(ProductSPU.spu_id == spu_id)
-    query = str(query or "").strip()
     if query:
         scored_items = [
             (sku, _sku_search_score(sku, query))
@@ -750,6 +769,19 @@ def _normalize_product_alias(value: str | None) -> str:
     return text
 
 
+def _product_name_match_tokens(value: str | None) -> list[str]:
+    text = str(value or "").strip().lower()
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[a-z][a-z0-9+]*", text):
+        normalized = _normalize_product_alias(token)
+        if len(normalized) < 3 or normalized in PRODUCT_ALIAS_STOPWORDS or normalized in seen:
+            continue
+        seen.add(normalized)
+        tokens.append(normalized)
+    return tokens
+
+
 def _strong_alias(value: str | None) -> str | None:
     alias = str(value or "").strip()
     normalized = _normalize_product_alias(alias)
@@ -883,8 +915,9 @@ def suggest_product_review_candidates(session: Session, text: str, *, limit: int
     if not query_norm and not tokens:
         return []
     active_skus = (
-        filter_finished_inventory_skus(session.query(ProductSKU))
-        .filter(ProductSKU.status == "Active")
+        session.query(ProductSKU)
+        .join(ProductSPU, ProductSKU.spu_uuid == ProductSPU.id)
+        .filter(ProductSKU.status == "Active", ProductSPU.status == "Active")
         .all()
     )
     best_by_spu: dict[str, dict] = {}
@@ -927,6 +960,88 @@ def suggest_product_review_candidates(session: Session, text: str, *, limit: int
                 "score": best_score,
             }
     return sorted(best_by_spu.values(), key=lambda item: item["score"], reverse=True)[:limit]
+
+
+def product_name_sku_candidates(session: Session, query: str, *, limit: int = 5) -> list[dict]:
+    source = str(query or "").strip()
+    query_norm = _normalize_product_alias(source)
+    query_tokens = _product_name_match_tokens(source)
+    if not query_norm:
+        return []
+    active_skus = (
+        session.query(ProductSKU)
+        .join(ProductSPU, ProductSKU.spu_uuid == ProductSPU.id)
+        .filter(ProductSKU.status == "Active", ProductSPU.status == "Active")
+        .all()
+    )
+    candidates: list[dict] = []
+    for sku in active_skus:
+        spu = sku.spu
+        if not spu:
+            continue
+        fields: list[tuple[str, str, int]] = []
+        fields.extend((alias, "alias", 300) for alias in spu_review_aliases(spu))
+        fields.append((spu.name, "name", 200))
+        fields.append((spu.name_en, "english_name", 100))
+        attrs = loads(sku.attributes_json, {}) if sku.attributes_json else {}
+        fields.append((attrs.get("english_name") or attrs.get("name_en"), "english_name", 100))
+        best: dict | None = None
+        for raw_value, source_name, priority in fields:
+            value = str(raw_value or "").strip()
+            value_norm = _normalize_product_alias(value)
+            if not value_norm:
+                continue
+            score = 0
+            confidence = 0
+            source_base = {"alias": 96, "name": 90, "english_name": 84}.get(source_name, 80)
+            if query_norm == value_norm:
+                score = priority + 100
+                confidence = source_base + 3
+            elif value_norm in query_norm:
+                score = priority + min(90, len(value_norm) * 4)
+                confidence = source_base
+            elif query_norm in value_norm:
+                score = priority + min(80, len(query_norm) * 3)
+                confidence = max(75, source_base - 4)
+            elif query_tokens and any(token in value_norm for token in query_tokens):
+                token = next(token for token in query_tokens if token in value_norm)
+                score = priority + min(70, len(token) * 8)
+                confidence = max(82, source_base - 6)
+            else:
+                ratio = SequenceMatcher(None, query_norm, value_norm).ratio()
+                if ratio >= 0.72:
+                    score = priority + int(ratio * 70)
+                    confidence = min(source_base - 8, int(ratio * 100))
+            if score <= 0:
+                continue
+            candidate = {
+                "sku_id": sku.sku_id,
+                "spu_id": spu.spu_id,
+                "product_name": spu.name,
+                "matched_value": value,
+                "match_source": source_name,
+                "confidence": max(0, min(99, confidence)),
+                "score": score,
+            }
+            if best is None or (candidate["score"], candidate["confidence"]) > (best["score"], best["confidence"]):
+                best = candidate
+        if best:
+            candidates.append(best)
+    candidates.sort(key=lambda item: (item["score"], item["confidence"]), reverse=True)
+    return candidates[:limit]
+
+
+def match_sku_by_product_name(session: Session, query: str, *, min_confidence: int = 80) -> dict:
+    candidates = product_name_sku_candidates(session, query, limit=5)
+    if not candidates:
+        return {"matched": False, "reason": "not_found", "candidates": []}
+    best = candidates[0]
+    if int(best.get("confidence") or 0) < min_confidence:
+        return {"matched": False, "reason": "low_confidence", "candidates": candidates}
+    ties = [item for item in candidates if item.get("confidence") == best.get("confidence") and item.get("sku_id") != best.get("sku_id")]
+    if ties:
+        return {"matched": False, "reason": "ambiguous", "candidates": candidates}
+    return {"matched": True, "sku_id": best["sku_id"], "confidence": best["confidence"], "match_source": best["match_source"], "matched_value": best["matched_value"], "candidates": candidates}
 
 
 def extract_order_products_from_text(session: Session, text: str, *, channel: str = "default") -> list[dict]:
@@ -1210,7 +1325,7 @@ def extract_products_with_llm(session: Session, product_summary: str) -> list[di
     - promotion_applied (list of strings)
     """
     from backend.app.services.model_provider import call_model, extract_chat_content
-    from backend.app.services.workflow import get_active_model
+    from backend.app.services.llm_fallback import active_model_config
     
     if not product_summary or not product_summary.strip():
         return []
@@ -1227,7 +1342,7 @@ def extract_products_with_llm(session: Session, product_summary: str) -> list[di
     user_prompt = f"Extract materials from the following text:\n\n{product_summary}"
     
     try:
-        config = get_active_model(session)
+        config = active_model_config(session)
         if config is None:
             return []
         response = call_model(
@@ -1255,3 +1370,106 @@ def extract_products_with_llm(session: Session, product_summary: str) -> list[di
         logger.warning("Failed to extract products with LLM: %s", e)
     
     return []
+
+
+def semantic_match_skus(session: Session, query: str, limit: int = 5) -> list[ProductSKU]:
+    """
+    使用大语言模型（LLM）对 CRM 产品名称进行语义匹配，在 active 的 SKU 中搜寻对应的货品/物料。
+    """
+    from backend.app.services.model_provider import call_model, extract_chat_content
+    from backend.app.services.llm_fallback import active_model_config
+    
+    query = str(query or "").strip()
+    if not query:
+        return []
+        
+    active_skus = (
+        session.query(ProductSKU)
+        .join(ProductSPU, ProductSKU.spu_uuid == ProductSPU.id)
+        .filter(ProductSKU.status == "Active")
+        .all()
+    )
+    if not active_skus:
+        return []
+        
+    candidates = []
+    for sku in active_skus:
+        spu = sku.spu
+        aliases = spu_review_aliases(spu) if spu else []
+        candidates.append({
+            "sku_id": sku.sku_id,
+            "spu_name": spu.name if spu else "",
+            "model": sku.model or "",
+            "brand": spu.brand if spu else "",
+            "category": spu.category if spu else "",
+            "aliases": aliases
+        })
+        
+    if len(candidates) > 30:
+        scored = []
+        for cand in candidates:
+            score = 0
+            q_norm = query.lower()
+            if q_norm in cand["sku_id"].lower():
+                score += 50
+            if cand["spu_name"] and q_norm in cand["spu_name"].lower():
+                score += 40
+            if cand["model"] and q_norm in cand["model"].lower():
+                score += 30
+            for alias in cand["aliases"]:
+                if q_norm in alias.lower() or alias.lower() in q_norm:
+                    score += 40
+            scored.append((cand, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        candidates = [x[0] for x in scored[:30]]
+        
+    system_prompt = (
+        "你是一个主数据专家。用户输入了一个来自 CRM 系统中的产品/物料/货品名称，你需要从以下给定的标准物料（候选）列表中，"
+        "寻找在语义上最匹配的最多 5 个标准物料的 sku_id。\n"
+        "注意：CRM 中的命名可能包含拼写差异、别名、缩写或中英文对照。请进行深度的语义匹配和型号比对。\n"
+        "请务必只返回一个标准的 JSON 数组，数组中包含匹配到的 sku_id 字符串（按匹配度从高到低排序）。"
+        "例如：[\"SKU-3D-SCANNER-PRO\", \"SKU-3D-SCANNER-LITE\"]\n"
+        "如果没有任何合理的匹配，请返回 []。不要包含任何 markdown 块、不要包含 ```json 等代码包裹符，仅输出纯 JSON 数组文本。"
+    )
+    
+    candidates_json = json.dumps(candidates, ensure_ascii=False)
+    user_prompt = f"用户输入的 CRM 产品名称: {query}\n\n候选标准物料列表:\n{candidates_json}"
+    
+    try:
+        config = active_model_config(session)
+        if config is None:
+            logger.warning("LLM semantic match skipped: model not configured")
+            return []
+            
+        response = call_model(
+            session,
+            config,
+            task_type="ProductSemanticMatch",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        content = extract_chat_content(response).strip()
+        
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        matched_ids = loads(content, [])
+        if not isinstance(matched_ids, list):
+            return []
+            
+        sku_map = {sku.sku_id: sku for sku in active_skus}
+        result_skus = []
+        for sku_id in matched_ids:
+            if sku_id in sku_map:
+                result_skus.append(sku_map[sku_id])
+        return result_skus
+    except Exception as exc:
+        logger.exception("LLM semantic product matching failed: %s", exc)
+        return []

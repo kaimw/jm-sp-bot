@@ -10,7 +10,7 @@ from backend.app.config import MAIL_WORKER_MIN_INTERVAL_SECONDS, settings
 from backend.app.database import SessionLocal
 from backend.app.models import OutboundMailJob, ProcessingJob
 from backend.app.services.crm_sync import schedule_crm_order_sync_if_due
-from backend.app.services.erp.material_sync import erp_material_sync_due
+from backend.app.services.oms.material_sync import oms_material_sync_due
 from backend.app.services.jobs import run_pending_jobs, schedule_oms_status_poll_if_due
 from backend.app.services.jsonutil import dumps
 from backend.app.services.mail_adapter import (
@@ -61,7 +61,7 @@ def run_mail_auto_worker_once() -> dict:
             
             result = {
                 "enabled": True,
-                "erp_material_sync": schedule_erp_material_sync_if_due(session),
+                "oms_material_sync": schedule_oms_material_sync_if_due(session),
                 "crm_order_sync": schedule_crm_order_sync_if_due(session),
                 "oms_status_poll": schedule_oms_status_poll_if_due(session),
                 "synced": {"imported": 0, "queued": 0},
@@ -141,17 +141,17 @@ def _finish_worker_run(result: dict, started: float) -> dict:
     return result
 
 
-def schedule_erp_material_sync_if_due(session: Session) -> dict:
-    if not erp_material_sync_due(session):
+def schedule_oms_material_sync_if_due(session: Session) -> dict:
+    if not oms_material_sync_due(session):
         return {"queued": False, "reason": "not due"}
     existing = (
         session.query(ProcessingJob)
-        .filter(ProcessingJob.job_type == "sync_erp_materials", ProcessingJob.status.in_(["Pending", "Running"]))
+        .filter(ProcessingJob.job_type == "sync_oms_materials", ProcessingJob.status.in_(["Pending", "Running"]))
         .first()
     )
     if existing is not None:
         return {"queued": False, "reason": "already queued", "job_id": existing.id}
-    job = ProcessingJob(job_type="sync_erp_materials", payload_json=dumps({"source": "auto"}), status="Pending")
+    job = ProcessingJob(job_type="sync_oms_materials", payload_json=dumps({"source": "auto"}), status="Pending")
     session.add(job)
     session.commit()
     return {"queued": True, "job_id": job.id}

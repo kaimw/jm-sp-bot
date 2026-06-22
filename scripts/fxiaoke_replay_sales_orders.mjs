@@ -392,17 +392,6 @@ function normalizeOrderDetail(body, row) {
     logistics_status: optionLabel(body, "logistics_status", detail.logistics_status) || firstValue(detail.logistics_status, row.logistics_status),
     shipment_status: optionLabel(body, "order_status", detail.order_status) || firstValue(detail.shipment_status, detail.delivery_status, row.shipment_status),
     invoice_status: optionLabel(body, "invoice_status", detail.invoice_status) || firstValue(detail.invoice_status, row.invoice_status),
-    receipt_contact: firstValue(
-      valueByFieldLabels(body, detail, /收货人|收件人|收货联系人|收件联系人|联系人/, ["receipt_contact", "ship_to_id__r", "ship_to_id", "receiver", "consignee", "contact_name"]),
-      row.receipt_contact,
-    ),
-    receipt_address: firstValue(
-      valueByFieldLabels(body, detail, /收货地址|收件地址|客户收件信息|配送地址/, ["receipt_address", "ship_to_add", "receive_address", "address", "shipping_address"]),
-      row.receipt_address,
-    ),
-    delivery_date: timestampToDate(valueByFieldLabels(body, detail, /交货日期|交付日期|期望交期|要求交期/, ["delivery_date", "expected_delivery_date", "delivery_time"]))
-      || timestampToDate(detail.confirmed_delivery_date)
-      || firstValue(detail.delivery_date, detail.expected_delivery_date, row.delivery_date),
     remark: firstValue(detail.remark, detail.delivery_comment, detail.description, detail.note, row.remark),
     attachment_files: attachments.map((item) => item.file_name).filter(Boolean).join("; ") || row.attachment_files,
     attachments: attachments.length ? attachments : row.attachments,
@@ -751,8 +740,9 @@ async function readListFromDom(page, limit = PAGE_SIZE) {
 async function readDetailFromDom(page, row) {
   await ensureLoggedInForDom(page, "读取 CRM 详情前发现登录态失效");
   const detail = await page.evaluate(
-    async ({ crmOrderNo }) => {
+    async ({ crmOrderNo, crmCustomerName }) => {
       const clean = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/[ \t\r\n]+/g, " ").trim();
+      const escapeRegExp = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       const visible = (element) => {
         const rect = element.getBoundingClientRect();
@@ -905,12 +895,14 @@ async function readDetailFromDom(page, row) {
         const productName = valueByHeader(/商品名称|产品名称|成交产品|商品|产品|名称/);
         const skuCode = valueByHeader(/SKU|编码|货号|物料/);
         const quantity = valueByHeader(/数量|qty|件数/i);
+        const settlementMethod = valueByHeader(/订单结算方式|结算方式|币种|currency/i);
         const unitPrice = valueByHeader(/单价|价格|unit/i).replace(/,/g, "");
         const lineAmount = valueByHeader(/金额|小计|合计|amount|total/i).replace(/,/g, "");
         return {
           ...row,
           product_name: productName || row.product_name || "",
           sku_code: skuCode || row.sku_code || "",
+          settlement_method: settlementMethod || row.settlement_method || "",
           quantity: quantity || row.quantity || "",
           unit_price: unitPrice || row.unit_price || "",
           line_amount: lineAmount || row.line_amount || "",
@@ -949,6 +941,39 @@ async function readDetailFromDom(page, row) {
       };
       const readOrderProductRowsFromText = () => {
         const text = String(document.body?.innerText || "");
+        const compactText = clean(text);
+        const customerNameForList = clean(crmCustomerName || byLabel(/^客户名称$/));
+        if (crmOrderNo && customerNameForList && /订单产品编号|销售订单编号|产品名称|销售单价|小计/.test(compactText)) {
+          const rowsFromList = [];
+          const settlementPattern = "(人民币结算CNY|美元结算USD|欧元结算EUR|港币结算HKD|日元结算JPY|[\\u4e00-\\u9fa5]+结算[A-Z]{3}|[A-Z]{3})";
+          const amountPattern = "([\\d,]+(?:\\.\\d+)?)";
+          const pattern = new RegExp(
+            `${escapeRegExp(crmOrderNo)}\\s+${escapeRegExp(customerNameForList)}\\s+(.+?)\\s+${settlementPattern}\\s+${amountPattern}\\s+${amountPattern}\\s+${amountPattern}`,
+            "g",
+          );
+          for (const match of compactText.matchAll(pattern)) {
+            const productName = clean(match[1]);
+            const settlementMethod = clean(match[2]);
+            const orderAmount = clean(match[3]).replace(/,/g, "");
+            const unitPrice = clean(match[4]).replace(/,/g, "");
+            const lineAmount = clean(match[5]).replace(/,/g, "");
+            if (!productName) continue;
+            const quantity = unitPrice && lineAmount && Number(unitPrice) > 0 && Number(lineAmount) > 0
+              ? String(Math.round((Number(lineAmount) / Number(unitPrice)) * 100) / 100)
+              : "";
+            rowsFromList.push({
+              source: "dom_sales_order_product_list_text",
+              raw_values: [crmOrderNo, customerNameForList, productName, settlementMethod, orderAmount, unitPrice, lineAmount],
+              product_name: productName,
+              settlement_method: settlementMethod,
+              quantity: quantity || "1",
+              unit_price: unitPrice,
+              line_amount: lineAmount,
+              order_amount: orderAmount,
+            });
+          }
+          if (rowsFromList.length) return rowsFromList;
+        }
         const lines = text
           .split(/\n+/)
           .map((line) => clean(line))
@@ -1061,7 +1086,7 @@ async function readDetailFromDom(page, row) {
         raw_dom_fields: fields,
       };
     },
-    { crmOrderNo: row.crm_order_no || "" },
+    { crmOrderNo: row.crm_order_no || "", crmCustomerName: row.customer_name || "" },
   );
   if (!detail) throw new Error("DOM detail fallback did not match current CRM order detail");
   return { ...row, ...detail, crm_order_id: row.crm_order_id };
@@ -1184,6 +1209,18 @@ async function main() {
       try {
         const body = await replayDetail(page, detailRequest, row);
         const normalized = normalizeOrderDetail(body, row);
+        if (!Array.isArray(normalized.order_items) || normalized.order_items.length === 0) {
+          try {
+            const domDetail = await readDetailFromDom(page, { ...row, ...normalized });
+            if (Array.isArray(domDetail.order_items) && domDetail.order_items.length > 0) {
+              normalized.order_items = domDetail.order_items;
+              normalized.detail_product_source = domDetail.detail_source || "DomDetailOrderProducts";
+              normalized.raw_dom_product_fields = domDetail.raw_dom_fields || [];
+            }
+          } catch (productError) {
+            normalized.detail_product_sync_error = String(productError.message || productError);
+          }
+        }
         if (!normalized.sales_user_email) {
           normalized.sales_user_email = await firstProfileEmail(
             page,

@@ -1692,6 +1692,7 @@ def test_word_excel_zip_attachment_parser():
 
 
 def test_email_store_and_processing_queue_creates_task():
+    """Legacy mail-to-task flow is disabled; processing should succeed but not create a task."""
     session = make_session()
     configure_department(session)
 
@@ -1727,7 +1728,6 @@ def test_email_store_and_processing_queue_creates_task():
     result = run_pending_jobs(session)
     session.commit()
     assets = session.query(AttachmentAsset).filter_by(mail_id=mail.id).all()
-    ack = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
 
     assert result["completed"] == 1
     assert result["failed"] == 0
@@ -1736,16 +1736,16 @@ def test_email_store_and_processing_queue_creates_task():
     assert len(parsed_assets) == 1
     assert len(raw_assets) == 1
     assert "表面处理" in (parsed_assets[0].extracted_text or "")
-    assert mail.related_task_id is not None
-    assert as_list(ack.to_json) == ["sales@jimuyida.com"]
-    task = session.get(ProductionTask, mail.related_task_id)
-    assert task is not None
-    assert f"任务号：{task.task_no}" in ack.body
-    assert "邮箱入库" in ack.subject
+    # Mail-triggered order creation is disabled – no task or ack should be produced.
+    assert mail.related_task_id is None
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 0
+    # Audit log should record that legacy flow was skipped.
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderCreationIgnored", related_object_id=mail.id).first()
+    assert audit is not None
 
     duplicate = store_incoming_email(session, incoming)
     assert duplicate.id == mail.id
-    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 1
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 0
 
 
 def test_parse_email_bytes_repairs_legacy_gbk_attachment_filename():
@@ -2287,13 +2287,14 @@ def test_llm_fallback_can_classify_and_extract_natural_sales_order(monkeypatch):
     result = run_pending_jobs(session)
     session.commit()
 
-    ack = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
-    version = session.query(ProductionTaskVersion).one()
+    # LLM reclassification should still update the mail classification…
     assert result["completed"] == 1
     assert mail.classification == "SalesOrderRequirement"
-    assert version.task.requirement.customer_name == "武汉大学"
-    assert version.task.requirement.product_summary == "G100"
-    assert as_list(ack.to_json) == ["sales@jimuyida.com"]
+    # …but the legacy mail-to-task flow is disabled, so no task/ack is created.
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 0
+    assert session.query(ProductionTaskVersion).count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderCreationIgnored", related_object_id=mail.id).first()
+    assert audit is not None
 
 
 def test_llm_fallback_non_target_is_ignored_without_exception(monkeypatch):
@@ -3661,6 +3662,7 @@ def test_pending_receipt_ack_sender_does_not_send_task_issues(monkeypatch):
 
 
 def test_attachment_text_can_create_task_and_evidence():
+    """Legacy mail-to-task flow is disabled; attachment orders are no longer auto-processed."""
     session = make_session()
     configure_department(session)
 
@@ -3694,14 +3696,13 @@ def test_attachment_text_can_create_task_and_evidence():
 
     result = run_pending_jobs(session)
     session.commit()
-    ack = session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").one()
-    evidence = session.query(ExtractionEvidence).filter_by(field_name="customer_name").one()
 
     assert result["completed"] == 1
-    assert mail.related_task_id is not None
-    assert evidence.source_type == "Attachment"
-    assert evidence.field_value == "附件字段客户"
-    assert as_list(ack.to_json) == ["sales@jimuyida.com"]
+    # Mail-triggered order creation is disabled – no task or ack should be produced.
+    assert mail.related_task_id is None
+    assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderCreationIgnored", related_object_id=mail.id).first()
+    assert audit is not None
 
 
 def test_missing_fields_enqueue_supplement_request():
@@ -3731,6 +3732,7 @@ def test_missing_fields_enqueue_supplement_request():
 
 
 def test_short_natural_sales_order_triggers_review_rejection_without_ack():
+    """Legacy mail-to-task flow is disabled; short orders no longer trigger review rejection."""
     session = make_session()
     configure_department(session)
     message = EmailMessage()
@@ -3747,15 +3749,13 @@ def test_short_natural_sales_order_triggers_review_rejection_without_ack():
     result = run_pending_jobs(session)
     session.commit()
 
-    supplement = session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").one()
-    case = session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").one()
-    detail = loads(case.detail, {})
     assert result["completed"] == 1
     assert mail.classification == "SalesOrderRequirement"
-    assert "期望交期" in supplement.body
-    assert "期望交期" in detail["missing_fields"]
+    # Legacy flow disabled – no supplement request, no ack, no exception case.
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0
     assert session.query(OutboundMailJob).filter_by(mail_type="SalesReceiptAck").count() == 0
-    assert as_list(supplement.to_json) == ["sales@jimuyida.com"]
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderCreationIgnored", related_object_id=mail.id).first()
+    assert audit is not None
 
 
 def test_sales_reply_to_initial_review_supplement_creates_task_and_receipt_after_send(monkeypatch):
@@ -3841,6 +3841,7 @@ def test_sales_reply_to_initial_review_supplement_creates_task_and_receipt_after
 
 
 def test_pending_non_target_mail_is_reclassified_by_updated_rules():
+    """Reclassification still happens, but legacy task creation is skipped."""
     session = make_session()
     configure_department(session)
     mail = create_inbound_mail(
@@ -3857,13 +3858,16 @@ def test_pending_non_target_mail_is_reclassified_by_updated_rules():
     result = run_pending_jobs(session)
     session.commit()
 
-    supplement = session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").one()
     assert result["completed"] == 1
     assert mail.classification == "SalesOrderRequirement"
-    assert "武汉大学" in supplement.body
+    # Reclassified but legacy flow disabled – no supplement or task.
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderCreationIgnored", related_object_id=mail.id).first()
+    assert audit is not None
 
 
 def test_duplicate_processing_does_not_duplicate_review_rejection():
+    """Legacy flow disabled – duplicate processing produces audit logs but no tasks/requirements."""
     session = make_session()
     configure_department(session)
     mail = create_inbound_mail(
@@ -3882,9 +3886,9 @@ def test_duplicate_processing_does_not_duplicate_review_rejection():
     run_pending_jobs(session)
     session.commit()
 
-    assert session.query(OrderRequirement).filter_by(source_mail_id=mail.id).count() == 1
-    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 1
-    assert session.query(ExceptionCase).filter_by(exception_type="ReviewNeedManual").count() == 1
+    # Legacy flow disabled – no requirements or supplements should be created.
+    assert session.query(OrderRequirement).filter_by(source_mail_id=mail.id).count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="RequirementSupplementRequest").count() == 0
 
 
 def test_legacy_duplicate_requirements_do_not_duplicate_review_rejection():
@@ -3925,6 +3929,7 @@ def test_legacy_duplicate_requirements_do_not_duplicate_review_rejection():
 
 
 def test_duplicate_processing_jobs_only_execute_one_business_flow():
+    """Duplicate jobs are still deduplicated, but no tasks are created (legacy flow disabled)."""
     session = make_session()
     configure_department(session)
     mail = create_inbound_mail(
@@ -3956,9 +3961,10 @@ def test_duplicate_processing_jobs_only_execute_one_business_flow():
     assert result == {"completed": 2, "failed": 0, "total": 2}
     assert skipped.status == "Completed"
     assert skipped.version == 2
-    assert session.query(OrderRequirement).filter_by(source_mail_id=mail.id).count() == 1
-    assert session.query(ProductionTask).count() == 1
-    assert session.query(OutboundMailJob).filter_by(mail_type="TaskIssue").count() == 1
+    # Legacy flow disabled – no requirement/task/issue created.
+    assert session.query(OrderRequirement).filter_by(source_mail_id=mail.id).count() == 0
+    assert session.query(ProductionTask).count() == 0
+    assert session.query(OutboundMailJob).filter_by(mail_type="TaskIssue").count() == 0
 
 
 def test_custom_initial_review_rule_rejects_sales_order():

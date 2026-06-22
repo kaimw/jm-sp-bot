@@ -818,87 +818,174 @@ label {
   max-width: none;
 }
 
-.product-workbench-head {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.8fr) minmax(560px, 1.45fr);
-  gap: 12px;
-  align-items: stretch;
-  margin: 12px 0 10px;
-}
-
-.product-workbench-copy {
-  display: grid;
-  align-content: center;
-  gap: 4px;
-  min-height: 92px;
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(26, 39, 64, 0.04);
-}
-
-.product-workbench-copy small {
-  color: var(--accent-strong);
-  font-size: 11px;
-  font-weight: 800;
-}
-
-.product-workbench-copy h2 {
-  font-size: 21px;
-}
-
-.product-workbench-copy p {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.product-center-summary {
-  margin: 0;
-}
-
-.product-center-summary .metric {
-  min-height: 92px;
-}
-
-.product-center-summary .metric span {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.product-tabs-shell {
+/* ── 物料中心统一工具栏 ── */
+.product-page-toolbar {
   display: flex;
   gap: 12px;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 12px;
-  padding: 8px;
+  padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #ffffff;
+  background: var(--surface);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
 }
 
-.product-tabs-shell .tabs {
+.product-page-toolbar .tabs {
   margin: 0;
   border: 0;
   background: transparent;
 }
 
-.product-tabs-hint {
+.product-page-toolbar-hint {
   display: flex;
   gap: 8px;
   align-items: center;
-  min-height: 34px;
-  padding: 0 10px;
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
 }
 
-.product-tabs-hint strong {
+.product-page-toolbar-hint strong {
   color: var(--ink);
+}
+
+/* 内联指标标签 */
+.product-tab-metrics {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.metric-pill {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-soft);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.metric-pill strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.metric-pill.warn {
+  background: #fffbeb;
+  color: var(--warn);
+}
+
+.metric-pill.warn strong { color: var(--warn); }
+
+.metric-pill.danger {
+  background: #fef2f2;
+  color: var(--danger);
+}
+
+.metric-pill.danger strong { color: var(--danger); }
+
+/* 统一扁平 filter bar */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.filter-bar .inline-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+
+.filter-bar .inline-form input[type="text"] {
+  min-width: 180px;
+}
+
+.filter-bar > div {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.filter-bar .button {
+  white-space: nowrap;
+}
+
+.checkbox-inline {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* 库存 tab 专用 filter-bar */
+.inventory-filter-bar .inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.inventory-filter-bar .inline-form input,
+.inventory-filter-bar .inline-form select {
+  min-width: 120px;
+}
+
+/* ── 库存区域 ── */
+.inventory-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.inventory-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.inventory-section-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.inventory-section-head h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.inventory-section-head p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inventory-section-metrics {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .tabs {
@@ -937,115 +1024,7 @@ label {
   display: none;
 }
 
-.product-page .table-filter-bar {
-  grid-template-columns: minmax(280px, 1fr) auto;
-  margin: 0 0 10px;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 10px 24px rgba(26, 39, 64, 0.035);
-}
-
-.product-page .table-filter-bar .inline-form {
-  display: flex;
-  min-width: 0;
-  gap: 8px;
-  align-items: center;
-}
-
-.product-page .table-filter-bar input {
-  min-width: 220px;
-}
-
-.product-page .table-filter-bar > div {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.product-page .compact-metrics {
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.product-page .compact-metrics .metric {
-  min-height: 66px;
-  padding: 10px 12px;
-  border-color: var(--line);
-  background: var(--surface);
-  box-shadow: none;
-}
-
-.product-page .compact-metrics .metric::after {
-  display: none;
-}
-
-.product-page .compact-metrics .metric strong {
-  font-size: 24px;
-}
-
-.product-inventory-toolbar {
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: center;
-}
-
-.product-inventory-toolbar .inline-form {
-  display: grid !important;
-  grid-template-columns: minmax(240px, 1.6fr) minmax(150px, 0.8fr) minmax(120px, 0.6fr) minmax(150px, 0.75fr) minmax(92px, 0.45fr) auto auto;
-  gap: 8px;
-  width: 100%;
-}
-
-.product-inventory-toolbar .inline-form input,
-.product-inventory-toolbar .inline-form select {
-  width: 100%;
-  min-width: 0;
-}
-
-.inventory-split-lists {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  align-items: start;
-}
-
-.inventory-list-section {
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(26, 39, 64, 0.04);
-}
-
-.inventory-list-head {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 12px;
-  padding-top: 0;
-}
-
-.inventory-list-head h3 {
-  margin: 0;
-  font-size: 16px;
-  line-height: 1.2;
-}
-
-.inventory-list-head p {
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.product-page .inventory-list-metrics {
-  margin-bottom: 2px;
-}
+/* ── 旧 product-page 专用规则精简 ── (filter-bar / table / metrics 已由新规则覆盖) */
 
 .product-table {
   overflow: hidden;
@@ -1064,11 +1043,11 @@ label {
   max-height: min(520px, calc(100vh - 420px));
 }
 
-.inventory-list-section .product-table .list {
-  max-height: min(250px, calc(100vh - 670px));
+.inventory-section .product-table .list {
+  max-height: min(520px, calc(100vh - 430px));
 }
 
-.inventory-list-section .product-inventory-table .product-row {
+.inventory-section .product-inventory-table .product-row {
   grid-template-columns: minmax(130px, 1fr) minmax(135px, 0.95fr) minmax(105px, 0.65fr) minmax(150px, 0.9fr);
   gap: 10px;
 }
@@ -1095,11 +1074,31 @@ label {
 .product-sku-table .product-row,
 .product-pricing-table .product-row,
 .product-promotions-table .product-row {
-  grid-template-columns: minmax(240px, 1.25fr) minmax(170px, 0.9fr) minmax(160px, 0.8fr) minmax(180px, auto);
+  grid-template-columns: minmax(180px, 1.1fr) minmax(160px, 0.85fr) minmax(130px, 0.75fr) minmax(140px, 0.7fr) minmax(150px, auto);
 }
 
 .product-inventory-table .product-row {
   grid-template-columns: minmax(220px, 1.25fr) minmax(200px, 0.95fr) minmax(130px, 0.55fr) minmax(240px, 1.05fr);
+}
+
+/* 物料别名标签 */
+.alias-tag {
+  display: inline-block;
+  margin: 1px 3px 1px 0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* 英文名称 */
+.en-name {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .crm-orders-page {
@@ -2598,6 +2597,7 @@ textarea:focus {
 .chat-shell,
 .crm-sync-runs,
 .inventory-list-section,
+.inventory-section,
 .product-review-readiness,
 .product-review-panel,
 .modal-panel,
@@ -4226,23 +4226,22 @@ label,
     overflow-x: auto;
   }
 
-  .product-workbench-head,
-  .inventory-split-lists {
-    grid-template-columns: 1fr;
-  }
-
-  .product-tabs-shell {
+  .product-page-toolbar {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .product-tabs-hint {
+  .product-page-toolbar-hint {
     justify-content: flex-start;
     white-space: normal;
   }
 
-  .product-inventory-toolbar,
-  .product-inventory-toolbar .inline-form {
+  .inventory-sections {
+    grid-template-columns: 1fr;
+  }
+
+  .filter-bar,
+  .filter-bar .inline-form {
     grid-template-columns: 1fr 1fr;
   }
 
@@ -4253,7 +4252,7 @@ label,
   .product-sku-table .product-row,
   .product-pricing-table .product-row,
   .product-promotions-table .product-row {
-    grid-template-columns: minmax(220px, 1.2fr) minmax(160px, 0.8fr) minmax(150px, 0.8fr) minmax(170px, auto);
+    grid-template-columns: minmax(180px, 1fr) minmax(160px, 0.8fr) minmax(130px, 0.7fr) minmax(140px, 0.7fr) minmax(130px, auto);
   }
 
   .product-review-panel {
@@ -4429,14 +4428,14 @@ label,
     max-height: 120px;
   }
 
-  .product-page .table-filter-bar,
-  .product-page .table-filter-bar .inline-form,
-  .product-page .table-filter-bar > div {
+  .filter-bar,
+  .filter-bar .inline-form,
+  .filter-bar > div {
     display: grid;
     grid-template-columns: 1fr;
   }
 
-  .product-page .table-filter-bar input {
+  .filter-bar input {
     min-width: 0;
   }
 
@@ -4642,4 +4641,94 @@ label,
   color: var(--accent);
   background: transparent;
   padding: 0;
+}
+
+/* 优化物料中心 checkbox 布局与全局 checkbox 冲突 */
+input[type="checkbox"] {
+  width: 16px !important;
+  height: 16px !important;
+  min-height: 16px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 1px solid #d6deeb !important;
+  border-radius: 4px !important;
+  background: #ffffff !important;
+  appearance: auto !important;
+  -webkit-appearance: checkbox !important;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.table-filter-bar input[type="checkbox"] {
+  min-height: 16px !important;
+  width: 16px !important;
+  height: 16px !important;
+}
+
+/* 遮蔽敏感输入框的字符，用于 type=text 防自动填充 */
+.secure-input {
+  -webkit-text-security: disc !important;
+  text-security: disc !important;
+}
+
+/* 物料详情及实时库存弹窗美化样式 */
+.detail-grid strong {
+  color: var(--color-text-secondary);
+}
+
+.detail-grid span {
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.stock-loader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 0;
+  color: var(--muted);
+}
+
+.stock-loader .spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: stock-spin 0.8s linear infinite;
+}
+
+@keyframes stock-spin {
+  to { transform: rotate(360deg); }
+}
+
+.stock-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.stock-table th {
+  background: var(--surface-soft);
+  color: var(--color-text-secondary);
+  font-weight: 600;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.stock-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.stock-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.stock-table tbody tr:hover {
+  background-color: #f8fafc;
 }

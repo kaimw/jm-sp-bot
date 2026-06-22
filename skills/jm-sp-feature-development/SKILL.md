@@ -37,6 +37,12 @@ rg -n "<symbol or business term>" backend tests docs
 ```
 
 ## Common Edit Patterns
+### Display time
+- Persist database timestamps in UTC.
+- Every user-facing displayed time in the system must be rendered as Beijing time (`Asia/Shanghai`), including admin pages, flow cards, queue/audit pages, dashboards, emails, diagnostics, exports, and generated notification text.
+- Do not insert raw `created_at`, `updated_at`, `sent_at`, `synced_at`, `started_at`, `finished_at`, or other timestamp strings into visible UI or outbound text. Route them through the shared frontend `formatTime()` helper or backend Beijing-time helper.
+- Backend API timestamps may stay UTC/ISO for contracts, but must include timezone information or be parsed by the frontend as UTC before display.
+
 ### Add an API endpoint
 - Add request/response schema in `schemas.py` when structured input is needed.
 - Implement orchestration in `main.py`.
@@ -89,4 +95,3 @@ curl -s http://127.0.0.1:8000/api/config
 - List tested commands.
 - Identify any behavior requiring runtime secrets or real mailbox access.
 - Call out residual risks, especially real email delivery or model connectivity.
-

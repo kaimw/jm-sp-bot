@@ -112,8 +112,10 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "initial_review_enabled", "true", is_secret=False)
     ensure_config(session, "initial_review_required_fields_json", dumps(["customer_name", "product_summary", "quantity_text", "expected_delivery_date"]), is_secret=False)
     ensure_config(session, "initial_review_rules_json", "[]", is_secret=False)
+    ensure_config(session, "v2_review_rule_states_json", "{}", is_secret=False)
     ensure_config(session, "bot_enabled", "true", is_secret=False)
     ensure_config(session, "llm_fallback_enabled", "true", is_secret=False)
+    ensure_config(session, "crm_attachment_llm_allow_external_sensitive", "false", is_secret=False)
     ensure_config(session, "conversation_max_rounds", "3", is_secret=False)
     ensure_config(session, "outbound_failed_alert_threshold", "1", is_secret=False)
     ensure_config(session, "outbound_pending_age_alert_seconds", "3600", is_secret=False)
@@ -159,6 +161,7 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "v2_crm_phase1_scope_enabled", "true", is_secret=False)
     ensure_config(session, "v2_crm_phase1_scope_json", dumps({
         "approved_values": ["approved", "审批通过", "已审批", "已通过", "complete", "completed", "passed"],
+        "approved_life_status_values": ["normal", "正常", "active"],
         "cancelled_values": ["cancelled", "canceled", "撤销", "已撤销", "作废", "已作废", "取消", "已取消"],
         "include_owner_departments": [],
         "include_settlement_methods": [],
@@ -169,6 +172,9 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "oms_auto_confirm_delivery_notice", "false", is_secret=False)
     ensure_config(session, "oms_inventory_review_enabled", "true", is_secret=False)
     upsert_config(session, "oms_inventory_missing_blocks", "true", is_secret=False)
+    ensure_config(session, "oms_material_sync_enabled", "true", is_secret=False)
+    ensure_config(session, "oms_material_sync_interval_seconds", "86400", is_secret=False)
+    ensure_config(session, "oms_material_last_sync_at", "", is_secret=False)
     ensure_config(session, "v2_review_crm_approved_values", dumps(["approved", "审批通过", "已审批", "已通过", "complete", "completed", "passed"]), is_secret=False)
     ensure_config(session, "v2_review_require_key_attachment", "true", is_secret=False)
     ensure_config(session, "v2_review_customer_mapping_required", "true", is_secret=False)

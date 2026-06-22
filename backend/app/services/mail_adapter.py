@@ -830,6 +830,41 @@ def send_outbound_jobs_with_account(
                 _clear_outbound_lock(job)
                 add_audit(session, "OutboundMailSent", "OutboundMailJob", job.id, {"recipients": recipients, "mail_type": job.mail_type})
                 sent_ids.add(job.id)
+                if job.mail_type == "V2ValidationFailed":
+                    from sqlalchemy import or_
+                    from backend.app.models import ExceptionCase, AuditEvent
+                    
+                    match = re.search(r"\[订单预审未通过\]\[(.*?)\]", job.subject)
+                    if match:
+                        order_no = match.group(1).strip()
+                        if order_no:
+                            cases = (
+                                session.query(ExceptionCase)
+                                .filter(
+                                    ExceptionCase.exception_type == "VALIDATION_BLOCKED",
+                                    ExceptionCase.status == "Open",
+                                    or_(
+                                        ExceptionCase.detail.like(f'%"order_no":"{order_no}"%'),
+                                        ExceptionCase.detail.like(f'%"crm_order_no":"{order_no}"%')
+                                    )
+                                )
+                                .all()
+                            )
+                            for case in cases:
+                                case.status = "Resolved"
+                                case.resolved_at = sent_at
+                                case.last_actor = "system"
+                                case.resolution_note = "预审不通过且已成功发送通知邮件，自动标记为已解决"
+                                session.add(
+                                    AuditEvent(
+                                        event_type="ExceptionResolved",
+                                        actor="system",
+                                        related_object_type="ExceptionCase",
+                                        related_object_id=case.id,
+                                        detail=dumps({"note": case.resolution_note}),
+                                        created_at=sent_at
+                                    )
+                                )
                 generated_followups = [
                     enqueue_sales_reply_reissue_receipt(session, job),
                     enqueue_requirement_supplement_receipt(session, job),

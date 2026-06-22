@@ -89,6 +89,7 @@ CRM_ORDER_1 = {
     "customer_id": "cust_001",
     "sales_user_name": "张三",
     "sales_user_id": "sales_001",
+    "sales_user_email": "zhangsan@example.com",
     "owner_department": "商务一部",
     "life_status": "normal",
     "approval_status": "approved",
@@ -119,6 +120,7 @@ CRM_ORDER_ECOMMERCE = {
     "customer_id": "cust_amazon_us",
     "sales_user_name": "王五",
     "sales_user_id": "sales_002",
+    "sales_user_email": "wangwu@example.com",
     "owner_department": "海外渠道部",
     "life_status": "normal",
     "approval_status": "approved",
@@ -169,6 +171,7 @@ CRM_ORDER_FBA = {
     "customer_id": "cust_amazon_us",
     "sales_user_name": "赵六",
     "sales_user_id": "sales_003",
+    "sales_user_email": "zhaoliu@example.com",
     "owner_department": "海外渠道部",
     "life_status": "normal",
     "approval_status": "approved",
@@ -183,7 +186,7 @@ CRM_ORDER_FBA = {
     "receipt_phone": "+1-206-555-0100",
     "receipt_address": "333 7th Ave, Suite 200, Seattle, WA 98101, USA",
     "delivery_date": "2026-06-20",
-    "attachment_files": "FBA-Shipping-Plan.pdf; 采购订单-FBA.pdf",
+    "attachment_files": "FBA-Shipping-Plan.pdf; 盖章采购订单-FBA.pdf",
     "fulfillment_type": "FBA",
     "channel_code": "amazon_us",
     "shop_code": "AMZ-US-01",
@@ -226,7 +229,7 @@ def main():
     set_config(session, "bot_signature", "积木易搭AI机器人（测试）")
 
     # 种子 SKU 主数据
-    spu = ProductSPU(spu_id="SPU-3D-SCANNER", name="3D Scanner")
+    spu = ProductSPU(spu_id="SPU-3D-SCANNER", name="3D Scanner", category="成品")
     session.add(spu)
     session.flush()
 

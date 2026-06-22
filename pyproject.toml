@@ -17,6 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.4.0"]
+ocr = [
+  "paddleocr>=2.7.0",
+  "pymupdf>=1.23.0",
+  "pillow>=10.0.0"
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -19,6 +19,7 @@ from backend.app.services.rules import (
     OrderContext,
     OrderValidationRule,
     ValidationResult,
+    is_review_rule_enabled,
     register_rule,
     remove_rule,
 )
@@ -37,6 +38,7 @@ from backend.app.services.crm_attachment_extraction import enrich_order_from_reg
 from backend.app.services.exception_diagnosis import enqueue_exception_diagnosis
 from backend.app.services.address_quality import is_detailed_receipt_address
 from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
+from backend.app.services.products import match_sku_by_product_name
 from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.storage import save_attachment
 from backend.app.services.task_scheduler import RetryPolicy, next_retry_at
@@ -382,6 +384,8 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         )
 
     order = upsert_middle_platform_order(session, crm_order)
+    if force_revalidate:
+        reset_order_for_force_revalidate(session, order, trace_id=trace_id)
     if order.status == OrderStatus.CRM_APPROVED.value:
         transition_order(session, order, OrderEvent.ORDER_SNAPSHOT_FETCHED, trace_id=trace_id)
     if order.status in {OrderStatus.IMPORTED.value, OrderStatus.VALIDATION_BLOCKED.value}:
@@ -389,10 +393,10 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         transition_order(session, order, event, trace_id=trace_id)
         validation_results = run_validation_chain(session, order)
         order.validation_summary_json = dumps({"results": [result.as_dict() for result in validation_results]})
-        critical = next((result for result in validation_results if result.blocker_level == BlockerLevel.CRITICAL), None)
-        if critical is not None:
+        blocking_failure = next((result for result in validation_results if not result.passed), None)
+        if blocking_failure is not None:
             failed_codes = [result.rule_code for result in validation_results if not result.passed]
-            transition_order(session, order, OrderEvent.RULES_FAILED_CRITICAL, trace_id=trace_id, detail={"rule_code": critical.rule_code, "failed_rule_codes": failed_codes})
+            transition_order(session, order, OrderEvent.RULES_FAILED_CRITICAL, trace_id=trace_id, detail={"rule_code": blocking_failure.rule_code, "failed_rule_codes": failed_codes})
             exception_case = create_exception_case(session, order, ExceptionType.VALIDATION_BLOCKED, "High", validation_blocker_summary(validation_results), validation_results, trace_id=trace_id)
             enqueue_validation_failure_notification(session, order, validation_results, exception_case, trace_id=trace_id)
             return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "validation_passed": False}
@@ -412,6 +416,26 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         if config_bool(session, "oms_auto_confirm_delivery_notice", False):
             confirm_delivery_notice(session, notice, confirmed_by="auto", trace_id=trace_id)
     return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "validation_passed": order.status != OrderStatus.VALIDATION_BLOCKED.value}
+
+
+def reset_order_for_force_revalidate(session: Session, order: MiddlePlatformOrder, *, trace_id: str = "") -> bool:
+    if order.status not in {OrderStatus.VALIDATED.value, OrderStatus.DELIVERY_NOTICE_READY.value}:
+        return False
+    old_status = order.status
+    expired_notices = expire_delivery_notices(session, order, reason="force_revalidate_before_oms_push")
+    cancel_oms_push_jobs(session, order, reason="force_revalidate_before_oms_push")
+    order.status = OrderStatus.IMPORTED.value
+    order.validated_at = None
+    order.updated_at = now_utc()
+    session.add(
+        AuditEvent(
+            event_type="OrderForceRevalidateReset",
+            related_object_type="MiddlePlatformOrder",
+            related_object_id=order.id,
+            detail=dumps({"from_status": old_status, "to_status": order.status, "expired_notices": expired_notices, "trace_id": trace_id}),
+        )
+    )
+    return True
 
 
 def handle_crm_snapshot_changed(
@@ -718,7 +742,7 @@ def sync_middle_order_items(session: Session, order: MiddlePlatformOrder, crm_or
     source_items = list(crm_order.items)
     if not source_items:
         raw = loads(crm_order.raw_json, {})
-        raw_items = raw.get("items") or raw.get("order_items") or []
+        raw_items = raw.get("order_items") or raw.get("items") or []
         if isinstance(raw_items, list):
             item_payloads = apportioned_order_item_payloads(raw, [item for item in raw_items if isinstance(item, dict)])
             for index, raw_item in enumerate(item_payloads):
@@ -844,25 +868,34 @@ def standard_sku_code_for_item(session: Session, order: MiddlePlatformOrder, ite
     if direct:
         return direct
     shop_sku = raw_text_from_keys(item, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"])
-    if not shop_sku:
-        return None
-    channel_candidates = [order.channel_code, order.shop_code, "default", None]
-    for channel in channel_candidates:
-        query = session.query(ChannelPricing).join(ProductSKU, ProductSKU.id == ChannelPricing.sku_uuid).filter(
-            ChannelPricing.channel_sku_id == shop_sku,
-            ProductSKU.status == "Active",
-        )
-        if channel:
-            query = query.filter(ChannelPricing.channel == channel)
-        row = query.order_by(ChannelPricing.updated_at.desc()).first()
-        if row and row.sku and row.sku.sku_id:
-            item["sku_mapping"] = {
-                "source": "channel_pricing",
-                "shop_sku_code": shop_sku,
-                "channel": row.channel,
-                "standard_sku_code": row.sku.sku_id,
-            }
-            return row.sku.sku_id
+    if shop_sku:
+        channel_candidates = [order.channel_code, order.shop_code, "default", None]
+        for channel in channel_candidates:
+            query = session.query(ChannelPricing).join(ProductSKU, ProductSKU.id == ChannelPricing.sku_uuid).filter(
+                ChannelPricing.channel_sku_id == shop_sku,
+                ProductSKU.status == "Active",
+            )
+            if channel:
+                query = query.filter(ChannelPricing.channel == channel)
+            row = query.order_by(ChannelPricing.updated_at.desc()).first()
+            if row and row.sku and row.sku.sku_id:
+                item["sku_mapping"] = {
+                    "source": "channel_pricing",
+                    "shop_sku_code": shop_sku,
+                    "channel": row.channel,
+                    "standard_sku_code": row.sku.sku_id,
+                }
+                return row.sku.sku_id
+    product_name = raw_text_from_keys(item, ["product_name", "name", "productName", "产品名称", "商品名称"])
+    if product_name:
+        match = match_sku_by_product_name(session, product_name)
+        item["sku_mapping"] = {
+            "source": "product_name_semantic",
+            "product_name": product_name,
+            **match,
+        }
+        if match.get("matched") and match.get("sku_id"):
+            return str(match["sku_id"])
     return shop_sku
 
 
@@ -873,6 +906,8 @@ def run_validation_chain(session: Session, order: MiddlePlatformOrder, rules: li
     context = OrderContext(order=order, crm_order=crm_order, items=list(order.items), session=session)
     results: list[ValidationResult] = []
     for rule in rules or DEFAULT_RULES:
+        if rules is None and not is_review_rule_enabled(session, rule.get_rule_code()):
+            continue
         if not rule.supports(context):
             continue
         result = rule.validate(context)

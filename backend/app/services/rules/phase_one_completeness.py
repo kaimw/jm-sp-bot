@@ -64,7 +64,6 @@ class PhaseOneCompletenessRule:
             attachments = []
 
         required = [
-            ("approval_status", "CRM 审批状态"),
             ("sales_user_name", "销售负责人"),
             ("sales_user_email", "销售邮箱"),
             ("owner_department", "归属部门"),

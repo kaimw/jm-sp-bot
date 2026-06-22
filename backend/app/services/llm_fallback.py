@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from ipaddress import ip_address, ip_network
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -42,6 +44,44 @@ def active_model_config(session: Session) -> ModelProviderConfig | None:
 
 def model_ready(session: Session, config: ModelProviderConfig | None) -> bool:
     return bool(config is not None and resolve_api_key(session, config))
+
+
+def config_bool(session: Session, key: str, default: bool = False) -> bool:
+    row = session.get(SystemConfig, key)
+    if row is None or row.value is None:
+        return default
+    return str(row.value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def model_endpoint_is_private(config: ModelProviderConfig | None) -> bool:
+    if config is None:
+        return False
+    endpoint = str(config.api_base or "").strip()
+    if not endpoint:
+        return False
+    parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        addr = ip_address(host)
+    except ValueError:
+        return host.endswith(".local") or host.endswith(".internal") or host.endswith(".lan")
+    if addr.is_loopback or addr.is_private or addr.is_link_local:
+        return True
+    private_ranges = [
+        ip_network("10.0.0.0/8"),
+        ip_network("172.16.0.0/12"),
+        ip_network("192.168.0.0/16"),
+        ip_network("100.64.0.0/10"),
+    ]
+    return any(addr in network for network in private_ranges)
+
+
+def sensitive_llm_allowed(session: Session, config: ModelProviderConfig | None, *, config_key: str) -> bool:
+    if model_endpoint_is_private(config):
+        return True
+    return config_bool(session, config_key, False)
 
 
 def parse_json_object(text: str) -> dict:

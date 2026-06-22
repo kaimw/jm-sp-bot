@@ -3554,7 +3554,14 @@ def apply_rule_classification_refresh(session: Session, mail: MailMessage, sourc
 
 def handle_classified_mail(session: Session, mail: MailMessage) -> object | None:
     if mail.classification == "SalesOrderRequirement":
-        return create_task_from_mail(session, mail)
+        add_audit(
+            session,
+            "LegacyMailOrderCreationIgnored",
+            "MailMessage",
+            mail.id,
+            {"classification": mail.classification, "reason": "订单流已迁移至 CRM/OMS 驱动，不再通过邮件自动建单。"},
+        )
+        return None
     if find_requirement_for_supplement_reply(session, mail) is not None:
         return handle_requirement_supplement_reply(session, mail)
 
@@ -3654,7 +3661,14 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
     if find_requirement_for_supplement_reply(session, mail) is not None:
         return handle_requirement_supplement_reply(session, mail)
     if mail.classification == "SalesOrderRequirement":
-        return create_task_from_mail(session, mail)
+        add_audit(
+            session,
+            "LegacyMailOrderCreationIgnored",
+            "MailMessage",
+            mail.id,
+            {"classification": mail.classification, "reason": "订单流已迁移至 CRM/OMS 驱动，不再通过邮件自动建单。"},
+        )
+        return None
     if mail.classification in {"NonTarget", "BounceOrAutoReply"}:
         if mail.classification == "NonTarget" and (mail.from_address or "").lower() in production_department_addresses(session):
             task = find_task_for_mail(session, mail)

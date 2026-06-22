@@ -1,6 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const hiddenPages = new Set(["orders", "templates"]);
 let initialReviewState = { enabled: true, required_fields: [], rules: [], field_options: [], operator_options: [] };
+let v2ReviewRulesState = { rules: [] };
 let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, readonly: false };
 let productionDepartmentState = { items: [] };
 let logisticsDepartmentState = { items: [] };
@@ -44,7 +45,7 @@ const tableStates = {
   backups: { q: "", status: "", backup_type: "", page: 1, page_size: 10 },
   reviewRules: { q: "", status: "", page: 1, page_size: 10 },
   productsSpu: { q: "", page: 1, page_size: 10 },
-  productsSku: { q: "", page: 1, page_size: 10 },
+  productsSku: { q: "", crm_semantic: false, page: 1, page_size: 10 },
   productsInventory: { q: "", warehouse_code: "", low_stock_only: "", measure_type: "countable", inventory_scope: "non_finished", threshold: "1", page: 1, page_size: 20 },
   productsFinishedInventory: { q: "", warehouse_code: "", low_stock_only: "", countable_only: "false", measure_type: "", inventory_scope: "finished", threshold: "1", page: 1, page_size: 20 },
   productsPricing: { q: "", page: 1, page_size: 10 },
@@ -54,8 +55,12 @@ const tableStates = {
 
 async function api(path, options = {}) {
   const { skipAuthRedirect, headers, ...fetchOptions } = options;
+  const mergedHeaders = { "Content-Type": "application/json", ...(headers || {}) };
+  if (headers && "Content-Type" in headers && headers["Content-Type"] === undefined) {
+    delete mergedHeaders["Content-Type"];
+  }
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(headers || {}) },
+    headers: mergedHeaders,
     credentials: "same-origin",
     ...fetchOptions,
   });
@@ -388,6 +393,10 @@ function setActivePage(pageName = currentPageName()) {
 
   if (pageName === "skill-lab" || pageName === "self-maintenance") {
     refreshSkills();
+  }
+  // 进入物料中心时自动刷新列表
+  if (pageName === "products") {
+    refreshProductsSku();
   }
 }
 
@@ -1396,27 +1405,29 @@ function reviewOperatorLabel(operator) {
 function renderInitialReviewRules() {
   const fieldSelect = $("#initial-review-rule-form [name=field]");
   const operatorSelect = $("#initial-review-rule-form [name=operator]");
-  if (!fieldSelect || !operatorSelect) return;
-  fieldSelect.innerHTML = (initialReviewState.field_options || [])
-    .map((field) => `<option value="${h(field.key)}">${h(field.label)}</option>`)
-    .join("");
-  operatorSelect.innerHTML = (initialReviewState.operator_options || [])
-    .map((operator) => `<option value="${h(operator.key)}">${h(operator.label)}</option>`)
-    .join("");
+  if (fieldSelect && operatorSelect) {
+    fieldSelect.innerHTML = (initialReviewState.field_options || [])
+      .map((field) => `<option value="${h(field.key)}">${h(field.label)}</option>`)
+      .join("");
+    operatorSelect.innerHTML = (initialReviewState.operator_options || [])
+      .map((operator) => `<option value="${h(operator.key)}">${h(operator.label)}</option>`)
+      .join("");
+  }
+  const openButton = $("#initial-review-rule-open");
+  if (openButton) openButton.hidden = true;
 
   const q = tableStates.reviewRules.q.trim().toLowerCase();
   const status = tableStates.reviewRules.status;
-  const filteredRules = (initialReviewState.rules || []).filter((rule) => {
+  const filteredRules = (v2ReviewRulesState.rules || []).filter((rule) => {
     const enabled = rule.enabled !== false;
     if (status === "enabled" && !enabled) return false;
     if (status === "disabled" && enabled) return false;
     if (!q) return true;
     const haystack = [
       rule.name,
-      optionLabel(initialReviewState.field_options || [], rule.field),
-      reviewOperatorLabel(rule.operator),
-      rule.value,
-      rule.message,
+      rule.code,
+      rule.description,
+      rule.default_blocker_level,
       enabled ? "启用" : "停用",
     ].join(" ").toLowerCase();
     return haystack.includes(q);
@@ -1429,25 +1440,36 @@ function renderInitialReviewRules() {
         <div class="review-rule-row">
           <div class="review-rule-main">
             <strong>${h(rule.name || "未命名规则")}</strong>
-            <span class="status-pill ${rule.enabled === false ? "is-muted" : "is-active"}">${h(reviewRuleStatusText(rule))}</span>
+            <span class="status-pill ${rule.enabled === false ? "is-muted" : "is-active"}">${rule.enabled === false ? "停用" : "启用"}</span>
           </div>
-          <div class="review-rule-field"><small>字段 / 判断</small><span>${h(optionLabel(initialReviewState.field_options || [], rule.field))} · ${h(reviewOperatorLabel(rule.operator))}</span></div>
-          <div class="review-rule-value"><small>规则值</small><span>${h(rule.value || "无")}</span></div>
-          <div class="review-rule-message"><small>未通过原因</small><span>${h(rule.message || "未填写未通过原因")}</span></div>
+          <div class="review-rule-field"><small>规则编码</small><span>${h(rule.code || "")}</span></div>
+          <div class="review-rule-value"><small>默认等级</small><span>${h(rule.default_blocker_level || "按规则结果")}</span></div>
+          <div class="review-rule-message"><small>规则说明</small><span>${h(rule.description || "")}</span></div>
           <div class="actions row-actions review-rule-actions">
-              ${
-                isReadonlyReviewRule(rule)
-                  ? `<span class="status-pill">系统内置 · 只读</span>`
-                  : `
-                    <button class="button ghost" data-action="toggle-review-rule" data-id="${h(rule.id)}">${rule.enabled === false ? "启用" : "停用"}</button>
-                    <button class="button warn" data-action="delete-review-rule" data-id="${h(rule.id)}">删除</button>
-                  `
-              }
+            <button class="button ghost" data-action="toggle-v2-review-rule" data-code="${h(rule.code)}">${rule.enabled === false ? "启用" : "停用"}</button>
           </div>
         </div>`
       )
-      .join("") || `<div class="empty-note">暂无自定义规则，当前仅执行必填项和内置风险初审。</div>`;
+      .join("") || `<div class="empty-note">暂无当前生效的订单预审规则。</div>`;
   renderListPagination("#initial-review-rules-pagination", "reviewRules", pageData);
+}
+
+async function refreshV2ReviewRules() {
+  v2ReviewRulesState = await api("/api/v2-review/rules");
+  renderInitialReviewRules();
+}
+
+async function saveV2ReviewRules() {
+  v2ReviewRulesState = await api("/api/v2-review/rules", {
+    method: "PUT",
+    body: JSON.stringify({
+      rules: (v2ReviewRulesState.rules || []).map((rule) => ({
+        code: rule.code,
+        enabled: rule.enabled !== false,
+      })),
+    }),
+  });
+  renderInitialReviewRules();
 }
 
 async function refreshInitialReviewRules() {
@@ -2078,7 +2100,7 @@ function renderWorkflowRules() {
             <div><small>状态</small><br />${h(row.status)}</div>
             <div><small>收件人</small><br />${h(toNames.join(", ") || "未配置")}<br /><small>专属初审规则 ${h(enabledReviewRules.length)}/${h(reviewRules.length)}</small></div>
             <div>
-              <small>${h(isBuiltin ? "内置默认流程（只读）" : row.approved_at || row.created_at || "")}</small>
+              <small>${h(isBuiltin ? "内置默认流程（只读）" : formatTime(row.approved_at || row.created_at))}</small>
               <div class="actions row-actions">
                 <button class="button ghost" data-action="view-workflow-version" data-id="${h(row.version_id)}">查看规则</button>
                 <button class="button ghost" data-action="diff-workflow-version" data-id="${h(row.version_id)}">版本差异</button>
@@ -2280,7 +2302,7 @@ async function refreshJobs() {
           <div><strong>${h(row.job_type)}</strong><br /><small>${h(row.id)}</small></div>
           <div><small>状态</small><br />${h(row.status)}</div>
           <div><small>尝试 / 版本</small><br />${h(row.attempt_count)} / V${h(row.version ?? 0)}</div>
-          <div><small>${h(row.error_message || row.created_at)}</small></div>
+          <div><small>${h(row.error_message || formatTime(row.created_at))}</small></div>
         </div>`
       )
       .join("") || `<div class="row"><div>暂无入库队列任务</div></div>`;
@@ -2802,7 +2824,7 @@ async function refreshOps() {
         <div class="row">
           <div><strong>${h(row.event_type)}</strong><br /><small>${h(row.actor)}</small></div>
           <div><small>${h(row.related_object_type)}</small><br />${h(row.related_object_id)}</div>
-          <div><small>${h(row.created_at)}</small></div>
+          <div><small>${h(formatTime(row.created_at))}</small></div>
           <div><small>${h(JSON.stringify(row.detail).slice(0, 160))}</small></div>
         </div>`
       )
@@ -2815,7 +2837,7 @@ async function refreshOps() {
         <div class="row">
           <div><strong>${h(row.backup_type)}</strong><br /><small>${h(row.id)}</small></div>
           <div><small>状态</small><br />${h(row.status)}</div>
-          <div><small>${h(row.created_at)}</small></div>
+          <div><small>${h(formatTime(row.created_at))}</small></div>
           <div><small>${h(row.storage_ref)}</small></div>
         </div>`
       )
@@ -3040,7 +3062,7 @@ function renderExceptionContextPanel(data = {}) {
     <div class="exception-context-grid">
       <section>
         <h3>队列</h3>
-        ${jobs.slice(0, 6).map((job) => `<p><strong>${h(job.job_type)}</strong> · ${h(job.status)}<br /><small>${h(job.error_message || job.created_at || "")}</small></p>`).join("") || `<p class="muted-line">暂无关联队列</p>`}
+        ${jobs.slice(0, 6).map((job) => `<p><strong>${h(job.job_type)}</strong> · ${h(job.status)}<br /><small>${h(job.error_message || formatTime(job.created_at) || "")}</small></p>`).join("") || `<p class="muted-line">暂无关联队列</p>`}
       </section>
       <section>
         <h3>审计</h3>
@@ -3069,7 +3091,16 @@ async function openExceptionContext(id) {
 
 function formatTime(value) {
   if (!value) return "";
-  const date = new Date(value);
+  let normalized = value;
+  if (typeof value === "string") {
+    const text = value.trim();
+    const looksLikeDateTime = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(text);
+    const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(text);
+    if (looksLikeDateTime && !hasTimezone) {
+      normalized = `${text.replace(" ", "T")}Z`;
+    }
+  }
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
 }
@@ -3336,6 +3367,7 @@ async function refreshAll() {
     refreshOutbound(),
     refreshExceptions(),
     refreshInitialReviewRules(),
+    refreshV2ReviewRules(),
     refreshWorkflowRules(),
     refreshConfig(),
     refreshWeeklyReportRecipients(),
@@ -3397,7 +3429,7 @@ const tableRefreshers = {
   attachments: refreshAttachments,
   audit: refreshOps,
   backups: refreshOps,
-  reviewRules: async () => renderInitialReviewRules(),
+  reviewRules: refreshV2ReviewRules,
   productsSpu: refreshProductsSpu,
   productsSku: refreshProductsSku,
   productsPricing: refreshProductsPricing,
@@ -3677,6 +3709,15 @@ $("#initial-review-rule-form").addEventListener("submit", async (event) => {
 $("#initial-review-rules-list").addEventListener("click", async (event) => {
   const target = event.target.closest("button");
   if (!target) return;
+  if (target.dataset.action === "toggle-v2-review-rule") {
+    const code = target.dataset.code;
+    v2ReviewRulesState.rules = (v2ReviewRulesState.rules || []).map((rule) =>
+      rule.code === code ? { ...rule, enabled: rule.enabled === false } : rule
+    );
+    await saveV2ReviewRules();
+    toast("订单预审规则已更新");
+    return;
+  }
   const id = target.dataset.id;
   if (target.dataset.action === "delete-review-rule") {
     if ((initialReviewState.rules || []).some((rule) => String(rule.id || "") === id && isReadonlyReviewRule(rule))) {
@@ -4025,6 +4066,7 @@ $("#runtime-mail-form").addEventListener("submit", async (event) => {
     return;
   }
   values.llm_fallback_enabled = $("#runtime-mail-form [name=llm_fallback_enabled]").checked;
+  values.crm_attachment_llm_allow_external_sensitive = $("#runtime-mail-form [name=crm_attachment_llm_allow_external_sensitive]").checked;
   try {
     await api("/api/config/mail", {
       method: "PUT",
@@ -5043,23 +5085,17 @@ function productPayloadTotal(data, rows = []) {
 }
 
 function renderProductCenterSummary() {
-  const node = $("#product-center-summary");
+  const node = $("#product-tab-metrics");
   if (!node) return;
-  const value = (item) => item === null || item === undefined ? "-" : item;
-  const lowStock =
-    productCenterState.materialLowStock === null && productCenterState.finishedLowStock === null
-      ? null
-      : Number(productCenterState.materialLowStock || 0) + Number(productCenterState.finishedLowStock || 0);
-  const zeroStock =
-    productCenterState.materialZeroStock === null && productCenterState.finishedZeroStock === null
-      ? null
-      : Number(productCenterState.materialZeroStock || 0) + Number(productCenterState.finishedZeroStock || 0);
-  node.innerHTML = `
-    <div class="metric"><small>成品 SPU</small><strong>${h(value(productCenterState.spu))}</strong><span>商品主档</span></div>
-    <div class="metric"><small>存货 SKU</small><strong>${h(value(productCenterState.sku))}</strong><span>履约粒度</span></div>
-    <div class="metric ${Number(lowStock || 0) ? "warn" : ""}"><small>库存预警</small><strong>${h(value(lowStock))}</strong><span>低库存记录</span></div>
-    <div class="metric ${Number(zeroStock || 0) ? "danger" : ""}"><small>零库存</small><strong>${h(value(zeroStock))}</strong><span>阻断风险</span></div>
-  `;
+  const v = (item) => item === null || item === undefined ? 0 : Number(item) || 0;
+  const sku = v(productCenterState.sku);
+  const low = v(productCenterState.materialLowStock) + v(productCenterState.finishedLowStock);
+  const zero = v(productCenterState.materialZeroStock) + v(productCenterState.finishedZeroStock);
+  node.innerHTML = [
+    `<span class="metric-pill"><strong>${h(sku)}</strong> SKU</span>`,
+    low ? `<span class="metric-pill warn"><strong>${h(low)}</strong> 低库存</span>` : "",
+    zero ? `<span class="metric-pill danger"><strong>${h(zero)}</strong> 零库存</span>` : "",
+  ].filter(Boolean).join("");
 }
 
 async function refreshProductsSpu() {
@@ -5425,20 +5461,33 @@ $("#products-review-readiness-refresh")?.addEventListener("click", async () => {
   await guardedAction(["物料中心", "刷新预审体检"], async () => refreshProductReviewReadiness());
 });
 
-$("#sync-erp-materials")?.addEventListener("click", async (event) => {
+$("#sync-oms-materials")?.addEventListener("click", async (event) => {
   const button = event.currentTarget;
-  const resultNode = $("#erp-material-sync-result");
   button.disabled = true;
-  resultNode.classList.add("show");
-  resultNode.textContent = "正在从 ERP 同步物料...";
+  toast("正在从 OMS 同步物料，请稍候...");
   try {
-    const result = await api("/api/products/erp-sync", { method: "POST" });
-    resultNode.textContent = JSON.stringify(result, null, 2);
-    toast(result.ok ? `ERP 物料同步完成：${result.total || 0} 条` : "ERP 物料同步未执行");
-    await Promise.all([refreshProductsSpu(), refreshProductsSku()]);
+    const result = await api("/api/products/oms-sync", { method: "POST" });
+    if (result.ok) {
+      let msg = `OMS 物料同步完成：${result.total || 0} 条`;
+      if (result._debug) {
+        const dbg = result._debug;
+        if (dbg.first_row_keys) msg += ` | OMS 字段: ${dbg.first_row_keys.slice(0, 8).join(', ')}`;
+        if (dbg.data_block_keys) msg += ` | data keys: ${dbg.data_block_keys.join(', ')}`;
+      }
+      toast(msg);
+      if (result._debug) {
+        const debugNode = $("#oms-sync-debug");
+        if (debugNode) {
+          debugNode.textContent = JSON.stringify(result._debug, null, 2);
+          debugNode.classList.add("show");
+        }
+      }
+    } else {
+      toast(result.skipped || "OMS 物料同步未执行");
+    }
+    await refreshProductsSku();
   } catch (error) {
-    notifyError(error, ["物料中心", "ERP 物料同步失败"]);
-    resultNode.textContent = messageFromError(error);
+    notifyError(error, ["物料中心", "OMS 物料同步失败"]);
   } finally {
     button.disabled = false;
   }
@@ -5448,16 +5497,49 @@ async function refreshProductsSku() {
   const data = await api(`/api/products/sku?${queryFromState(tableStates.productsSku)}`);
   const rows = data.items || [];
   cacheProductSkuRows(rows);
+
+  // 伪装 SPU 数据缓存，以复用原别名编辑器
+  rows.forEach(row => {
+    if (row.spu_uuid) {
+      const fakeSpu = {
+        id: row.spu_uuid,
+        spu_id: row.spu_id || "",
+        name: row.spu_name || "",
+        brand: row.brand || "",
+        category: row.category || "",
+        review_aliases: row.review_aliases || []
+      };
+      window._productSpuRows = window._productSpuRows || {};
+      window._productSpuRows[row.spu_uuid] = fakeSpu;
+      window._productSpuRowsByCode = window._productSpuRowsByCode || {};
+      window._productSpuRowsByCode[productLookupKey(row.spu_id)] = fakeSpu;
+    }
+  });
+
   productCenterState.sku = productPayloadTotal(data, rows);
   renderProductCenterSummary();
-  $("#products-sku-list").innerHTML = rows.map(row => `
+  $("#products-sku-list").innerHTML = rows.map(row => {
+    let attrs = row.attributes || {};
+    if (typeof attrs === "string") {
+      try { attrs = JSON.parse(attrs); } catch (_) { attrs = {}; }
+    }
+    const enName = attrs.oms_en_name || "";
+    const aliases = row.review_aliases || [];
+    const model = row.model || "-";
+    const brand = row.brand || "-";
+    return `
     <div class="row product-row">
-      <div><strong>${h(row.sku_id)}</strong><br /><small>${h(JSON.stringify(row.attributes))}</small></div>
-      <div><a href="#" class="link" data-action="goto-spu" data-spu="${h(row.spu_id)}">${h(row.spu_id)}</a><br /><small>${h(row.spu_name || "")}</small></div>
-      <div><small>${h(row.status)}</small><br /><a href="#" class="link" data-action="quick-new-pricing" data-sku-uuid="${h(row.id)}" data-sku-id="${h(row.sku_id)}">配置价格</a></div>
-      <div><small>${h(formatTime(row.created_at))}</small></div>
+      <div><strong>${h(row.spu_name || row.sku_id)}</strong><br /><small><a href="#" class="link" data-action="view-product-detail" data-sku-id="${h(row.sku_id)}">${h(row.sku_id)}</a></small></div>
+      <div>${enName ? h(enName) : `<small>-</small>`}</div>
+      <div>${aliases.length ? aliases.map(a => `<span class="alias-tag">${h(a)}</span>`).join("") : `<small>-</small>`}</div>
+      <div><small>${h(model)} · ${h(brand)}</small></div>
+      <div>
+        <a href="#" class="link" data-action="edit-product-aliases" data-id="${h(row.spu_uuid)}">别名</a> |
+        <a href="#" class="link" data-action="quick-new-pricing" data-sku-uuid="${h(row.id)}" data-sku-id="${h(row.sku_id)}">价格</a> |
+        <a href="#" class="link" data-action="view-product-detail" data-sku-id="${h(row.sku_id)}">详情</a>
+      </div>
     </div>
-  `).join("") || `<div class="row product-row product-empty-row"><div>暂无 SKU 数据</div></div>`;
+  `}).join("") || `<div class="row product-row product-empty-row"><div>暂无物料数据</div></div>`;
   renderListPagination("#products-sku-pagination", "productsSku", data);
 }
 
@@ -5539,30 +5621,86 @@ function renderInventoryTypeRows(listSelector, rows, emptyText, tableKey, itemLa
 }
 
 async function refreshProductsInventory() {
-  syncFinishedInventoryFilters();
-  const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsInventory)}`);
-  const rows = data.items || [];
-  const summary = data.summary || {};
-  productCenterState.materialLowStock = Number(summary.low_stock_count || 0);
-  productCenterState.materialZeroStock = Number(summary.zero_stock_count || 0);
-  renderProductCenterSummary();
-  renderInventorySummary("#products-inventory-summary", summary, `${inventoryMeasureLabel(summary.measure_type)}合计`);
-  renderInventoryTypeRows("#products-inventory-list", rows, "暂无非成品库存数据，请先同步 ERP 库存", "productsInventory", "物料");
-  renderListPagination("#products-inventory-pagination", "productsInventory", data);
-  await refreshProductsFinishedInventory();
+  // 1. Fetch unique warehouses to populate dropdown if empty
+  const selectNode = $("#inventory-warehouse-select");
+  if (selectNode && selectNode.options.length <= 1) {
+    try {
+      const whData = await api("/api/products/inventory/warehouses?limit=100");
+      const items = whData.items || [];
+      selectNode.innerHTML = '<option value="">全部仓库</option>' + items.map(wh => `
+        <option value="${h(wh.warehouse_code)}">${h(wh.warehouse_name)}</option>
+      `).join("");
+      // Restore selected value if set in state
+      selectNode.value = tableStates.productsInventory.warehouse_code || "";
+    } catch (e) {
+      console.error("Failed to load warehouses list:", e);
+    }
+  }
+
+  // 2. Fetch inventory list
+  const state = tableStates.productsInventory;
+  const params = new URLSearchParams({
+    q: state.q || "",
+    warehouse_code: state.warehouse_code || "",
+    countable_only: "false",
+    inventory_scope: "",
+    page: state.page || 1,
+    page_size: state.page_size || 20
+  });
+  
+  try {
+    const data = await api(`/api/products/inventory?${params.toString()}`);
+    const rows = data.items || [];
+    const summary = data.summary || {};
+    
+    // Update top summary metrics in productCenterState
+    productCenterState.materialLowStock = Number(summary.low_stock_count || 0);
+    productCenterState.materialZeroStock = Number(summary.zero_stock_count || 0);
+    productCenterState.finishedLowStock = 0;
+    productCenterState.finishedZeroStock = 0;
+    renderProductCenterSummary();
+    
+    // Render inventory statistics cards
+    const summaryNode = $("#products-inventory-summary");
+    if (summaryNode) {
+      summaryNode.innerHTML = `
+        <div class="metric"><small>库存记录</small><strong>${h(summary.total_rows || 0)}</strong></div>
+        <div class="metric warn"><small>预警记录</small><strong>${h(summary.low_stock_count || 0)}</strong></div>
+        <div class="metric danger"><small>零库存记录</small><strong>${h(summary.zero_stock_count || 0)}</strong></div>
+        <div class="metric"><small>库存数量合计</small><strong>${h(summary.total_base_qty || 0)}</strong></div>
+      `;
+    }
+    
+    // Render inventory rows
+    const listNode = $("#products-inventory-list");
+    if (listNode) {
+      listNode.innerHTML = rows.map(row => `
+        <div class="row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); padding: 8px 0;">
+          <div style="word-break: break-all;"><strong>${h(row.material_code)}</strong></div>
+          <div style="word-break: break-word;">${h(row.material_name)}</div>
+          <div style="word-break: break-word;">${h(row.english_name || "-")}</div>
+          <div>${h(row.model || "-")}</div>
+          <div>${h(row.warehouse_name)}</div>
+          <div style="font-weight: 600;">${h(row.base_qty)}</div>
+          <div style="color: var(--muted);">${h(row.in_transit_qty)}</div>
+          <div>
+            <span class="status-pill ${row.warning_status === '正常' ? 'is-active' : 'is-warn'}">
+              ${h(row.warning_status)}
+            </span>
+          </div>
+          <div style="color: var(--muted); font-size: 11px;">${h(formatTime(row.synced_at))}</div>
+        </div>
+      `).join("") || `<div class="row product-row product-empty-row"><div>暂无库存数据，请先导入海外库存 Excel</div></div>`;
+    }
+    
+    renderListPagination("#products-inventory-pagination", "productsInventory", data);
+  } catch (error) {
+    notifyError(error, ["物料中心", "加载库存数据失败"]);
+  }
 }
 
 async function refreshProductsFinishedInventory() {
-  syncFinishedInventoryFilters();
-  const data = await api(`/api/products/inventory/types?${queryFromState(tableStates.productsFinishedInventory)}`);
-  const rows = data.items || [];
-  const summary = data.summary || {};
-  productCenterState.finishedLowStock = Number(summary.low_stock_count || 0);
-  productCenterState.finishedZeroStock = Number(summary.zero_stock_count || 0);
-  renderProductCenterSummary();
-  renderInventorySummary("#products-finished-inventory-summary", summary, "成品库存合计");
-  renderInventoryTypeRows("#products-finished-inventory-list", rows, "暂无成品库存数据，请先同步 ERP 库存", "productsFinishedInventory", "成品");
-  renderListPagination("#products-finished-inventory-pagination", "productsFinishedInventory", data);
+  // No-op in restructured inventory
 }
 
 async function openInventoryDetail(materialType, parentCategory = "", page = 1, tableKey = "productsInventory") {
@@ -5901,6 +6039,9 @@ function activateScopedTab(prefix, tabsNode, activeButton) {
 $("#products-tabs")?.addEventListener("click", (e) => {
   if (e.target.tagName !== "BUTTON") return;
   const tabName = activateScopedTab("products", e.currentTarget, e.target);
+  if (tabName === "inventory") {
+    guardedAction(["物料中心", "库存管理"], async () => { await refreshProductsInventory(); await refreshProductsFinishedInventory(); });
+  }
   if (tabName === "review") {
     guardedAction(["物料中心", "预审体检"], async () => refreshProductReviewReadiness());
   }
@@ -5950,9 +6091,12 @@ document.addEventListener("click", async (e) => {
     tableStates.productsSpu.q = spuId;
     tableStates.productsSpu.page = 1;
     $("#products-spu-filter-form [name=q]").value = spuId;
-    document.querySelectorAll("#products-tabs button").forEach(b => {
-      if (b.dataset.tab === "spu") b.click();
-    });
+    // SPU tab 没有可见按钮，直接操作 DOM 切换
+    document.querySelectorAll("#products-tabs button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll("[id^='products-'][id$='-tab']").forEach(el => { el.hidden = true; el.classList.remove("is-active"); });
+    const spuTab = $("#products-spu-tab");
+    if (spuTab) { spuTab.hidden = false; spuTab.classList.add("is-active"); }
+    guardedAction(["物料中心", "SPU"], async () => refreshProductsSpu());
   }
 
   if (target.dataset.action === "goto-sku") {
@@ -5980,6 +6124,11 @@ document.addEventListener("click", async (e) => {
   if (target.dataset.action === "edit-product-aliases") {
     e.preventDefault();
     openProductAliasModal(target.dataset.id);
+  }
+
+  if (target.dataset.action === "view-product-detail") {
+    e.preventDefault();
+    openProductDetailModal(target.dataset.skuId);
   }
 
   if (target.dataset.action === "goto-promotions") {
@@ -6075,6 +6224,68 @@ $("#product-alias-close")?.addEventListener("click", () => closeModal("#product-
 $("#product-pricing-close")?.addEventListener("click", () => closeModal("#product-pricing-modal"));
 $("#product-promotion-close")?.addEventListener("click", () => closeModal("#product-promotion-modal"));
 $("#product-import-close")?.addEventListener("click", () => closeModal("#product-import-modal"));
+$("#product-detail-close")?.addEventListener("click", () => closeModal("#product-detail-modal"));
+
+async function openProductDetailModal(skuId) {
+  if (!skuId) return;
+  openModal("#product-detail-modal");
+  
+  const lookupKey = productLookupKey(skuId);
+  const sku = (window._productSkuRowsByCode || {})[lookupKey] || { sku_id: skuId };
+  
+  $("#detail-sku-id").textContent = sku.sku_id || "-";
+  $("#detail-spu-name").textContent = sku.spu_name || "-";
+  $("#detail-model").textContent = sku.model || "-";
+  $("#detail-brand").textContent = sku.brand || "-";
+  $("#detail-category").textContent = sku.category || "-";
+  
+  const aliases = sku.review_aliases || [];
+  $("#detail-aliases").textContent = aliases.length ? aliases.join(" / ") : "无别名";
+  
+  const loader = $("#product-detail-modal .stock-loader");
+  const tableWrapper = $("#detail-stock-table-wrapper");
+  const errorNode = $("#detail-stock-error");
+  const tbody = $("#detail-stock-rows");
+  
+  if (loader) loader.style.display = "flex";
+  if (tableWrapper) tableWrapper.hidden = true;
+  if (errorNode) errorNode.hidden = true;
+  if (tbody) tbody.innerHTML = "";
+  
+  try {
+    const data = await api(`/api/products/sku/${encodeURIComponent(skuId)}/realtime-stock`);
+    if (loader) loader.style.display = "none";
+    
+    const stocks = data.stocks || [];
+    if (stocks.length === 0) {
+      if (tbody) tbody.innerHTML = `<tr><td colspan="5" style="text-align: center; padding: 12px; color: var(--muted);">OMS 中暂无该物料各仓库库存数据</td></tr>`;
+    } else {
+      if (tbody) {
+        tbody.innerHTML = stocks.map(item => {
+          const q = item.quantity !== null && item.quantity !== undefined ? h(item.quantity) : "-";
+          const uq = item.usable_quantity !== null && item.usable_quantity !== undefined ? h(item.usable_quantity) : "-";
+          const eq = item.excel_qty !== null && item.excel_qty !== undefined ? h(item.excel_qty) : "-";
+          return `
+            <tr style="border-bottom: 1px solid var(--line);">
+              <td style="padding: 8px 6px;">${h(item.warehouse_code)}</td>
+              <td style="padding: 8px 6px;">${h(item.warehouse_name)}</td>
+              <td style="padding: 8px 6px; font-weight: 600;">${q}</td>
+              <td style="padding: 8px 6px; font-weight: 600; color: var(--success);">${uq}</td>
+              <td style="padding: 8px 6px; font-weight: 600; color: var(--accent);">${eq}</td>
+            </tr>
+          `;
+        }).join("");
+      }
+    }
+    if (tableWrapper) tableWrapper.hidden = false;
+  } catch (error) {
+    if (loader) loader.style.display = "none";
+    if (errorNode) {
+      errorNode.hidden = false;
+      errorNode.textContent = `获取 OMS 实时库存失败：${error.message || "未知接口错误"}`;
+    }
+  }
+}
 
 let currentImportPreviewData = null;
 let editingPromotionId = null;
@@ -6267,6 +6478,7 @@ $("#products-spu-filter-form")?.addEventListener("submit", (e) => {
 $("#products-sku-filter-form")?.addEventListener("submit", (e) => {
   e.preventDefault();
   tableStates.productsSku.q = e.target.q.value;
+  tableStates.productsSku.crm_semantic = e.target.crm_semantic?.checked ?? false;
   tableStates.productsSku.page = 1;
   refreshProductsSku();
 });
@@ -6302,6 +6514,35 @@ $("#products-review-preview-form")?.addEventListener("submit", async (e) => {
       body: JSON.stringify(payload),
     });
     renderProductReviewPreview(result);
+  });
+});
+
+// 导入海外库存 Excel 文件事件绑定
+document.addEventListener("click", (e) => {
+  if (e.target && e.target.id === "btn-trigger-import-excel") {
+    $("#inventory-excel-file")?.click();
+  }
+});
+
+$("#inventory-excel-file")?.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  
+  const formData = new FormData();
+  formData.append("file", file);
+  
+  // Clear the input value so that the same file can be selected again
+  e.target.value = "";
+  
+  await guardedAction(["物料中心", "导入海外库存"], async () => {
+    toast("正在导入并解析库存数据，请稍候...");
+    const res = await api("/api/products/inventory/import-excel", {
+      method: "POST",
+      body: formData,
+      headers: { "Content-Type": undefined } // explicitly override to let fetch set the boundary!
+    });
+    toast(`成功导入 ${res.imported_count || 0} 条仓库库存记录`);
+    await refreshProductsInventory();
   });
 });
 

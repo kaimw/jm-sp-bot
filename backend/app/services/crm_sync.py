@@ -46,6 +46,24 @@ def config_int(session: Session, key: str, default: int) -> int:
         return default
 
 
+def ensure_request_file(
+    *,
+    configured_path: str,
+    request_json: str,
+    fallback_prefix: str,
+) -> tuple[str, Path | None]:
+    path_text = str(configured_path or "").strip()
+    json_text = str(request_json or "").strip()
+    if path_text and Path(path_text).exists():
+        return path_text, None
+    if not json_text:
+        return path_text, None
+    target = Path(path_text) if path_text else Path("/private/tmp") / f"{fallback_prefix}-{hashlib.sha1(json_text.encode()).hexdigest()[:12]}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json_text, encoding="utf-8")
+    return str(target), target
+
+
 def crm_order_sync_due(session: Session, *, now: datetime | None = None) -> bool:
     if not config_bool(session, "crm_sync_enabled", False):
         return False
@@ -173,10 +191,11 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
     temp_detail_request_path: Path | None = None
     try:
         single_row_path.write_text(json.dumps(crm_order_single_row(order), ensure_ascii=False), encoding="utf-8")
-        if detail_request_json and not detail_request_path:
-            temp_detail_request_path = Path("/private/tmp") / f"fxiaoke-detail-request-{hashlib.sha1(detail_request_json.encode()).hexdigest()[:12]}.json"
-            temp_detail_request_path.write_text(detail_request_json, encoding="utf-8")
-            detail_request_path = str(temp_detail_request_path)
+        detail_request_path, temp_detail_request_path = ensure_request_file(
+            configured_path=detail_request_path,
+            request_json=detail_request_json,
+            fallback_prefix="fxiaoke-detail-request",
+        )
         command = [node_bin, str(script_path), f"--single-row={single_row_path}", f"--detail-request={detail_request_path}"]
         env = {
             "FXIAOKE_CDP_URL": cdp_url,
@@ -306,14 +325,16 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
     temp_request_path: Path | None = None
     temp_detail_request_path: Path | None = None
     try:
-        if request_json and not request_path:
-            temp_request_path = Path("/private/tmp") / f"fxiaoke-list-request-{hashlib.sha1(request_json.encode()).hexdigest()[:12]}.json"
-            temp_request_path.write_text(request_json, encoding="utf-8")
-            request_path = str(temp_request_path)
-        if detail_request_json and not detail_request_path:
-            temp_detail_request_path = Path("/private/tmp") / f"fxiaoke-detail-request-{hashlib.sha1(detail_request_json.encode()).hexdigest()[:12]}.json"
-            temp_detail_request_path.write_text(detail_request_json, encoding="utf-8")
-            detail_request_path = str(temp_detail_request_path)
+        request_path, temp_request_path = ensure_request_file(
+            configured_path=request_path,
+            request_json=request_json,
+            fallback_prefix="fxiaoke-list-request",
+        )
+        detail_request_path, temp_detail_request_path = ensure_request_file(
+            configured_path=detail_request_path,
+            request_json=detail_request_json,
+            fallback_prefix="fxiaoke-detail-request",
+        )
 
         command = [node_bin, str(script_path), f"--request={request_path}"]
         if detail_request_path:
@@ -407,8 +428,11 @@ def protect_degraded_detail_row(session: Session, existing: CrmSalesOrder | None
                 return value
         return None
 
+    incoming_order_items = protected.get("order_items")
+    if isinstance(incoming_order_items, list) and incoming_order_items:
+        protected["items"] = incoming_order_items
     previous_items = first_raw_value("order_items") or first_raw_value("items")
-    if isinstance(previous_items, list) and previous_items:
+    if not (isinstance(incoming_order_items, list) and incoming_order_items) and isinstance(previous_items, list) and previous_items:
         for key in ["order_items", "items"]:
             incoming = protected.get(key)
             if not isinstance(incoming, list) or not incoming:
@@ -428,9 +452,6 @@ def protect_degraded_detail_row(session: Session, existing: CrmSalesOrder | None
         "sales_user_name",
         "sales_user_email",
         "owner_department",
-        "receipt_contact",
-        "receipt_phone",
-        "receipt_address",
     ]
     for key in scalar_keys:
         if str(protected.get(key) or "").strip():
@@ -639,6 +660,11 @@ def phase_one_scope_result(session: Session, row: dict[str, Any], existing: CrmS
         return True, None
     scope = config_json(session, "v2_crm_phase1_scope_json", {})
     approved_values = {str(item).strip().lower() for item in scope.get("approved_values", []) if str(item).strip()}
+    approved_life_status_values = {
+        str(item).strip().lower()
+        for item in scope.get("approved_life_status_values", ["normal", "正常", "active"])
+        if str(item).strip()
+    }
     cancelled_values = {str(item).strip().lower() for item in scope.get("cancelled_values", []) if str(item).strip()}
     approval_status = normalized_lower(row.get("approval_status"))
     life_status = normalized_lower(row.get("life_status"))
@@ -646,6 +672,8 @@ def phase_one_scope_result(session: Session, row: dict[str, Any], existing: CrmS
         if existing is not None:
             return True, None
         return False, "crm_order_cancelled_before_middle_platform"
+    if life_status and approved_life_status_values and life_status not in approved_life_status_values:
+        return False, f"life_status_not_in_phase1_scope:{row.get('life_status')}"
     if approval_status and approved_values and approval_status not in approved_values:
         return False, f"approval_status_not_in_phase1_scope:{row.get('approval_status')}"
     list_filters = {
@@ -943,6 +971,20 @@ def infer_currency(settlement_method: str | None) -> str | None:
     return None
 
 
+def settlement_method_from_items(row: dict[str, Any]) -> str:
+    for key in ("order_items", "items"):
+        items = row.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = normalized_text(item.get("settlement_method") or item.get("订单结算方式") or item.get("结算方式"))
+            if value:
+                return value
+    return ""
+
+
 def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> None:
     def keep_existing(key: str, current: Any) -> str | None:
         value = str(row.get(key) or "").strip()
@@ -988,6 +1030,10 @@ def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> N
     order.life_status = keep_existing("life_status", order.life_status)
     order.approval_status = keep_existing("approval_status", order.approval_status)
     order.order_date = keep_existing("order_date", order.order_date)
+    if not normalized_text(row.get("settlement_method")):
+        item_settlement_method = settlement_method_from_items(row)
+        if item_settlement_method:
+            row["settlement_method"] = item_settlement_method
     order.settlement_method = keep_existing("settlement_method", order.settlement_method)
     order.currency = infer_currency(order.settlement_method)
     order.order_amount = keep_existing("order_amount", order.order_amount)
@@ -998,16 +1044,21 @@ def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> N
     order.logistics_status = keep_existing("logistics_status", order.logistics_status)
     order.shipment_status = keep_existing("shipment_status", order.shipment_status)
     order.invoice_status = keep_existing("invoice_status", order.invoice_status)
-    order.receipt_contact = keep_existing("receipt_contact", order.receipt_contact)
-    order.receipt_phone = keep_existing("receipt_phone", order.receipt_phone)
-    order.receipt_address = keep_existing("receipt_address", order.receipt_address)
-    order.delivery_date = keep_existing("delivery_date", order.delivery_date)
+    for attachment_field in ("receipt_contact", "receipt_phone", "receipt_address", "delivery_date"):
+        existing_attachment_value = str(getattr(order, attachment_field, None) or "").strip()
+        if existing_attachment_value:
+            row[attachment_field] = existing_attachment_value
+        else:
+            row.pop(attachment_field, None)
     order.remark = keep_existing("remark", order.remark)
     attachment_names = [item.strip() for item in str(row.get("attachment_files") or "").split(";") if item.strip()]
     if not attachment_names:
         attachment_names = [normalized_text(item.get("file_name")) for item in row.get("attachments", []) if isinstance(item, dict) and normalized_text(item.get("file_name"))]
     if attachment_names:
         order.attachment_files_json = dumps(attachment_names)
+    existing_raw = loads(order.raw_json, {})
+    if isinstance(existing_raw, dict) and isinstance(existing_raw.get("oms_field_extraction"), dict) and "oms_field_extraction" not in row:
+        row["oms_field_extraction"] = existing_raw["oms_field_extraction"]
     order.raw_json = dumps(row)
     order.payload_hash = digest
     order.sync_status = "Synced"
