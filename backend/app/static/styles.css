@@ -3202,7 +3202,7 @@ label,
 }
 
 .crm-order-detail-panel {
-  width: min(980px, 100%);
+  width: min(1040px, 100%);
 }
 
 .inventory-detail-panel {
@@ -3546,6 +3546,19 @@ label,
   gap: 14px;
 }
 
+.crm-order-detail-tabs {
+  margin: 12px 0;
+  overflow-x: auto;
+}
+
+.crm-order-detail-tab-panel {
+  min-height: 260px;
+}
+
+.crm-order-detail-tab-panel[hidden] {
+  display: none !important;
+}
+
 .crm-order-detail-grid h3,
 .crm-order-detail-panel h3 {
   margin: 0 0 10px;
@@ -3553,7 +3566,47 @@ label,
 }
 
 .crm-order-detail-fields {
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.crm-order-product-table {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.crm-order-product-head,
+.crm-order-product-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(220px, 1.6fr) minmax(70px, 0.45fr) minmax(110px, 0.65fr) minmax(110px, 0.65fr) minmax(90px, 0.55fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+}
+
+.crm-order-product-head {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.crm-order-product-row {
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.crm-order-product-row strong,
+.crm-order-product-row small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.crm-order-product-row small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-weight: 600;
 }
 
 .crm-extraction-alert {
@@ -4414,6 +4467,19 @@ label,
 
   .crm-sync-settings-panel {
     max-height: calc(100vh - 28px);
+  }
+
+  .crm-order-detail-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .crm-order-product-table {
+    overflow-x: auto;
+  }
+
+  .crm-order-product-head,
+  .crm-order-product-row {
+    min-width: 760px;
   }
 
   .crm-sync-form {

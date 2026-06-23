@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, object_session
 
 from backend.app.config import settings
@@ -28,6 +31,7 @@ from backend.app.models import (
     AuditEvent,
     AttachmentAsset,
     BackupJob,
+    CrmOrderItem,
     CrmOrderSnapshot,
     CrmSalesOrder,
     CrmSyncRun,
@@ -46,10 +50,12 @@ from backend.app.models import (
     ModelProviderConfig,
     DeliveryNotice,
     MiddlePlatformOrder,
+    MiddlePlatformOrderItem,
     OrderRequirement,
     OutboundMailJob,
     ProcessingJob,
     ProductionDepartment,
+    ProductSKU,
     QuestionAndReply,
     RequirementWorkflowBinding,
     ProductionTask,
@@ -105,7 +111,9 @@ from backend.app.config import MAIL_LOGIN_MIN_INTERVAL_SECONDS, MAIL_WORKER_MIN_
 from backend.app.services.auth import COOKIE_NAME, create_session_token, parse_session_token, verify_password, should_mask_financials
 from backend.app.services.bootstrap import seed_defaults, set_config
 from backend.app.services.crm_sync import (
+    CrmSyncBusyError,
     crm_order_summary,
+    force_sync_crm_order_by_no,
     queue_crm_order_sync,
     retry_crm_order_detail_sync,
     run_crm_integration_test,
@@ -230,6 +238,7 @@ from backend.app.services.products import (
     extract_order_products_for_review,
     review_order_products,
     product_review_readiness,
+    match_sku_by_product_name,
     spu_review_aliases,
     suggest_product_review_candidates,
     update_spu_review_aliases,
@@ -814,6 +823,24 @@ def system_config_bool(session: Session, key: str, default: bool = False) -> boo
     return str(row.value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _store_config_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def kick_mail_worker_once_async(reason: str = "manual-start") -> None:
+    def _run() -> None:
+        try:
+            result = run_mail_auto_worker_once()
+            logger.info("mail worker kickoff completed: reason=%s result=%s", reason, result)
+        except Exception:
+            logger.exception("mail worker kickoff failed: reason=%s", reason)
+
+    thread = threading.Thread(target=_run, name=f"mail-worker-kickoff-{reason}", daemon=True)
+    thread.start()
+
+
 def configured_worker_interval_seconds(session: Session) -> int:
     row = session.get(SystemConfig, "mail_auto_worker_interval_seconds")
     try:
@@ -862,6 +889,37 @@ def crm_cdp_port_from_config(session: Session) -> int:
     return 9333
 
 
+def crm_external_browser_pids(port: int, user_data_dir: str) -> list[int]:
+    patterns = [
+        f"remote-debugging-port={port}",
+        f"user-data-dir={user_data_dir}",
+        f"fxiaoke_start_cdp_chrome.mjs --port={port}",
+    ]
+    pids: set[int] = set()
+    for pattern in patterns:
+        try:
+            output = subprocess.check_output(["pgrep", "-f", pattern], text=True, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            continue
+        for line in output.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid != os.getpid():
+                pids.add(pid)
+    return sorted(pids)
+
+
+def crm_cdp_version(port: int) -> dict:
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+
 def crm_browser_status() -> dict:
     global _crm_browser_process, _crm_browser_meta
     process = _crm_browser_process
@@ -881,6 +939,21 @@ def stop_crm_browser_process() -> dict:
     process = _crm_browser_process
     if process is None or process.poll() is not None:
         _crm_browser_process = None
+        port = int(_crm_browser_meta.get("port") or 0) if _crm_browser_meta.get("port") else 0
+        user_data_dir = str(_crm_browser_meta.get("user_data_dir") or "")
+        if not port:
+            return {"stopped": False, **_crm_browser_meta}
+        pids = crm_external_browser_pids(port, user_data_dir or f"/private/tmp/fxiaoke-cdp-profile-{port}")
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, 15)
+        if pids:
+            time.sleep(1)
+            for pid in pids:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, 9)
+            _crm_browser_meta = {**_crm_browser_meta, "stopped": True, "external_pids": pids}
+            return {"stopped": True, "external_pids": pids, **_crm_browser_meta}
         return {"stopped": False, **_crm_browser_meta}
     process.terminate()
     try:
@@ -895,7 +968,9 @@ def stop_crm_browser_process() -> dict:
 
 def start_crm_browser_process(session: Session, requested_mode: str | None = None) -> dict:
     global _crm_browser_process, _crm_browser_meta
-    mode = (requested_mode or system_config_value(session, "crm_cdp_browser_mode", {}, "headless")).strip().lower()
+    # Default CRM automation should never pop a browser window. A visible browser
+    # is only used when the caller explicitly requests manual login mode.
+    mode = (requested_mode or "headless").strip().lower()
     if mode not in {"headless", "headed"}:
         raise HTTPException(status_code=400, detail="CRM 浏览器模式只能是 headless 或 headed")
     current = crm_browser_status()
@@ -906,6 +981,26 @@ def start_crm_browser_process(session: Session, requested_mode: str | None = Non
 
     port = crm_cdp_port_from_config(session)
     user_data_dir = system_config_value(session, "crm_cdp_user_data_dir", {}, f"/private/tmp/fxiaoke-cdp-profile-{port}").strip()
+    existing_cdp = crm_cdp_version(port)
+    if existing_cdp:
+        user_agent = str(existing_cdp.get("User-Agent") or "")
+        if mode == "headed" and "HeadlessChrome" in user_agent:
+            _crm_browser_meta = {"mode": "headless", "cdp_url": f"http://127.0.0.1:{port}", "port": port, "user_data_dir": user_data_dir, "external": True}
+            stop_crm_browser_process()
+        elif mode == "headless" and "HeadlessChrome" not in user_agent:
+            _crm_browser_meta = {"mode": "headed", "cdp_url": f"http://127.0.0.1:{port}", "port": port, "user_data_dir": user_data_dir, "external": True}
+            stop_crm_browser_process()
+        elif mode == "headed" and "HeadlessChrome" not in user_agent:
+            return {
+                "managed": False,
+                "external": True,
+                "already_running": True,
+                "mode": "headed",
+                "cdp_url": f"http://127.0.0.1:{port}",
+                "port": port,
+                "user_data_dir": user_data_dir,
+                "message": "CRM 人工登录浏览器已在运行，请在桌面或任务栏中切换到该 Chrome 窗口。",
+            }
     chrome_bin = system_config_value(session, "crm_chrome_bin", {}, "").strip()
     script_path = Path(__file__).resolve().parents[2] / "scripts" / "fxiaoke_start_cdp_chrome.mjs"
     if not script_path.exists():
@@ -1043,32 +1138,46 @@ def config(session: Session = Depends(get_session), current_user: User = Depends
 
 @app.put("/api/config/mail")
 def update_mail_config(payload: MailRuntimeConfigUpdate, session: Session = Depends(get_session), current_user: User = Depends(require_role(["admin"]))) -> dict:
-    values = payload.model_dump(exclude_unset=True)
-    if "mail_auto_worker_interval_seconds" in values and values["mail_auto_worker_interval_seconds"] not in (None, ""):
-        requested_interval = int(values["mail_auto_worker_interval_seconds"])
-        if requested_interval < MAIL_WORKER_MIN_INTERVAL_SECONDS:
-            raise HTTPException(status_code=400, detail=f"worker 执行周期不能低于 {MAIL_WORKER_MIN_INTERVAL_SECONDS} 秒")
-        values["mail_auto_worker_interval_seconds"] = requested_interval
-    if "mail_rate_limit_interval_seconds" in values and values["mail_rate_limit_interval_seconds"] not in (None, ""):
-        requested_interval = int(values["mail_rate_limit_interval_seconds"])
-        if requested_interval < MAIL_LOGIN_MIN_INTERVAL_SECONDS:
-            raise HTTPException(status_code=400, detail=f"邮箱登录/发信间隔不能低于 {MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒")
-        values["mail_rate_limit_interval_seconds"] = clamp_mail_interval_seconds(requested_interval)
-    if values.get("bot_enabled") is True:
-        readiness = runtime_startup_readiness(session, values)
-        if not readiness["ready"]:
-            set_config(session, "bot_enabled", "false", is_secret=False)
-            session.commit()
-            raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
-    secret_keys = {"bot_email_password", "baidu_map_ak", "e2e_sales_password", "e2e_production_password"}
-    for key, value in values.items():
-        if value is None:
-            continue
-        if key in secret_keys and str(value).strip() in {"", "***"}:
-            continue
-        set_config(session, key, str(value), is_secret=key in secret_keys)
-    session.commit()
-    return config(session)
+    try:
+        values = payload.model_dump(exclude_unset=True)
+        bot_was_enabled = system_config_bool(session, "bot_enabled", False)
+        bot_enable_requested = values.get("bot_enabled") is True
+        if "mail_auto_worker_interval_seconds" in values and values["mail_auto_worker_interval_seconds"] not in (None, ""):
+            requested_interval = int(values["mail_auto_worker_interval_seconds"])
+            if requested_interval < MAIL_WORKER_MIN_INTERVAL_SECONDS:
+                raise HTTPException(status_code=400, detail=f"worker 执行周期不能低于 {MAIL_WORKER_MIN_INTERVAL_SECONDS} 秒")
+            values["mail_auto_worker_interval_seconds"] = requested_interval
+        if "mail_rate_limit_interval_seconds" in values and values["mail_rate_limit_interval_seconds"] not in (None, ""):
+            requested_interval = int(values["mail_rate_limit_interval_seconds"])
+            if requested_interval < MAIL_LOGIN_MIN_INTERVAL_SECONDS:
+                raise HTTPException(status_code=400, detail=f"邮箱登录/发信间隔不能低于 {MAIL_LOGIN_MIN_INTERVAL_SECONDS} 秒")
+            values["mail_rate_limit_interval_seconds"] = clamp_mail_interval_seconds(requested_interval)
+        if values.get("bot_enabled") is True:
+            readiness = runtime_startup_readiness(session, values)
+            if not readiness["ready"]:
+                set_config(session, "bot_enabled", "false", is_secret=False)
+                session.commit()
+                raise HTTPException(status_code=400, detail=f"系统启动前配置不完整：缺少 {'、'.join(readiness['missing'])}")
+        secret_keys = {"bot_email_password", "baidu_map_ak", "e2e_sales_password", "e2e_production_password"}
+        for key, value in values.items():
+            if value is None:
+                continue
+            if key in secret_keys and str(value).strip() in {"", "***"}:
+                continue
+            set_config(session, key, _store_config_value(value), is_secret=key in secret_keys)
+        session.commit()
+        result = config(session)
+        if bot_enable_requested and not bot_was_enabled:
+            kick_mail_worker_once_async("bot-enabled")
+            result["worker_kickoff"] = {"triggered": True, "reason": "bot-enabled"}
+        else:
+            result["worker_kickoff"] = {"triggered": False}
+        return result
+    except OperationalError as exc:
+        session.rollback()
+        if "database is locked" in str(exc).lower():
+            raise HTTPException(status_code=503, detail="数据库正被后台任务占用，请稍后重试；如持续出现，请重启服务释放 SQLite 写锁。") from exc
+        raise
 
 
 @app.put("/api/config/erp")
@@ -1119,6 +1228,11 @@ def update_crm_config(payload: CrmRuntimeConfigUpdate, session: Session = Depend
         if page_size < 1 or page_size > 200:
             raise HTTPException(status_code=400, detail="CRM 每页条数需在 1-200 之间")
         values["crm_sync_page_size"] = page_size
+    if "crm_sync_max_pages" in values and values["crm_sync_max_pages"] not in (None, ""):
+        max_pages = int(values["crm_sync_max_pages"])
+        if max_pages < 0 or max_pages > 200:
+            raise HTTPException(status_code=400, detail="CRM 最大同步页数需在 0-200 之间，0 表示按最早下单日期自动停止")
+        values["crm_sync_max_pages"] = max_pages
     if "crm_sync_timeout_seconds" in values and values["crm_sync_timeout_seconds"] not in (None, ""):
         timeout = int(values["crm_sync_timeout_seconds"])
         if timeout < 30 or timeout > 600:
@@ -4864,6 +4978,90 @@ def serialize_order_attachment(row: OrderAttachment, current_user: User | None =
     }
 
 
+def resolve_crm_product_material_sku(session: Session, *, raw_sku_code: str | None = None, product_name: str | None = None) -> dict:
+    raw_code = str(raw_sku_code or "").strip()
+    if raw_code:
+        sku = session.query(ProductSKU).filter(ProductSKU.sku_id == raw_code, ProductSKU.status == "Active").first()
+        if sku is not None:
+            return {"sku_code": sku.sku_id, "sku_match_status": "matched", "sku_match_source": "sku_code", "sku_match_confidence": 100}
+    name = str(product_name or "").strip()
+    if name:
+        match = match_sku_by_product_name(session, name)
+        if match.get("matched") and match.get("sku_id"):
+            return {
+                "sku_code": str(match["sku_id"]),
+                "sku_match_status": "matched",
+                "sku_match_source": match.get("match_source") or "product_name",
+                "sku_match_confidence": match.get("confidence"),
+                "sku_matched_value": match.get("matched_value"),
+            }
+        return {
+            "sku_code": "",
+            "sku_match_status": "manual_required",
+            "sku_match_source": match.get("reason") or "product_name",
+            "sku_match_confidence": None,
+            "sku_candidates": match.get("candidates") or [],
+        }
+    return {"sku_code": "", "sku_match_status": "manual_required", "sku_match_source": "missing_product_name", "sku_match_confidence": None}
+
+
+def serialize_crm_order_item(session: Session, row: CrmOrderItem) -> dict:
+    raw = loads(row.raw_json, {})
+    product_name = row.product_name or raw.get("product_name") or raw.get("产品名称") or raw.get("商品名称")
+    material_sku = resolve_crm_product_material_sku(session, raw_sku_code=row.sku_code, product_name=product_name)
+    return {
+        "id": row.id,
+        "crm_item_id": row.crm_item_id,
+        "sku_code": material_sku["sku_code"],
+        "crm_raw_sku_code": row.sku_code,
+        "sku_match_status": material_sku["sku_match_status"],
+        "sku_match_source": material_sku["sku_match_source"],
+        "sku_match_confidence": material_sku["sku_match_confidence"],
+        "sku_candidates": material_sku.get("sku_candidates", []),
+        "product_name": row.product_name,
+        "specification": row.specification,
+        "quantity": row.quantity,
+        "unit_price": row.unit_price,
+        "line_amount": row.line_amount,
+        "discount": raw.get("discount") or raw.get("discount_amount") or raw.get("折扣") or raw.get("优惠金额"),
+        "settlement_method": raw.get("settlement_method") or raw.get("订单结算方式") or raw.get("结算方式"),
+        "raw": raw,
+    }
+
+
+def serialize_crm_order_raw_item(session: Session, item: dict, index: int) -> dict:
+    raw = item if isinstance(item, dict) else {}
+    def pick(keys: list[str]) -> str:
+        for key in keys:
+            value = raw.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return ""
+    raw_sku_code = pick(["sku_code", "skuCode", "sku_id", "product_code", "商品编码", "产品编码", "SKU"])
+    product_name = pick(["product_name", "name", "productName", "产品名称", "商品名称", "货物名称"])
+    material_sku = resolve_crm_product_material_sku(session, raw_sku_code=raw_sku_code, product_name=product_name)
+
+    return {
+        "id": f"raw-{index + 1}",
+        "crm_item_id": pick(["crm_item_id", "item_id", "id", "订单产品编号"]) or f"raw-{index + 1}",
+        "sku_code": material_sku["sku_code"],
+        "crm_raw_sku_code": raw_sku_code,
+        "sku_match_status": material_sku["sku_match_status"],
+        "sku_match_source": material_sku["sku_match_source"],
+        "sku_match_confidence": material_sku["sku_match_confidence"],
+        "sku_candidates": material_sku.get("sku_candidates", []),
+        "product_name": product_name,
+        "specification": pick(["specification", "model", "规格型号", "规格", "型号", "主要规格/详细配置"]),
+        "quantity": pick(["quantity", "qty", "数量"]),
+        "unit_price": pick(["unit_price", "price", "销售单价", "单价", "价格(元)", "不含税单价（元）"]),
+        "line_amount": pick(["line_amount", "amount", "销售订单金额", "小计", "总价", "总金额（含税）", "不含税总价（元）"]),
+        "discount": pick(["discount", "discount_amount", "折扣", "优惠金额"]),
+        "settlement_method": pick(["settlement_method", "订单结算方式", "结算方式"]),
+        "raw": raw,
+        "source": "raw_json_fallback",
+    }
+
+
 def crm_order_attachment_payload(session: Session, row: CrmSalesOrder, current_user: User | None = None) -> list[dict]:
     records = (
         session.query(OrderAttachment)
@@ -5065,11 +5263,28 @@ def snapshot_status_summary(data: dict) -> dict:
 def serialize_crm_order_with_flow(session: Session, row: CrmSalesOrder, current_user: User | None = None) -> dict:
     data = serialize_crm_order(row, include_raw=True, current_user=current_user)
     attachments = crm_order_attachment_payload(session, row, current_user=current_user)
+    order_items = (
+        session.query(CrmOrderItem)
+        .filter(CrmOrderItem.order_id == row.id)
+        .order_by(CrmOrderItem.created_at.asc(), CrmOrderItem.crm_item_id.asc())
+        .all()
+    )
     has_downloadable_attachment = any(item.get("has_download") for item in attachments)
     raw = loads(row.raw_json, {})
     detail_synced = raw.get("detail_sync_status") == "Synced" or bool(raw.get("detail_raw"))
     detail_failed = raw.get("detail_sync_status") == "Failed"
+    raw_order_items = raw.get("order_items") if isinstance(raw.get("order_items"), list) else []
     data["attachments"] = attachments
+    data["order_items"] = [serialize_crm_order_item(session, item) for item in order_items]
+    if not data["order_items"] and raw_order_items:
+        data["order_items"] = [
+            serialize_crm_order_raw_item(session, item, index)
+            for index, item in enumerate(raw_order_items)
+            if isinstance(item, dict)
+        ]
+        data["order_items_source"] = "raw_json_fallback"
+    else:
+        data["order_items_source"] = "crm_order_items"
     data["snapshots"] = crm_order_snapshot_payload(session, row)
     data["snapshot_diff"] = crm_snapshot_diff_payload(session, row)
     data["crm_detail_status"] = "detail_available" if detail_synced else ("detail_failed" if detail_failed else "list_only")
@@ -5330,6 +5545,116 @@ def crm_order_processing_jobs(session: Session, row: CrmSalesOrder, middle_order
         if len(matched) >= 20:
             break
     return matched
+
+
+def processing_job_matches_crm_order(job: ProcessingJob, crm_order: CrmSalesOrder, middle_order_ids: set[str], notice_ids: set[str]) -> bool:
+    payload = loads(job.payload_json, {})
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    candidates = [payload, data]
+    for item in candidates:
+        if item.get("crm_sales_order_id") == crm_order.id:
+            return True
+        if item.get("crm_order_id") == crm_order.crm_order_id:
+            return True
+        if item.get("crm_order_no") == crm_order.crm_order_no:
+            return True
+        if item.get("order_id") in middle_order_ids:
+            return True
+        if item.get("notice_id") in notice_ids:
+            return True
+    return False
+
+
+def delete_local_crm_order(session: Session, row: CrmSalesOrder, *, actor: str = "System") -> dict:
+    middle_orders = (
+        session.query(MiddlePlatformOrder)
+        .filter(MiddlePlatformOrder.source_system == row.source_system, MiddlePlatformOrder.crm_order_id == row.crm_order_id)
+        .all()
+    )
+    middle_order_ids = {item.id for item in middle_orders}
+    middle_order_nos = {item.order_no for item in middle_orders}
+    notices = session.query(DeliveryNotice).filter(DeliveryNotice.order_id.in_(middle_order_ids)).all() if middle_order_ids else []
+    notice_ids = {item.id for item in notices}
+    related_tokens = {row.id, row.crm_order_id, row.crm_order_no, *middle_order_ids, *middle_order_nos, *notice_ids}
+    related_tokens = {str(item) for item in related_tokens if item}
+
+    counts: dict[str, int] = {
+        "crm_orders": 1,
+        "crm_order_items": 0,
+        "snapshots": 0,
+        "attachments": 0,
+        "middle_orders": len(middle_order_ids),
+        "middle_order_items": 0,
+        "delivery_notices": len(notice_ids),
+        "processing_jobs": 0,
+        "integration_events": 0,
+        "exceptions": 0,
+        "audit_events": 0,
+    }
+
+    jobs = session.query(ProcessingJob).all()
+    for job in jobs:
+        if processing_job_matches_crm_order(job, row, middle_order_ids, notice_ids):
+            session.delete(job)
+            counts["processing_jobs"] += 1
+
+    if middle_order_ids:
+        counts["middle_order_items"] = (
+            session.query(MiddlePlatformOrderItem)
+            .filter(MiddlePlatformOrderItem.order_id.in_(middle_order_ids))
+            .delete(synchronize_session=False)
+        )
+        session.query(DeliveryNotice).filter(DeliveryNotice.id.in_(notice_ids)).delete(synchronize_session=False)
+        session.query(MiddlePlatformOrder).filter(MiddlePlatformOrder.id.in_(middle_order_ids)).delete(synchronize_session=False)
+
+    counts["crm_order_items"] = (
+        session.query(CrmOrderItem)
+        .filter(CrmOrderItem.source_system == row.source_system, CrmOrderItem.crm_order_id == row.crm_order_id)
+        .delete(synchronize_session=False)
+    )
+    counts["snapshots"] = (
+        session.query(CrmOrderSnapshot)
+        .filter(CrmOrderSnapshot.source_system == row.source_system, CrmOrderSnapshot.crm_order_id == row.crm_order_id)
+        .delete(synchronize_session=False)
+    )
+    counts["attachments"] = (
+        session.query(OrderAttachment)
+        .filter(OrderAttachment.source_system == row.source_system, OrderAttachment.crm_order_id == row.crm_order_id)
+        .delete(synchronize_session=False)
+    )
+    counts["integration_events"] = (
+        session.query(IntegrationEvent)
+        .filter(IntegrationEvent.biz_key.in_([row.crm_order_id, row.crm_order_no]))
+        .delete(synchronize_session=False)
+    )
+
+    exception_rows = session.query(ExceptionCase).all()
+    for case in exception_rows:
+        detail = str(case.detail or "")
+        if any(token and token in detail for token in related_tokens):
+            session.delete(case)
+            counts["exceptions"] += 1
+
+    audit_rows = session.query(AuditEvent).filter(AuditEvent.related_object_id.in_(list(related_tokens))).all() if related_tokens else []
+    for audit in audit_rows:
+        session.delete(audit)
+        counts["audit_events"] += 1
+
+    crm_order_no = row.crm_order_no
+    crm_order_id = row.crm_order_id
+    session.delete(row)
+    session.add(
+        AuditEvent(
+            event_type="CrmOrderLocalDeleted",
+            actor=actor,
+            related_object_type="CrmSalesOrder",
+            related_object_id=crm_order_id,
+            detail=dumps({"crm_order_id": crm_order_id, "crm_order_no": crm_order_no, "counts": counts}),
+        )
+    )
+    return counts
 
 
 def exception_summary(row: ExceptionCase) -> str:
@@ -5866,8 +6191,27 @@ def retry_crm_order_detail(order_id: str, session: Session = Depends(get_session
         session.commit()
         refreshed = session.get(CrmSalesOrder, order_id) or row
         return {"retry": result, "order": serialize_crm_order_with_flow(session, refreshed, current_user=current_user)}
+    except CrmSyncBusyError as exc:
+        session.rollback()
+        return {"ok": False, "busy": True, "message": str(exc)}
     except Exception as exc:
         session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/crm/orders/{order_id}")
+def delete_crm_order(order_id: str, session: Session = Depends(get_session), current_user: User = Depends(require_role(["admin", "it_ops"]))) -> dict:
+    row = session.get(CrmSalesOrder, order_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="CRM 订单不存在")
+    try:
+        crm_order_no = row.crm_order_no
+        crm_order_id = row.crm_order_id
+        counts = delete_local_crm_order(session, row, actor=getattr(current_user, "username", "System") or "System")
+        session.commit()
+        return {"ok": True, "crm_order_id": crm_order_id, "crm_order_no": crm_order_no, "deleted": counts}
+    except Exception as exc:
+        session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -5930,7 +6274,24 @@ def queue_crm_sync(session: Session = Depends(get_session)) -> dict:
 def run_crm_sync_now(session: Session = Depends(get_session)) -> dict:
     try:
         return run_crm_sales_order_sync(session, trigger="manual")
+    except CrmSyncBusyError as exc:
+        session.rollback()
+        return {"ok": False, "busy": True, "message": str(exc)}
     except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/crm/sync/orders/{crm_order_no}/force")
+def force_sync_crm_order(crm_order_no: str, session: Session = Depends(get_session), current_user: User = Depends(require_role(["admin", "it_ops"]))) -> dict:
+    try:
+        result = force_sync_crm_order_by_no(session, crm_order_no)
+        session.commit()
+        return result
+    except CrmSyncBusyError as exc:
+        session.rollback()
+        return {"ok": False, "busy": True, "message": str(exc)}
+    except Exception as exc:
+        session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

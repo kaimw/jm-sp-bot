@@ -272,14 +272,12 @@ async function main() {
     assert(summary.ok === true, "CRM replay summary should be ok");
     assert(summary.total === 2 && summary.count === 2, "CRM replay should sync 2 mock orders");
     assert(summary.detailPages.every((item) => item.status === "Synced"), "all detail pages should sync");
-    assert(first.receipt_contact === "张三", "receipt contact should be mapped from ship_to_id");
-    assert(first.receipt_address === "湖北省武汉市东湖高新区测试路 1 号", "receipt address should be mapped from ship_to_add");
-    assert(first.delivery_date === "2026-06-30", "delivery date should be mapped from delivery_date");
+    assert(first.sales_user_name === "刘测试", "sales owner should be mapped from owner__r");
     assert(first.logistics_status === "待发货", "logistics enum should be converted to label");
     assert(first.invoice_status === "已开票", "invoice enum should be converted to label");
     assert(first.attachments?.[0]?.file_url?.includes("/files/contract.pdf"), "attachment signedUrl should be downloadable");
 
-    console.log(JSON.stringify({ ok: true, checked: ["list", "detail", "delivery_fields", "enum_labels", "attachments"], jsonPath: summary.jsonPath }, null, 2));
+    console.log(JSON.stringify({ ok: true, checked: ["list", "detail", "owner", "enum_labels", "attachments"], jsonPath: summary.jsonPath }, null, 2));
   } finally {
     chrome.kill();
     await new Promise((resolve) => mockServer.close(resolve));

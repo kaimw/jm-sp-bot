@@ -25,6 +25,7 @@ let productCenterState = {
 };
 let dashboardViewState = { period: "year" };
 let currentCrmOrderDetailId = "";
+let currentCrmOrderDetailFlow = null;
 let baiduMapLoadPromise = null;
 let baiduDemandMap = null;
 let taskQueryState = { q: "", status: "", customer: "", product: "", salesperson: "", order_no: "", delivery: "", page: 1, page_size: 10 };
@@ -2731,16 +2732,108 @@ function renderCrmOmsExtractionAlert(row) {
   `;
 }
 
+function activateCrmOrderDetailTab(tabName = "order") {
+  $("#crm-order-detail-tabs")?.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === tabName);
+  });
+  document.querySelectorAll("[id^='crm-order-detail-'][id$='-tab']").forEach((panel) => {
+    const active = panel.id === `crm-order-detail-${tabName}-tab`;
+    panel.hidden = !active;
+    panel.classList.toggle("is-active", active);
+  });
+  if (tabName === "flow") {
+    renderCrmOrderFlow(currentCrmOrderDetailFlow || {});
+  }
+}
+
+function crmItemValue(item, keys) {
+  for (const key of keys) {
+    const value = item?.[key];
+    if (value !== null && value !== undefined && value !== "") return value;
+  }
+  const raw = item?.raw || {};
+  for (const key of keys) {
+    const value = raw?.[key];
+    if (value !== null && value !== undefined && value !== "") return value;
+  }
+  return "";
+}
+
+function renderCrmOrderProducts(items = [], currency = "") {
+  if (!Array.isArray(items) || !items.length) {
+    return `<div class="empty-note">CRM 订单产品未同步到本地，请先重试详情同步。</div>`;
+  }
+  return `
+    <div class="crm-order-product-table">
+      <div class="crm-order-product-head">
+        <span>物料编码</span>
+        <span>产品名称 / 规格</span>
+        <span>数量</span>
+        <span>单价</span>
+        <span>总价</span>
+        <span>折扣</span>
+      </div>
+      ${items
+        .map((item) => {
+          const sku = crmItemValue(item, ["sku_code"]);
+          const skuStatus = item?.sku_match_status || "";
+          const skuConfidence = item?.sku_match_confidence || "";
+          const skuMeta = sku
+            ? [skuStatus === "matched" ? "已匹配物料中心" : "", skuConfidence ? `置信度 ${skuConfidence}%` : ""].filter(Boolean).join(" · ")
+            : "未匹配，需人工确认";
+          const name = crmItemValue(item, ["product_name", "name", "产品名称", "商品名称", "货物名称"]);
+          const spec = crmItemValue(item, ["specification", "model", "规格型号", "规格", "型号", "主要规格/详细配置"]);
+          const quantity = crmItemValue(item, ["quantity", "qty", "数量"]);
+          const unitPrice = crmItemValue(item, ["unit_price", "price", "销售单价", "单价"]);
+          const lineAmount = crmItemValue(item, ["line_amount", "amount", "销售订单金额", "小计", "总价"]);
+          const discount = crmItemValue(item, ["discount", "discount_amount", "折扣", "优惠金额"]);
+          return `
+            <div class="crm-order-product-row">
+              <div><strong>${h(sku || "未匹配，需人工确认")}</strong><small>${h(skuMeta)}</small></div>
+              <div><strong>${h(name || "-")}</strong><small>${h(spec || "未记录规格")}</small></div>
+              <div>${h(quantity || "-")}</div>
+              <div>${h(formatAmount(unitPrice, currency))}</div>
+              <div>${h(formatAmount(lineAmount, currency))}</div>
+              <div>${h(discount || "未记录")}</div>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+async function deleteCrmOrderLocal(id, orderNo = "该订单") {
+  if (!id) return;
+  const ok = window.confirm(
+    `确认删除本地 CRM 订单“${orderNo}”？\n\n这只会删除本系统中的 CRM 镜像、订单产品、附件记录、快照、中台流程、发货预览、队列任务和相关异常，不会删除纷享销客线上的订单。删除后可重新同步并从头走流程。`
+  );
+  if (!ok) return;
+  const result = await api(`/api/crm/orders/${id}`, { method: "DELETE" });
+  const deleted = result.deleted || {};
+  const total = Object.values(deleted).reduce((sum, value) => sum + Number(value || 0), 0);
+  toast(`已删除本地订单：${result.crm_order_no || orderNo}，清理 ${total} 条关联记录`);
+  if (currentCrmOrderDetailId === id) {
+    closeCrmOrderDetail();
+  }
+  await refreshCrmOrders();
+  await refreshExceptions();
+  await refreshJobs();
+}
+
 async function openCrmOrderDetail(orderId) {
   currentCrmOrderDetailId = orderId;
+  currentCrmOrderDetailFlow = null;
   const modal = $("#crm-order-detail-modal");
   modal.hidden = false;
   $("#crm-order-detail-title").textContent = "订单详情";
   $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 正在加载";
   $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">正在读取订单详情...</div>`;
-  renderCrmOrderFlow({});
+  activateCrmOrderDetailTab("order");
   $("#crm-order-detail-fields").innerHTML = "";
   $("#crm-order-detail-delivery").innerHTML = "";
+  $("#crm-order-detail-party").innerHTML = "";
+  $("#crm-order-detail-products").innerHTML = "";
   $("#crm-order-detail-raw").textContent = "";
 
   try {
@@ -2748,7 +2841,7 @@ async function openCrmOrderDetail(orderId) {
     $("#crm-order-detail-title").textContent = row.crm_order_no || row.crm_order_id || "订单详情";
     $("#crm-order-detail-meta").innerHTML = `${h(row.source_system || "CRM")} · 同步时间 ${row.synced_at ? h(formatTime(row.synced_at)) : "未同步"} · ${h(row.crm_detail_message || "")}${
       ` <button class="button ghost mini" data-action="retry-crm-detail-sync" data-id="${h(row.id)}">强制重试详情同步</button>`
-    }`;
+    } <button class="button warn mini" data-action="delete-crm-order-local" data-id="${h(row.id)}" data-no="${h(row.crm_order_no || row.crm_order_id || "")}">删除本地订单</button>`;
     $("#crm-order-detail-summary").innerHTML = [
       ["订单金额", formatAmountHtml(row.order_amount, row.currency), row.currency || "CNY"],
       ["已回款", formatAmountHtml(row.received_amount, row.currency), "CRM 回款金额"],
@@ -2757,20 +2850,24 @@ async function openCrmOrderDetail(orderId) {
     ]
       .map(([label, value, hint]) => `<div class="metric"><span>${h(label)}</span><strong>${value}</strong><small>${h(hint)}</small></div>`)
       .join("");
-    renderCrmOrderFlow(row.flow || {});
+    currentCrmOrderDetailFlow = row.flow || {};
+    if ($("#crm-order-detail-tabs button[data-tab='flow']")?.classList.contains("active")) {
+      renderCrmOrderFlow(currentCrmOrderDetailFlow);
+    }
     $("#crm-order-detail-fields").innerHTML = [
       detailField("CRM 订单 ID", row.crm_order_id),
       detailField("销售订单编号", row.crm_order_no),
-      detailField("客户名称", row.customer_name),
-      detailField("客户 ID", row.customer_id),
       detailField("商机", row.opportunity_name),
-      detailField("销售", listOnlyValue(row.sales_user_name, row.crm_detail_status)),
-      detailField("部门", row.owner_department),
       detailField("下单日期", row.order_date),
       detailField("结算方式", row.settlement_method),
       detailField("币种", row.currency),
+      detailField("订单金额", formatAmount(row.order_amount, row.currency)),
+      detailField("已回款金额", formatAmount(row.received_amount, row.currency)),
+      detailField("待回款金额", formatAmount(row.receivable_amount, row.currency)),
       detailField("开票金额", formatAmount(row.invoice_amount, row.currency)),
       detailField("商品金额", formatAmount(row.product_amount, row.currency)),
+      detailField("生命周期", row.life_status),
+      detailField("审批状态", row.approval_status),
     ].join("");
     $("#crm-order-detail-delivery").innerHTML = [
       renderCrmOmsExtractionAlert(row),
@@ -2784,11 +2881,24 @@ async function openCrmOrderDetail(orderId) {
       detailFieldHtml("附件", renderCrmAttachments(row.attachments, row.attachment_files)),
       detailField("备注", listOnlyValue(row.remark, row.crm_detail_status)),
     ].join("");
+    $("#crm-order-detail-party").innerHTML = [
+      detailField("客户名称", row.customer_name),
+      detailField("客户 ID", row.customer_id),
+      detailField("销售", listOnlyValue(row.sales_user_name, row.crm_detail_status)),
+      detailField("部门", row.owner_department),
+      detailField("销售用户 ID", row.sales_user_id),
+      detailField("商机 ID", row.opportunity_id),
+    ].join("");
+    $("#crm-order-detail-products").innerHTML = renderCrmOrderProducts(row.order_items, row.currency);
     $("#crm-order-detail-raw").textContent = JSON.stringify(row.raw || row, null, 2);
   } catch (error) {
     $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 读取失败";
     $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">读取失败：${h(error.message || "未知错误")}</div>`;
-    renderCrmOrderFlow({});
+    currentCrmOrderDetailFlow = null;
+    $("#crm-order-detail-fields").innerHTML = "";
+    $("#crm-order-detail-delivery").innerHTML = "";
+    $("#crm-order-detail-party").innerHTML = "";
+    $("#crm-order-detail-products").innerHTML = "";
     $("#crm-order-detail-raw").textContent = "";
   }
 }
@@ -2796,6 +2906,7 @@ async function openCrmOrderDetail(orderId) {
 function closeCrmOrderDetail() {
   $("#crm-order-detail-modal").hidden = true;
   currentCrmOrderDetailId = "";
+  currentCrmOrderDetailFlow = null;
 }
 
 async function refreshOps() {
@@ -3287,13 +3398,17 @@ function renderCrmSyncRuns(runs = []) {
   node.innerHTML = runs.length
     ? runs
         .map(
-          (run) => `
+          (run) => {
+            const detail = run.detail || {};
+            const stage = detail.stage ? `${detail.stage}${detail.stage_at ? ` · ${formatTime(detail.stage_at)}` : ""}` : "";
+            return `
             <div class="row crm-sync-run-row">
-              <div><strong>${h(run.status || "")}</strong><br /><small>${h(run.trigger || "")} · ${h(formatTime(run.started_at))}</small></div>
+              <div><strong>${h(run.status || "")}</strong><br /><small>${h(run.trigger || "")} · ${h(formatTime(run.started_at))}</small>${stage ? `<br /><small>${h(stage)}</small>` : ""}</div>
               <div><small>合计 ${h(run.total_count || 0)} / 新增 ${h(run.created_count || 0)} / 更新 ${h(run.updated_count || 0)}</small><br /><small>未变 ${h(run.unchanged_count || 0)}</small></div>
               <div><small>${h(run.error_message || "")}</small></div>
             </div>
-          `
+          `;
+          }
         )
         .join("")
     : `<div class="row"><div>暂无同步记录</div></div>`;
@@ -3347,6 +3462,7 @@ async function refreshCrmOrders() {
                 <button class="button ghost compact-action" type="button" data-action="view-crm-order" data-id="${h(row.id)}">详情</button>
                 <button class="button ghost compact-action" type="button" data-action="queue-crm-v2" data-id="${h(row.id)}">入中台</button>
                 <button class="button ghost compact-action" type="button" data-action="process-crm-v2" data-id="${h(row.id)}">立即预审</button>
+                <button class="button warn compact-action" type="button" data-action="delete-crm-order-local" data-id="${h(row.id)}" data-no="${h(row.crm_order_no || row.crm_order_id || "")}">删除</button>
               </div>
             </div>
           `
@@ -4157,9 +4273,9 @@ async function runCrmBrowserAction(endpoint, body, pendingText, successText) {
 $("#crm-browser-start")?.addEventListener("click", async () => {
   await runCrmBrowserAction(
     "/api/crm/browser/start",
-    {},
-    "正在按当前配置启动 CRM 专用浏览器...",
-    "CRM 专用浏览器已启动"
+    { mode: "headless" },
+    "正在后台启动 CRM 专用浏览器...",
+    "CRM 后台专用浏览器已启动"
   );
 });
 
@@ -4217,6 +4333,10 @@ async function runCrmSyncAction(endpoint, pendingText) {
     await saveCrmConfig();
     const result = await api(endpoint, { method: "POST" });
     if (resultNode) resultNode.textContent = JSON.stringify(result, null, 2);
+    if (result?.busy) {
+      toast(result.message || "当前有 CRM 同步任务正在进行，请稍后重试。");
+      return;
+    }
     toast(result.message || "CRM 同步已触发");
     await refreshCrmOrders();
   } catch (error) {
@@ -4826,7 +4946,28 @@ $("#mail-detail-modal")?.addEventListener("click", (event) => {
 });
 
 $("#crm-order-detail-close")?.addEventListener("click", closeCrmOrderDetail);
+$("#crm-order-detail-tabs")?.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-tab]");
+  if (!button) return;
+  activateCrmOrderDetailTab(button.dataset.tab || "order");
+});
 $("#crm-order-detail-modal")?.addEventListener("click", async (event) => {
+  const deleteButton = event.target.closest("button[data-action='delete-crm-order-local']");
+  if (deleteButton) {
+    const id = deleteButton.dataset.id || currentCrmOrderDetailId;
+    const orderNo = deleteButton.dataset.no || "该订单";
+    if (!id) return;
+    deleteButton.disabled = true;
+    deleteButton.textContent = "删除中...";
+    try {
+      await deleteCrmOrderLocal(id, orderNo);
+    } catch (error) {
+      notifyError(error, ["CRM", "删除本地订单失败"]);
+      deleteButton.disabled = false;
+      deleteButton.textContent = "删除本地订单";
+    }
+    return;
+  }
   const actionButton = event.target.closest("button[data-action='retry-crm-detail-sync']");
   if (actionButton) {
     const id = actionButton.dataset.id || currentCrmOrderDetailId;
@@ -4834,7 +4975,13 @@ $("#crm-order-detail-modal")?.addEventListener("click", async (event) => {
     actionButton.disabled = true;
     actionButton.textContent = "同步中...";
     try {
-      await api(`/api/crm/orders/${id}/retry-detail-sync`, { method: "POST" });
+      const result = await api(`/api/crm/orders/${id}/retry-detail-sync`, { method: "POST" });
+      if (result?.busy) {
+        toast(result.message || "当前有 CRM 同步任务正在进行，请稍后重试。");
+        actionButton.disabled = false;
+        actionButton.textContent = "重试详情同步";
+        return;
+      }
       toast("CRM 订单详情已重新同步");
       await openCrmOrderDetail(id);
       await refreshCrmOrders();
@@ -6194,6 +6341,13 @@ document.addEventListener("click", async (e) => {
     e.preventDefault();
     await guardedAction(["订单管理", "查看订单详情"], async () => {
       await openCrmOrderDetail(target.dataset.id);
+    });
+  }
+
+  if (target.dataset.action === "delete-crm-order-local") {
+    e.preventDefault();
+    await guardedAction(["订单管理", "删除本地 CRM 订单"], async () => {
+      await deleteCrmOrderLocal(target.dataset.id, target.dataset.no || "该订单");
     });
   }
 

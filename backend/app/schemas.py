@@ -160,6 +160,7 @@ class CrmRuntimeConfigUpdate(BaseModel):
     crm_fxiaoke_detail_request_file: str | None = None
     crm_fxiaoke_detail_request_json: str | None = None
     crm_sync_page_size: int | None = None
+    crm_sync_max_pages: int | None = None
     crm_sync_timeout_seconds: int | None = None
     v2_crm_phase1_scope_enabled: bool | None = None
     v2_crm_phase1_scope_json: str | None = None

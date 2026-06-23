@@ -138,6 +138,7 @@ class OrderStatus(str, Enum):
     FINANCE_EXCEPTION = "FINANCE_EXCEPTION"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"
 
 
 class OrderEvent(str, Enum):
@@ -284,6 +285,7 @@ def transition_order(
 
 
 def crm_order_parsed_event(crm_order: CrmSalesOrder, *, trace_id: str | None = None) -> dict[str, Any]:
+    order_items = crm_order_parsed_event_items(crm_order)
     return {
         "trace_id": trace_id or f"crm-{crm_order.id}",
         "event_type": "CRM_ORDER_PARSED",
@@ -300,17 +302,24 @@ def crm_order_parsed_event(crm_order: CrmSalesOrder, *, trace_id: str | None = N
                 "currency": crm_order.currency or "CNY",
                 "sales_user_name": crm_order.sales_user_name,
             },
-            "order_items": [
-                {
-                    "sku_code": item.sku_code,
-                    "quantity": item.quantity,
-                    "unit_price": item.unit_price,
-                    "line_amount": item.line_amount,
-                }
-                for item in sorted(crm_order.items, key=lambda row: row.created_at)
-            ],
+            "order_items": order_items,
         },
     }
+
+
+def crm_order_parsed_event_items(crm_order: CrmSalesOrder) -> list[dict[str, Any]]:
+    return [
+        {
+            "sku_code": item.sku_code,
+            "product_name": item.product_name,
+            "specification": item.specification,
+            "quantity": item.quantity,
+            "unit_price": item.unit_price,
+            "line_amount": item.line_amount,
+            "raw": loads(item.raw_json, {}),
+        }
+        for item in sorted(crm_order.items, key=lambda row: row.created_at)
+    ]
 
 
 def enqueue_crm_order_parsed_event(session: Session, crm_order: CrmSalesOrder, *, trace_id: str | None = None) -> ProcessingJob:
@@ -367,6 +376,8 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
         raise DuplicateEventException(f"重复 CRM_ORDER_PARSED 事件：{crm_order.crm_order_id}/{payload_hash}")
     if existing_order is not None and is_crm_order_cancelled(crm_order):
         return handle_crm_cancel_confirmed(session, existing_order, crm_order, payload_hash=payload_hash, trace_id=trace_id)
+    if existing_order is not None and existing_order.status == OrderStatus.CANCELLED.value and not is_crm_order_cancelled(crm_order):
+        reactivate_cancelled_order_from_crm(session, existing_order, crm_order, trace_id=trace_id)
     if existing_order is not None and payload_hash and existing_order.payload_hash != payload_hash and existing_order.status != OrderStatus.CRM_APPROVED.value:
         change_result = handle_crm_snapshot_changed(session, existing_order, crm_order, new_payload_hash=payload_hash, trace_id=trace_id)
         if not change_result.get("continue_processing", False):
@@ -436,6 +447,30 @@ def reset_order_for_force_revalidate(session: Session, order: MiddlePlatformOrde
         )
     )
     return True
+
+
+def reactivate_cancelled_order_from_crm(session: Session, order: MiddlePlatformOrder, crm_order: CrmSalesOrder, *, trace_id: str = "") -> None:
+    old_status = order.status
+    order.status = OrderStatus.CRM_APPROVED.value
+    order.validated_at = None
+    order.validation_summary_json = "{}"
+    order.updated_at = now_utc()
+    session.add(
+        AuditEvent(
+            event_type="CancelledOrderReactivatedFromCrm",
+            related_object_type="MiddlePlatformOrder",
+            related_object_id=order.id,
+            detail=dumps(
+                {
+                    "from_status": old_status,
+                    "to_status": order.status,
+                    "crm_order_no": crm_order.crm_order_no,
+                    "payload_hash": crm_order.payload_hash,
+                    "trace_id": trace_id,
+                }
+            ),
+        )
+    )
 
 
 def handle_crm_snapshot_changed(
@@ -741,26 +776,6 @@ def sync_middle_order_items(session: Session, order: MiddlePlatformOrder, crm_or
     session.flush()
     source_items = list(crm_order.items)
     if not source_items:
-        raw = loads(crm_order.raw_json, {})
-        raw_items = raw.get("order_items") or raw.get("items") or []
-        if isinstance(raw_items, list):
-            item_payloads = apportioned_order_item_payloads(raw, [item for item in raw_items if isinstance(item, dict)])
-            for index, raw_item in enumerate(item_payloads):
-                if not isinstance(raw_item, dict):
-                    continue
-                session.add(
-                    MiddlePlatformOrderItem(
-                        order_id=order.id,
-                        sku_code=standard_sku_code_for_item(session, order, raw_item),
-                        product_name=str(raw_item.get("product_name") or raw_item.get("name") or "").strip() or None,
-                        shop_sku_code=raw_text_from_keys(raw_item, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"]),
-                        channel_code=order.channel_code,
-                        quantity=parse_decimal(raw_item.get("quantity") or raw_item.get("qty")),
-                        unit_price=parse_decimal(raw_item.get("unit_price")),
-                        line_amount=parse_decimal(raw_item.get("line_amount") or raw_item.get("amount")),
-                        raw_json=dumps({"index": index, **raw_item}),
-                    )
-                )
         return
     raw = loads(crm_order.raw_json, {})
     source_payloads = []
@@ -771,6 +786,7 @@ def sync_middle_order_items(session: Session, order: MiddlePlatformOrder, crm_or
                 **source_raw,
                 "sku_code": source.sku_code,
                 "product_name": source.product_name,
+                "specification": source.specification,
                 "quantity": source.quantity,
                 "unit_price": source.unit_price,
                 "line_amount": source.line_amount,
@@ -2405,15 +2421,19 @@ def build_validation_failure_mail_body(
     lines.extend(f"- {item}" for item in evidence_summary)
     lines.extend([
         "",
-        "预审失败项：",
+        "需处理事项：",
     ])
+    item_index = 1
     for result in failed:
-        lines.extend(format_validation_result_for_mail(result))
+        formatted = format_validation_result_for_mail(order, result, item_index)
+        if formatted:
+            lines.extend(formatted)
+            item_index += 1
     lines.extend(
         [
             "",
             "处理建议：",
-            "- 请按失败项分别补齐 CRM 字段、客户映射、商品/SKU 主数据、库存或附件资料。",
+            "- 请按上方事项分别补齐 CRM 字段、客户映射、商品/SKU 主数据、库存或附件资料。",
             "- 处理完成后重新同步该订单，系统会自动重新预审。",
             "",
             config_value(session, "bot_signature", "积木易搭AI机器人"),
@@ -2422,15 +2442,259 @@ def build_validation_failure_mail_body(
     return "\n".join(lines)
 
 
-def format_validation_result_for_mail(result: ValidationResult) -> list[str]:
+PHASE_ONE_FIELD_LABELS = {
+    "sales_user_name": "销售负责人",
+    "sales_user_email": "销售邮箱",
+    "owner_department": "归属部门",
+    "order_date": "订单日期",
+    "settlement_method": "结算方式",
+    "receipt_contact": "收货联系人",
+    "receipt_phone": "收货联系电话",
+    "receipt_address": "收货地址",
+    "currency": "币种",
+    "attachment_files": "关键附件",
+    "order_items": "订单商品明细",
+}
+
+
+def format_validation_result_for_mail(order: MiddlePlatformOrder, result: ValidationResult, index: int) -> list[str]:
     if result.rule_code == "ATTACHMENT_PRODUCT_CONSISTENCY":
-        return format_attachment_consistency_result_for_mail(result)
-    refs = "；".join(result.evidence_refs or [])
-    suffix = f"（{refs}）" if refs else ""
-    return [f"- {result.rule_code}：{result.reason}{suffix}"]
+        return format_attachment_consistency_result_for_mail(result, index)
+    if result.rule_code == "PHASE1_COMPLETE_PRE_REVIEW_FIELDS":
+        return format_phase_one_result_for_mail(order, result, index)
+    if result.rule_code in {"KNOWN_ACTIVE_SKU", "SKU_MAPPING_MISSING"}:
+        return format_sku_result_for_mail(result, index)
+    if result.rule_code == "CUSTOMER_MAPPING":
+        return [
+            f"{index}. 客户映射",
+            f"   当前值：{order.customer_name or '未填写'}",
+            "   不通过原因：系统未找到该客户对应的中台/OMS 客户映射。",
+            "   处理要求：请维护客户映射，或确认 OMS 客户资料是否已建立。",
+        ]
+    if result.rule_code == "HAS_ORDER_ITEMS":
+        return [
+            f"{index}. 商品明细",
+            "   当前值：未解析到商品明细",
+            "   不通过原因：CRM 订单没有解析到任何明细行。",
+            "   处理要求：请确认 CRM 订单中已填写商品、规格、数量等信息。",
+        ]
+    return [
+        f"{index}. {validation_result_title(result)}",
+        f"   当前值：{validation_current_value(result)}",
+        f"   不通过原因：{clean_validation_text(result.reason)}",
+        "   处理要求：请按原因修正后重新同步该订单。",
+    ]
 
 
-def format_attachment_consistency_result_for_mail(result: ValidationResult) -> list[str]:
+def format_phase_one_result_for_mail(order: MiddlePlatformOrder, result: ValidationResult, index: int) -> list[str]:
+    crm = order.crm_order
+    raw = loads(crm.raw_json, {}) if crm else {}
+    lines = [f"{index}. 一期完整性预审"]
+    sub_index = 1
+    refs = result.evidence_refs or []
+    for ref in refs:
+        field_match = re.fullmatch(r"(.+?)\(([\w_]+)\)", ref.strip())
+        if field_match:
+            raw_label, field = field_match.groups()
+            label = PHASE_ONE_FIELD_LABELS.get(field, raw_label)
+            lines.extend(
+                [
+                    f"   {sub_index}) {label}",
+                    "      当前值：未填写",
+                    f"      不通过原因：{label}缺失。",
+                    f"      处理要求：请在 CRM 订单中补充{label}。",
+                ]
+            )
+            sub_index += 1
+            continue
+        if ref.startswith("收货地址不是可邮寄详细地址："):
+            value = ref.split("：", 1)[1].strip()
+            lines.extend(
+                [
+                    f"   {sub_index}) 收货地址",
+                    f"      当前值：{value or '未填写'}",
+                    "      不通过原因：收货地址不是可邮寄的详细地址。",
+                    "      处理要求：请补充省市区、街道、门牌号等完整地址。",
+                ]
+            )
+            sub_index += 1
+            continue
+        if ref.startswith("CRM 审批状态未通过："):
+            value = ref.split("：", 1)[1].strip()
+            lines.extend(
+                [
+                    f"   {sub_index}) CRM 审批状态",
+                    f"      当前值：{value or '未填写'}",
+                    "      不通过原因：CRM 审批状态未达到可履约条件。",
+                    "      处理要求：请完成 CRM 审批后重新同步。",
+                ]
+            )
+            sub_index += 1
+            continue
+        if ref.startswith("CRM 订单生命状态异常："):
+            value = ref.split("：", 1)[1].strip()
+            lines.extend(
+                [
+                    f"   {sub_index}) CRM 订单生命状态",
+                    f"      当前值：{value or '未填写'}",
+                    "      不通过原因：CRM 订单当前生命状态不允许继续履约。",
+                    "      处理要求：请确认订单状态已恢复为正常/有效后重新同步。",
+                ]
+            )
+            sub_index += 1
+            continue
+        if ref == "附件未识别到盖章/签字 PO 或盖章/签字合同":
+            attachments = loads(crm.attachment_files_json, []) if crm else []
+            value = "、".join(str(item) for item in attachments) if isinstance(attachments, list) else str(attachments or "")
+            lines.extend(
+                [
+                    f"   {sub_index}) 关键附件",
+                    f"      当前值：{value or '未上传'}",
+                    "      不通过原因：附件中未识别到盖章/签字 PO 或盖章/签字合同。",
+                    "      处理要求：请补充有效盖章/签字文件，或确认附件解析结果。",
+                ]
+            )
+            sub_index += 1
+            continue
+        if raw and "life_status" in str(ref):
+            value = str(raw.get("life_status") or "").strip()
+            lines.extend(
+                [
+                    f"   {sub_index}) CRM 订单生命状态",
+                    f"      当前值：{value or '未填写'}",
+                    "      不通过原因：CRM 订单当前生命状态不允许继续履约。",
+                    "      处理要求：请确认订单状态已恢复为正常/有效后重新同步。",
+                ]
+            )
+            sub_index += 1
+            continue
+        lines.extend(
+            [
+                f"   {sub_index}) 基础资料",
+                f"      当前值：{validation_current_value(result)}",
+                f"      不通过原因：{clean_validation_text(ref)}",
+                "      处理要求：请按原因补充或修正 CRM 订单资料。",
+            ]
+        )
+        sub_index += 1
+    if sub_index == 1:
+        lines.extend(
+            [
+                "   当前值：资料不完整或不符合预审要求",
+                f"   不通过原因：{clean_validation_text(result.reason)}",
+                "   处理要求：请补齐 CRM 订单基础资料后重新同步。",
+            ]
+        )
+    return lines
+
+
+def format_sku_result_for_mail(result: ValidationResult, index: int) -> list[str]:
+    issues = sku_match_issues(result)
+    lines = [f"{index}. 商品/SKU 匹配问题"]
+    if not issues:
+        current_value = "未匹配到标准 SKU"
+        if result.rule_code == "SKU_MAPPING_MISSING":
+            current_value = "渠道 SKU 未匹配中台标准 SKU"
+        lines.extend(
+            [
+                f"   当前值：{current_value}",
+                f"   不通过原因：{clean_validation_text(result.reason)}",
+                "   处理要求：请维护标准 SKU、商品别名或渠道 SKU 映射。",
+            ]
+        )
+        return lines
+    for item_index, issue in enumerate(issues, start=1):
+        product_name = str(issue.get("product_name") or "").strip() or "未填写"
+        reason = str(issue.get("reason") or "").strip()
+        candidates = issue.get("candidates") if isinstance(issue.get("candidates"), list) else []
+        lines.extend(
+            [
+                f"   {item_index}. CRM 商品：{product_name}",
+                f"      当前值：{sku_current_value(reason)}",
+                f"      不通过原因：{sku_failure_reason(reason)}",
+                "      处理要求：请补充型号、版本、套装内容或标准 SKU 编码。",
+            ]
+        )
+        if candidates:
+            lines.extend(["", "      可能匹配项（按相似度排序）："])
+            for candidate_index, candidate in enumerate(sorted_sku_candidates(candidates), start=1):
+                sku_id = str(candidate.get("sku_id") or "-").strip()
+                name = str(candidate.get("product_name") or candidate.get("matched_value") or candidate.get("spu_id") or "-").strip()
+                confidence = int(candidate.get("confidence") or 0)
+                lines.append(f"      {candidate_index}）{sku_id}｜{name}｜相似度 {confidence}%")
+        else:
+            lines.extend(["", "      可能匹配项（按相似度排序）：暂无高置信度候选项"])
+    return lines
+
+
+def sku_match_issues(result: ValidationResult) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for ref in result.evidence_refs or []:
+        if not ref.startswith("SKU_MATCH_JSON:"):
+            continue
+        payload = loads(ref.split(":", 1)[1], {})
+        if isinstance(payload, dict):
+            issues.append(payload)
+    return issues
+
+
+def sorted_sku_candidates(candidates: list[Any]) -> list[dict[str, Any]]:
+    dict_candidates = [item for item in candidates if isinstance(item, dict)]
+    return sorted(
+        dict_candidates,
+        key=lambda item: (int(item.get("confidence") or 0), int(item.get("score") or 0)),
+        reverse=True,
+    )
+
+
+def sku_current_value(reason: str) -> str:
+    if reason == "ambiguous":
+        return "候选 SKU 过多，无法自动选择"
+    if reason == "low_confidence":
+        return "候选 SKU 相似度不足，无法自动选择"
+    if reason == "not_found":
+        return "未匹配到标准 SKU"
+    return "未匹配到唯一标准 SKU"
+
+
+def sku_failure_reason(reason: str) -> str:
+    if reason == "ambiguous":
+        return "商品描述过于泛化，匹配到多个相似 SKU。"
+    if reason == "low_confidence":
+        return "系统找到相似商品，但相似度不足，无法自动判断。"
+    if reason == "not_found":
+        return "系统没有找到足够相似的标准商品或别名。"
+    return "系统无法根据当前商品信息确认唯一标准 SKU。"
+
+
+def validation_result_title(result: ValidationResult) -> str:
+    names = {
+        "REQUIRED_HEAD_FIELDS": "订单头基础字段",
+        "POSITIVE_ORDER_AMOUNT": "订单金额",
+        "AMOUNT_CONSISTENCY": "金额一致性",
+        "RULE_SKU_BOM_MATCH": "SKU/BOM 匹配",
+        "RULE_CONTRACT_AMOUNT_CONSISTENCY": "合同金额一致性",
+        "LOCAL_INVENTORY_AVAILABLE": "本地库存",
+    }
+    return names.get(result.rule_code, "预审检查")
+
+
+def validation_current_value(result: ValidationResult) -> str:
+    refs = [clean_validation_text(ref) for ref in result.evidence_refs or [] if str(ref or "").strip()]
+    return "；".join(refs[:3]) if refs else "见不通过原因"
+
+
+def clean_validation_text(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\(([a-zA-Z_][a-zA-Z0-9_]*)(?:[,，]\s*[a-zA-Z_][a-zA-Z0-9_]*)*\)", "", text)
+    text = text.replace("CRM.customer_name=", "客户名称：")
+    text = text.replace("OMS.customer.query=", "OMS 客户查询：")
+    text = text.replace("配置项 v2_customer_mapping_json", "客户映射配置")
+    text = text.replace("SKU_MATCH_JSON:", "")
+    return text
+
+
+def format_attachment_consistency_result_for_mail(result: ValidationResult, index: int) -> list[str]:
     issue_text = result.reason
     prefix = "CRM 订单产品与附件解析内容不一致："
     if issue_text.startswith(prefix):
@@ -2439,7 +2703,10 @@ def format_attachment_consistency_result_for_mail(result: ValidationResult) -> l
     for raw_issue in [part.strip() for part in re.split(r"[；;]", issue_text) if part.strip()]:
         rows.append(_attachment_consistency_issue_row(raw_issue))
     lines = [
-        f"- {result.rule_code}：CRM 订单产品与附件解析内容不一致",
+        f"{index}. 附件商品一致性",
+        "   当前值：CRM 订单产品与附件解析内容不一致",
+        "   不通过原因：CRM 订单产品与附件解析内容不一致",
+        "   处理要求：请核对 CRM 商品明细和附件中的产品、数量、单价、金额。",
     ]
     if not rows:
         return lines

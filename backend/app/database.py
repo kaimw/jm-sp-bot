@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterator
 
 from sqlalchemy.engine import make_url
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from backend.app.config import settings
@@ -41,7 +41,7 @@ def database_runtime_info() -> dict:
 
 def engine_kwargs(database_url: str) -> dict:
     if database_url.startswith("sqlite"):
-        return {"connect_args": {"check_same_thread": False}}
+        return {"connect_args": {"check_same_thread": False, "timeout": 30}}
     return {"pool_pre_ping": True}
 
 
@@ -61,6 +61,17 @@ if db_path is not None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(database_url, **engine_kwargs(database_url))
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_busy_timeout(dbapi_connection, connection_record) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

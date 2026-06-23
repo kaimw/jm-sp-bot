@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1360" viewBox="0 0 900 1360" role="img" aria-labelledby="title desc">
+  <title id="title">图1：核心业务流程图（第一期目标流程）</title>
+  <desc id="desc">CRM 创建订单、审批、中台预审、OMS 履约、ERP 财务闭环和归档的第一期目标流程。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L8,3 z" fill="#455a64"/>
+    </marker>
+    <style>
+      .title { font: 700 24px "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #1f2937; }
+      .box-title { font: 700 15px "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #263238; }
+      .box-text { font: 13px "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #4b5563; }
+      .small { font: 12px "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #667085; }
+      .line { stroke: #455a64; stroke-width: 1.7; fill: none; marker-end: url(#arrow); }
+      .branch { stroke: #607d8b; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+      .label { font: 12px "PingFang SC", "Microsoft YaHei", Arial, sans-serif; fill: #475467; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="1360" fill="#ffffff"/>
+  <text x="450" y="42" text-anchor="middle" class="title">图1：核心业务流程图（第一期目标流程）</text>
+
+  <!-- Main flow boxes -->
+  <rect x="300" y="70" width="300" height="66" rx="4" fill="#e8f5e9" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="97" text-anchor="middle" class="box-title">销售在 CRM 创建订单</text>
+  <text x="450" y="119" text-anchor="middle" class="box-text">合同 / 客户 / SKU / 交付条款 / 附件</text>
+
+  <rect x="300" y="170" width="300" height="66" rx="4" fill="#e8f5e9" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="197" text-anchor="middle" class="box-title">CRM 审批完成</text>
+  <text x="450" y="219" text-anchor="middle" class="box-text">形成最终状态订单</text>
+
+  <rect x="300" y="270" width="300" height="66" rx="4" fill="#eaf2ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="297" text-anchor="middle" class="box-title">商务 AI Agent 中台</text>
+  <text x="450" y="319" text-anchor="middle" class="box-text">拉取 / 接收 CRM 订单</text>
+
+  <rect x="300" y="370" width="300" height="72" rx="4" fill="#eaf2ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="399" text-anchor="middle" class="box-title">字段标准化与主数据匹配</text>
+  <text x="450" y="421" text-anchor="middle" class="box-text">客户 / 料号 / 仓库 / 主体 / 金额</text>
+
+  <polygon points="450,482 575,542 450,602 325,542" fill="#fff7e6" stroke="#b26a00" stroke-width="1.6"/>
+  <text x="450" y="536" text-anchor="middle" class="box-title">自动预审</text>
+  <text x="450" y="558" text-anchor="middle" class="box-text">是否通过?</text>
+
+  <rect x="300" y="640" width="300" height="66" rx="4" fill="#eaf2ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="667" text-anchor="middle" class="box-title">生成发货通知单</text>
+  <text x="450" y="689" text-anchor="middle" class="box-text">写入 / 推送 OMS</text>
+
+  <rect x="300" y="740" width="300" height="66" rx="4" fill="#f2e8ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="767" text-anchor="middle" class="box-title">OMS 发货审核</text>
+  <text x="450" y="789" text-anchor="middle" class="box-text">库存 / 仓库 / 拆单 / 特殊要求</text>
+
+  <polygon points="450,846 575,906 450,966 325,906" fill="#fff7e6" stroke="#b26a00" stroke-width="1.6"/>
+  <text x="450" y="900" text-anchor="middle" class="box-title">库存与发货条件</text>
+  <text x="450" y="922" text-anchor="middle" class="box-text">是否满足?</text>
+
+  <rect x="300" y="1000" width="300" height="66" rx="4" fill="#f2e8ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="1027" text-anchor="middle" class="box-title">仓库拣货 / 装箱 / 贴标</text>
+  <text x="450" y="1049" text-anchor="middle" class="box-text">物流报关 / 清关 / 发运</text>
+
+  <rect x="300" y="1100" width="300" height="66" rx="4" fill="#f2e8ff" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="1127" text-anchor="middle" class="box-title">OMS 回写发货 / 在途 / 签收状态</text>
+  <text x="450" y="1149" text-anchor="middle" class="box-text">物流平台补充签收凭证</text>
+
+  <!-- Side boxes -->
+  <rect x="55" y="490" width="225" height="88" rx="4" fill="#fff0f0" stroke="#455a64" stroke-width="1.6"/>
+  <text x="167.5" y="521" text-anchor="middle" class="box-title">异常工单</text>
+  <text x="167.5" y="543" text-anchor="middle" class="box-text">退回销售 / 商务补正</text>
+  <text x="167.5" y="565" text-anchor="middle" class="box-text">并通知相关人</text>
+
+  <rect x="55" y="855" width="225" height="88" rx="4" fill="#fff9eb" stroke="#455a64" stroke-width="1.6"/>
+  <text x="167.5" y="886" text-anchor="middle" class="box-title">缺货 / 不满足</text>
+  <text x="167.5" y="908" text-anchor="middle" class="box-text">触发生产或补货任务</text>
+  <text x="167.5" y="930" text-anchor="middle" class="box-text">保留人工确认</text>
+
+  <rect x="640" y="390" width="210" height="138" rx="5" fill="#fffbe6" stroke="#d48806" stroke-width="1.4"/>
+  <text x="745" y="421" text-anchor="middle" class="box-title">AI Agent 重点</text>
+  <text x="670" y="449" class="box-text">• 识别缺字段 / 错料号</text>
+  <text x="670" y="474" class="box-text">• 解释异常原因</text>
+  <text x="670" y="499" class="box-text">• 生成处理建议</text>
+  <text x="670" y="524" class="box-text">• 自动通知责任人</text>
+
+  <rect x="300" y="1200" width="300" height="66" rx="4" fill="#e6fffb" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="1227" text-anchor="middle" class="box-title">金蝶 ERP 财务闭环</text>
+  <text x="450" y="1249" text-anchor="middle" class="box-text">销售出库 / 发票 / 回款核验</text>
+
+  <rect x="300" y="1300" width="300" height="66" rx="4" fill="#e8f5e9" stroke="#455a64" stroke-width="1.6"/>
+  <text x="450" y="1327" text-anchor="middle" class="box-title">订单完成归档</text>
+  <text x="450" y="1349" text-anchor="middle" class="box-text">看板 / 报表 / 审计日志</text>
+
+  <!-- Main vertical lines -->
+  <path class="line" d="M450 136 L450 170"/>
+  <path class="line" d="M450 236 L450 270"/>
+  <path class="line" d="M450 336 L450 370"/>
+  <path class="line" d="M450 442 L450 482"/>
+  <path class="line" d="M450 602 L450 640"/>
+  <path class="line" d="M450 706 L450 740"/>
+  <path class="line" d="M450 806 L450 846"/>
+  <path class="line" d="M450 966 L450 1000"/>
+  <path class="line" d="M450 1066 L450 1100"/>
+  <path class="line" d="M450 1166 L450 1200"/>
+  <path class="line" d="M450 1266 L450 1300"/>
+
+  <!-- Branch lines -->
+  <path class="branch" d="M325 542 L280 542"/>
+  <text x="294" y="526" text-anchor="middle" class="label">否</text>
+  <path class="branch" d="M167.5 490 C167.5 410 250 406 300 406"/>
+  <text x="211" y="428" class="small">修正后重审</text>
+
+  <path class="branch" d="M325 906 L280 906"/>
+  <text x="294" y="890" text-anchor="middle" class="label">否</text>
+  <path class="branch" d="M167.5 855 C167.5 772 248 773 300 773"/>
+  <text x="205" y="795" class="small">补货 / 生产完成</text>
+
+  <text x="591" y="627" class="label">是</text>
+  <text x="591" y="991" class="label">是</text>
+  <path class="branch" d="M640 459 L600 459 L600 406"/>
+</svg>

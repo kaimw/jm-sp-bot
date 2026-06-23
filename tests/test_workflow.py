@@ -715,11 +715,14 @@ def test_inventory_type_items_lists_material_warehouse_details():
     assert zero_only["summary"]["zero_stock_count"] == 1
 
 
-def test_system_enable_requires_model_bot_and_department_config():
+def test_system_enable_requires_model_bot_and_department_config(monkeypatch):
+    from backend.app import main
     from backend.app.main import config, update_mail_config
     from backend.app.schemas import MailRuntimeConfigUpdate
 
     session = make_session()
+    kicked: list[str] = []
+    monkeypatch.setattr(main, "kick_mail_worker_once_async", lambda reason="manual-start": kicked.append(reason))
 
     readiness = config(session)["startup_readiness"]
     assert readiness["ready"] is False
@@ -758,7 +761,9 @@ def test_system_enable_requires_model_bot_and_department_config():
     result = update_mail_config(MailRuntimeConfigUpdate(bot_email_password="mail-secret", bot_enabled=True), session)
 
     assert result["startup_readiness"]["ready"] is True
-    assert session.get(SystemConfig, "bot_enabled").value == "True"
+    assert session.get(SystemConfig, "bot_enabled").value == "true"
+    assert result["worker_kickoff"] == {"triggered": True, "reason": "bot-enabled"}
+    assert kicked == ["bot-enabled"]
 
 
 def test_system_enable_rejects_invalid_department_main_email():
@@ -799,7 +804,8 @@ def test_department_upsert_rejects_invalid_main_email():
     assert "主送邮箱格式不合法" in exc.value.detail
 
 
-def test_delete_department_hides_it_and_disables_system_when_last_recipient():
+def test_delete_department_hides_it_and_disables_system_when_last_recipient(monkeypatch):
+    from backend.app import main
     from backend.app.main import delete_department, list_departments, update_mail_config
     from backend.app.schemas import MailRuntimeConfigUpdate
 
@@ -810,6 +816,7 @@ def test_delete_department_hides_it_and_disables_system_when_last_recipient():
         state = State()
 
     session = make_session()
+    monkeypatch.setattr(main, "kick_mail_worker_once_async", lambda reason="manual-start": None)
     configure_department(session)
     model = session.query(ModelProviderConfig).one()
     set_config(session, "model_api_key", "runtime-secret", is_secret=True)
@@ -1245,7 +1252,7 @@ def test_database_url_normalization_masking_and_health():
     assert mask_database_url("postgresql://user:secret@db.example.com/app") == (
         "postgresql+psycopg://user:***@db.example.com/app"
     )
-    assert engine_kwargs("sqlite:///data/app.db") == {"connect_args": {"check_same_thread": False}}
+    assert engine_kwargs("sqlite:///data/app.db") == {"connect_args": {"check_same_thread": False, "timeout": 30}}
     assert engine_kwargs("postgresql+psycopg://user:secret@db.example.com/app") == {"pool_pre_ping": True}
 
     session = make_session()
@@ -2340,6 +2347,27 @@ def test_legacy_order_cancel_mail_without_task_is_ignored_without_exception():
     audit = session.query(AuditEvent).filter_by(event_type="LegacyMailOrderMutationIgnored", related_object_id=mail.id).one()
     detail = loads(audit.detail, {})
     assert detail["classification"] == "OrderCancelRequest"
+
+
+def test_legacy_logistics_confirmation_without_task_is_ignored_without_exception():
+    session = make_session()
+    mail = create_inbound_mail(
+        session,
+        from_address="logistics@jimuyida.com",
+        subject="Re: [物流核查单][LT-20260519-0001] 库存满足",
+        body_text="库存满足，可以安排发货。",
+    )
+    mail.classification = "LogisticsShipmentConfirmation"
+    mail.classification_confidence = 99
+
+    result = process_mail_direct(session, mail)
+    session.commit()
+
+    assert result is None
+    assert session.query(ExceptionCase).filter_by(exception_type="MailTaskLinkFailed").count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="LegacyMailTaskLinkIgnored", related_object_id=mail.id).one()
+    detail = loads(audit.detail, {})
+    assert detail["classification"] == "LogisticsShipmentConfirmation"
 
 
 def test_source_mail_exceptions_are_merged_into_one_record():

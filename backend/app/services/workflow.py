@@ -3576,17 +3576,7 @@ def handle_classified_mail(session: Session, mail: MailMessage) -> object | None
                 {"classification": mail.classification, "reason": "一期订单流由 CRM 详情驱动，不再处理销售邮件变更/撤销建单链路。"},
             )
             return None
-        record_exception_case(
-            session,
-            exception_type="MailTaskLinkFailed",
-            severity="Medium",
-            detail={
-                "source_mail_id": mail.id,
-                "classification": mail.classification,
-                "subject": mail.subject,
-            },
-            source_mail_id=mail.id,
-        )
+        record_legacy_mail_task_link_ignored(session, mail)
         return None
 
     if task.status == "Closed" and mail.classification in {"OrderChangeRequest", "ProductionScheduleConfirmation", "ProductionQuestion", "SalesClarificationReply"}:
@@ -3641,6 +3631,20 @@ def record_non_target_exception(
             "llm_reason": llm_result.reason if llm_result else "",
             "conversation_task_id": task.id if task else None,
             "task_no": task.task_no if task else None,
+        },
+    )
+
+
+def record_legacy_mail_task_link_ignored(session: Session, mail: MailMessage) -> None:
+    add_audit(
+        session,
+        "LegacyMailTaskLinkIgnored",
+        "MailMessage",
+        mail.id,
+        {
+            "classification": mail.classification,
+            "subject": mail.subject,
+            "reason": "一期订单流由 CRM/OMS 驱动，旧邮件生产任务关联失败不再进入异常队列。",
         },
     )
 
@@ -3705,13 +3709,7 @@ def process_inbound_mail(session: Session, mail: MailMessage) -> object | None:
                 {"classification": mail.classification, "reason": "一期订单流由 CRM 详情驱动，不再处理销售邮件变更/撤销建单链路。"},
             )
             return None
-        record_exception_case(
-            session,
-            exception_type="MailTaskLinkFailed",
-            severity="Medium",
-            detail={"source_mail_id": mail.id, "classification": mail.classification, "subject": mail.subject, "message": f"邮件分类为 {mail.classification}，但无法关联到生产任务。"},
-            source_mail_id=mail.id,
-        )
+        record_legacy_mail_task_link_ignored(session, mail)
         return None
 
     if task.status == "Closed" and mail.classification in {"OrderChangeRequest", "ProductionScheduleConfirmation", "ProductionQuestion", "SalesClarificationReply"}:

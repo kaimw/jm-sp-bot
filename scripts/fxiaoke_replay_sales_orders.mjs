@@ -5,6 +5,7 @@ const CDP_URL = process.env.FXIAOKE_CDP_URL || "http://127.0.0.1:9333";
 const DEFAULT_PROBE = process.env.FXIAOKE_PROBE_FILE || "";
 const PAGE_SIZE = Number(process.env.FXIAOKE_PAGE_SIZE || "20");
 const MAX_PAGES = Number(process.env.FXIAOKE_MAX_PAGES || "0");
+const MIN_ORDER_DATE = String(process.env.FXIAOKE_MIN_ORDER_DATE || "").trim();
 const DETAIL_ENABLED = !["0", "false", "no", "off"].includes(String(process.env.FXIAOKE_DETAIL_ENABLED || "true").toLowerCase());
 const REQUEST_TIMEOUT_MS = Number(process.env.FXIAOKE_REQUEST_TIMEOUT_MS || "15000");
 const DOM_FALLBACK_ENABLED = !["0", "false", "no", "off"].includes(String(process.env.FXIAOKE_DOM_FALLBACK_ENABLED || "true").toLowerCase());
@@ -16,6 +17,9 @@ const CDP_COMMAND_TIMEOUT_MS = Number(process.env.FXIAOKE_CDP_COMMAND_TIMEOUT_MS
 const LOGIN_COOLDOWN_MS = Number(process.env.FXIAOKE_LOGIN_COOLDOWN_MS || String(10 * 60 * 1000));
 const LOGIN_SETTLE_MS = Number(process.env.FXIAOKE_LOGIN_SETTLE_MS || "8000");
 const LOGIN_STATE_FILE = process.env.FXIAOKE_LOGIN_STATE_FILE || "/private/tmp/fxiaoke-login-renewal-state.json";
+const REQUEST_RETRY_MAX = Number(process.env.FXIAOKE_REQUEST_RETRY_MAX || "2");
+const REQUEST_RETRY_DELAY_MS = Number(process.env.FXIAOKE_REQUEST_RETRY_DELAY_MS || "1000");
+const DETAIL_CONCURRENCY = Number(process.env.FXIAOKE_DETAIL_CONCURRENCY || "3");
 
 function parseArg(name, fallback = "") {
   const prefix = `--${name}=`;
@@ -103,6 +107,12 @@ function timestampToDate(value) {
     month: "2-digit",
     day: "2-digit",
   }).format(date);
+}
+
+function isBeforeMinOrderDate(row) {
+  if (!MIN_ORDER_DATE) return false;
+  const dateText = cleanText(row?.order_date);
+  return /^\d{4}-\d{2}-\d{2}$/.test(dateText) && dateText < MIN_ORDER_DATE;
 }
 
 function describeFields(body) {
@@ -198,6 +208,14 @@ async function writeLoginState(patch) {
 
 function manualLoginRequired(reason) {
   return new Error(`CRM 登录态已过期，自动续租未完成：${reason}。请人工打开 CRM 专用浏览器完成登录后再重试同步。`);
+}
+
+function isLoginUrl(url) {
+  return /loginv2|\/login/i.test(String(url || ""));
+}
+
+function isFxiaokeHomeUrl(url) {
+  return /fxiaoke\.com\/XV\/UI\/Home/i.test(String(url || "")) && !isLoginUrl(url);
 }
 
 function applyTemplate(value, row) {
@@ -414,6 +432,64 @@ async function firstPage(browser) {
   return context.pages()[0] || (await context.newPage());
 }
 
+// --- 并发控制工具 ---
+
+function semaphore(max) {
+  let running = 0;
+  const queue = [];
+  const next = () => {
+    if (queue.length === 0 || running >= max) return;
+    running += 1;
+    const { resolve } = queue.shift();
+    resolve();
+  };
+  return {
+    acquire() {
+      return new Promise((resolve) => {
+        queue.push({ resolve });
+        next();
+      });
+    },
+    release() {
+      running -= 1;
+      next();
+    },
+    get running() { return running; },
+  };
+}
+
+// --- CDP 页面工厂（支持断线重连）---
+
+function createPageFactory() {
+  let currentPage = null;
+  let factoryPromise = null;
+
+  return {
+    /** 获取或创建 CDP 连接 */
+    async getOrCreate() {
+      if (currentPage) return currentPage;
+      if (factoryPromise) return factoryPromise;
+      factoryPromise = connectReplayPage().then((page) => {
+        currentPage = page;
+        factoryPromise = null;
+        return page;
+      }).catch((err) => {
+        factoryPromise = null;
+        throw err;
+      });
+      return factoryPromise;
+    },
+
+    /** 标记当前连接已失效，下次获取时自动重连 */
+    invalidate() {
+      if (currentPage) {
+        currentPage.close().catch(() => {});
+        currentPage = null;
+      }
+    },
+  };
+}
+
 async function connectReplayPage() {
   const baseUrl = CDP_URL.replace(/\/$/, "");
   const version = await fetch(`${baseUrl}/json/version`).then(async (response) => {
@@ -456,6 +532,28 @@ async function connectReplayPage() {
   });
   let targets = await send("Target.getTargets");
   let pages = (targets.targetInfos || []).filter((target) => target.type === "page");
+
+  // 关闭多余页签，只保留一个最佳候选页，减少登录态干扰
+  if (pages.length > 1) {
+    const pagePriority = (p) => {
+      const url = String(p.url || "");
+      if (url.includes("crm/list/=/SalesOrderObj") && !isLoginUrl(url)) return 0;
+      if (isFxiaokeHomeUrl(url)) return 1;
+      if (!isLoginUrl(url)) return 2;
+      return 3;  // 登录页优先级最低
+    };
+    const sorted = [...pages].sort((a, b) => pagePriority(a) - pagePriority(b));
+    const keep = sorted[0];
+    for (const page of pages) {
+      if (page.id !== keep.id) {
+        await send("Target.closeTarget", { targetId: page.id }).catch(() => {});
+      }
+    }
+    // 刷新页面列表
+    targets = await send("Target.getTargets");
+    pages = (targets.targetInfos || []).filter((t) => t.type === "page");
+  }
+
   if (!pages.length) {
     await send("Target.createTarget", {
       url: "https://www.fxiaoke.com/XV/UI/Home#crm/list/=/SalesOrderObj",
@@ -464,13 +562,18 @@ async function connectReplayPage() {
     targets = await send("Target.getTargets");
     pages = (targets.targetInfos || []).filter((target) => target.type === "page");
   }
-  let target = pages.find((page) => String(page.url || "").includes("crm/list/=/SalesOrderObj"));
+  // 优先选择已登录的 CRM 页面，即使停留在登录页也接受（后续 autoLogin 会处理）
+  let target = pages.find((page) => String(page.url || "").includes("crm/list/=/SalesOrderObj") && !isLoginUrl(page.url))
+    || pages.find((page) => isFxiaokeHomeUrl(page.url))
+    || pages.find((page) => !isLoginUrl(page.url))
+    || pages[0];
   if (!target) {
     const created = await send("Target.createTarget", { url: CRM_HOME_URL });
     await new Promise((resolve) => setTimeout(resolve, 2500));
     targets = await send("Target.getTargets");
     target = (targets.targetInfos || []).find((item) => item.targetId === created.targetId)
-      || (targets.targetInfos || []).find((item) => item.type === "page" && String(item.url || "").includes("crm/list/=/SalesOrderObj"));
+      || (targets.targetInfos || []).find((item) => item.type === "page" && String(item.url || "").includes("crm/list/=/SalesOrderObj") && !isLoginUrl(item.url))
+      || (targets.targetInfos || []).find((item) => item.type === "page" && isFxiaokeHomeUrl(item.url));
   }
   if (!target) throw new Error("No SalesOrderObj page target found from CDP");
   const attached = await send("Target.attachToTarget", { targetId: target.targetId, flatten: true });
@@ -497,6 +600,23 @@ async function connectReplayPage() {
     },
     async navigate(url) {
       await send("Page.navigate", { url }, sessionId);
+    },
+    async getActiveFsToken() {
+      try {
+        const result = await send("Network.getCookies", {}, sessionId);
+        const cookie = (result.cookies || []).find((c) => c.name === "fs_token");
+        if (cookie?.value) return cookie.value;
+      } catch (err) {
+        console.error("Failed to get fs_token via CDP Network.getCookies:", err);
+      }
+      try {
+        const cookieStr = await this.evaluate(() => document.cookie);
+        const match = cookieStr.match(/(?:^|; )fs_token=([^;]*)/);
+        if (match) return match[1];
+      } catch (err) {
+        console.error("Failed to get fs_token via document.cookie:", err);
+      }
+      return "";
     },
     async readProfileEmail(employeeId) {
       const id = cleanText(employeeId);
@@ -529,6 +649,76 @@ async function connectReplayPage() {
       socket.close();
     },
   };
+}
+
+function injectActiveToken(request, token) {
+  if (!token || !request?.url) return request;
+  try {
+    const urlObj = new URL(request.url);
+    urlObj.searchParams.set("_fs_token", token);
+    request.url = urlObj.toString();
+  } catch (err) {
+    console.error("Failed to inject active token into URL:", err);
+  }
+  return request;
+}
+
+async function fetchOrderItemsViaApi(page, token, orderId) {
+  const url = `/FHH/EM1HNCRM/API/v1/object/SalesOrderProductObj/controller/List?_fs_token=${token}`;
+  const payload = {
+    serializeEmpty: false,
+    extractExtendInfo: true,
+    object_describe_api_name: "SalesOrderProductObj",
+    search_template_id: "5d0c806a7cfed91f3e95ba8e",
+    include_describe: false,
+    include_layout: false,
+    need_tag: true,
+    search_template_type: "default",
+    ignore_scene_record_type: false,
+    search_query_info: JSON.stringify({
+      limit: 100,
+      offset: 0,
+      filters: [
+        {
+          field_name: "order_id",
+          field_values: [orderId],
+          operator: "EQ"
+        }
+      ]
+    })
+  };
+  try {
+    const response = await page.evaluate(
+      async ({ url, payload }) => {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json;charset=UTF-8",
+          },
+          body: JSON.stringify(payload)
+        });
+        return res.json();
+      },
+      { url, payload }
+    );
+    if (response.Result?.StatusCode === 0 && response.Value?.dataList) {
+      return response.Value.dataList.map((item, index) => {
+        return {
+          product_name: item.product_id__r || item.name || "",
+          specification: item.specification || item.model || "",
+          quantity: String(item.quantity || ""),
+          unit_price: String(item.sales_price || ""),
+          line_amount: String(item.subtotal || ""),
+          sku_code: item.product_id || "",
+          crm_item_id: item._id || `${orderId}:${index + 1}`,
+          raw: item
+        };
+      });
+    }
+  } catch (err) {
+    console.error(`Failed to fetch order items via API for ${orderId}:`, err);
+  }
+  return [];
 }
 
 async function autoLogin(page) {
@@ -632,41 +822,154 @@ async function ensureLoggedInForDom(page, reason = "当前页面停留在 CRM �
   return loginState;
 }
 
+async function ensureLoggedInForSync(page) {
+  // 第一轮：标准登录检查和修复
+  await ensureLoggedInForDom(page, "CRM 同步前发现登录态失效");
+  let state = await page.evaluate(() => {
+    const text = String(document.body?.innerText || "").slice(0, 800);
+    const hasPasswordInput = Array.from(document.querySelectorAll("input"))
+      .some((input) => {
+        const rect = input.getBoundingClientRect();
+        const style = getComputedStyle(input);
+        return String(input.type || "").toLowerCase() === "password"
+          && rect.width > 0
+          && rect.height > 0
+          && style.visibility !== "hidden"
+          && style.display !== "none";
+      });
+    return {
+      url: location.href,
+      title: document.title || "",
+      isLoginPage: /loginv2|login/i.test(location.href) || hasPasswordInput || /验证码|短信|安全验证|账号登录|密码登录/.test(text),
+      isFxiaokeHome: /fxiaoke\.com\/XV\/UI\/Home/i.test(location.href),
+      hasSalesOrderRoute: /SalesOrderObj/.test(location.href),
+      hasCaptchaOrRisk: /验证码|短信|安全验证|滑块|拖动|二次验证|人机验证|风险|扫码/.test(text),
+    };
+  });
+
+  // 第二轮：如果仍在登录页且未检测到风控验证码，做一次完整的重新登录
+  if (state?.isLoginPage && !state?.hasCaptchaOrRisk && CRM_USERNAME && CRM_PASSWORD) {
+    // 先导航到 CRM 首页清除可能卡住的中间态
+    await page.navigate(CRM_HOME_URL);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // 再次尝试自动登录
+    await autoLogin(page);
+    await page.navigate(CRM_HOME_URL);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    // 重新检查状态
+    state = await page.evaluate(() => {
+      const text = String(document.body?.innerText || "").slice(0, 800);
+      const hasPasswordInput = Array.from(document.querySelectorAll("input"))
+        .some((input) => {
+          const rect = input.getBoundingClientRect();
+          const style = getComputedStyle(input);
+          return String(input.type || "").toLowerCase() === "password"
+            && rect.width > 0
+            && rect.height > 0
+            && style.visibility !== "hidden"
+            && style.display !== "none";
+        });
+      return {
+        url: location.href,
+        title: document.title || "",
+        isLoginPage: /loginv2|login/i.test(location.href) || hasPasswordInput || /验证码|短信|安全验证|账号登录|密码登录/.test(text),
+        isFxiaokeHome: /fxiaoke\.com\/XV\/UI\/Home/i.test(location.href),
+        hasSalesOrderRoute: /SalesOrderObj/.test(location.href),
+        hasCaptchaOrRisk: /验证码|短信|安全验证|滑块|拖动|二次验证|人机验证|风险|扫码/.test(text),
+      };
+    });
+  }
+
+  if (state?.isLoginPage) {
+    if (state?.hasCaptchaOrRisk) {
+      throw manualLoginRequired(`CRM 触发了风控验证（验证码/滑块/安全验证），请人工打开 CRM 专用浏览器完成验证后再重试同步。`);
+    }
+    throw manualLoginRequired(`CRM 自动登录失败，浏览器仍停留在登录页：${state.title || state.url || "login"}。请检查 CRM 账号密码配置是否正确，或人工完成登录。`);
+  }
+  if (!state?.hasSalesOrderRoute) {
+    await page.navigate(CRM_HOME_URL);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    let afterNavigate = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title || "",
+      text: String(document.body?.innerText || "").slice(0, 800),
+    }));
+    if (/loginv2|login/i.test(afterNavigate.url) || /验证码|短信|安全验证|账号登录|密码登录/.test(afterNavigate.text || "")) {
+      throw manualLoginRequired(`跳转销售订单列表后仍需登录：${afterNavigate.title || afterNavigate.url || "login"}`);
+    }
+    if (!/SalesOrderObj/.test(afterNavigate.url || "")) {
+      await page.evaluate(() => {
+        location.hash = "crm/list/=/SalesOrderObj";
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      afterNavigate = await page.evaluate(() => ({
+        url: location.href,
+        title: document.title || "",
+        text: String(document.body?.innerText || "").slice(0, 800),
+      }));
+    }
+    if (!/SalesOrderObj/.test(afterNavigate.url || "")) {
+      throw new Error(`CRM 专用浏览器已登录，但未能进入销售订单列表：${afterNavigate.title || afterNavigate.url || "unknown"}`);
+    }
+  }
+}
+
 async function replayList(page, listRequest, offset, limit, allowLoginRetry = true) {
   const payload = makePayload(listRequest.postData, offset, limit);
-  const result = await page.evaluate(
-    async ({ url, payload, timeoutMs }) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "content-type": "application/json;charset=UTF-8",
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-        return {
-          ok: response.ok,
-          status: response.status,
-          text: await response.text(),
-        };
-      } finally {
-        clearTimeout(timer);
+  let lastError = null;
+  for (let retry = 0; retry <= REQUEST_RETRY_MAX; retry++) {
+    try {
+      const result = await page.evaluate(
+        async ({ url, payload, timeoutMs }) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(url, {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                "content-type": "application/json;charset=UTF-8",
+              },
+              body: JSON.stringify(payload),
+              signal: controller.signal,
+            });
+            return {
+              ok: response.ok,
+              status: response.status,
+              text: await response.text(),
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        { url: listRequest.url, payload, timeoutMs: REQUEST_TIMEOUT_MS },
+      );
+      if (!result.ok) throw new Error(`List request failed: HTTP ${result.status}`);
+      const body = parseJson(result.text, `List response offset ${offset}`);
+      if (allowLoginRetry && isLoginExpired(body)) {
+        await autoLogin(page);
+        const newToken = await page.getActiveFsToken();
+        if (newToken) {
+          listRequest = injectActiveToken(listRequest, newToken);
+        }
+        return replayList(page, listRequest, offset, limit, false);
       }
-    },
-    { url: listRequest.url, payload, timeoutMs: REQUEST_TIMEOUT_MS },
-  );
-  if (!result.ok) throw new Error(`List request failed: HTTP ${result.status}`);
-  const body = parseJson(result.text, `List response offset ${offset}`);
-  if (allowLoginRetry && isLoginExpired(body)) {
-    await autoLogin(page);
-    return replayList(page, listRequest, offset, limit, false);
+      assertFxiaokeSuccess(body, `List request offset ${offset}`);
+      return body;
+    } catch (error) {
+      lastError = error;
+      const message = String(error.message || error);
+      // 仅对网络类错误重试，业务错误（StatusCode != 0）不重试
+      const isNetworkError = /fetch failed|NetworkError|timeout|timed out|abort|signal/i.test(message);
+      const isServerError = /502|503|504|5\d{2}/.test(message);
+      if (retry < REQUEST_RETRY_MAX && (isNetworkError || isServerError)) {
+        await new Promise((resolve) => setTimeout(resolve, REQUEST_RETRY_DELAY_MS * (retry + 1)));
+        continue;
+      }
+      throw error;
+    }
   }
-  assertFxiaokeSuccess(body, `List request offset ${offset}`);
-  return body;
+  throw lastError || new Error(`List request offset ${offset} failed after retries`);
 }
 
 async function readListFromDom(page, limit = PAGE_SIZE) {
@@ -740,7 +1043,7 @@ async function readListFromDom(page, limit = PAGE_SIZE) {
 async function readDetailFromDom(page, row) {
   await ensureLoggedInForDom(page, "读取 CRM 详情前发现登录态失效");
   const detail = await page.evaluate(
-    async ({ crmOrderNo, crmCustomerName }) => {
+    async ({ crmOrderNo, crmCustomerName, crmOrderId }) => {
       const clean = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/[ \t\r\n]+/g, " ").trim();
       const escapeRegExp = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -815,7 +1118,11 @@ async function readDetailFromDom(page, row) {
         if (clicked) await sleep(800);
         return Boolean(clicked);
       };
-      if (crmOrderNo && !hasDetailFields()) {
+      const isHexId = /^[0-9a-f]{24}$/i.test(crmOrderId);
+      if (isHexId && !hasDetailFields()) {
+        location.hash = "crm/detail/=/SalesOrderObj/" + crmOrderId;
+        await waitForStableDetail(30000);
+      } else if (crmOrderNo && !hasDetailFields()) {
         const candidates = Array.from(document.querySelectorAll("a, button, span, div, td"))
           .filter((node) => visible(node) && clean(node.innerText || node.textContent) === crmOrderNo);
         const clickable = candidates.find((node) => ["A", "BUTTON"].includes(node.tagName))
@@ -1041,14 +1348,11 @@ async function readDetailFromDom(page, row) {
           return { file_name: cleanName, file_url: downloadUrl || previewUrl, download_url: downloadUrl, preview_url: previewUrl, raw: { source: "dom_detail" } };
         })
         : [];
-      const productName = byLabel(/^成交产品$/);
-      const productAmount = byLabel(/^产品合计$/).replace(/,/g, "") || byLabel(/^销售订单金额/).replace(/,/g, "");
       const productRows = readOrderProductRows();
       const textProductRows = productRows.length ? [] : readOrderProductRowsFromText();
       const hasAnyDetail = fields.length > 0
         || productRows.length > 0
         || textProductRows.length > 0
-        || Boolean(productName)
         || Boolean(byLabel(/^客户名称$/))
         || Boolean(byLabel(/^销售订单金额/));
       if (!hasAnyDetail) {
@@ -1065,13 +1369,7 @@ async function readDetailFromDom(page, row) {
         receivable_amount: byLabel(/^待回款金额/).replace(/,/g, ""),
         invoice_amount: byLabel(/^已开票金额/).replace(/,/g, ""),
         product_amount: byLabel(/^产品合计$/).replace(/,/g, ""),
-        order_items: productRows.length ? productRows : (textProductRows.length ? textProductRows : (productName ? [{
-          product_name: productName,
-          quantity: "1",
-          unit_price: productAmount,
-          line_amount: productAmount,
-          source: "dom_detail_field",
-        }] : [])),
+        order_items: productRows.length ? productRows : textProductRows,
         sales_user_name: byLabel(/^负责人$/),
         owner_department: byLabel(/^负责人主属部门$/),
         created_by_name: byLabel(/^创建人$/),
@@ -1086,7 +1384,7 @@ async function readDetailFromDom(page, row) {
         raw_dom_fields: fields,
       };
     },
-    { crmOrderNo: row.crm_order_no || "", crmCustomerName: row.customer_name || "" },
+    { crmOrderNo: row.crm_order_no || "", crmCustomerName: row.customer_name || "", crmOrderId: row.crm_order_id || "" },
   );
   if (!detail) throw new Error("DOM detail fallback did not match current CRM order detail");
   return { ...row, ...detail, crm_order_id: row.crm_order_id };
@@ -1104,41 +1402,61 @@ function makeDetailRequest(detailRequest, row) {
 }
 
 async function replayDetail(page, detailRequest, row, allowLoginRetry = true) {
-  const request = makeDetailRequest(detailRequest, row);
-  if (!request.url) throw new Error("Detail request missing url");
-  const result = await page.evaluate(
-    async ({ request, timeoutMs }) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        const response = await fetch(request.url, {
-          method: request.method,
-          credentials: "include",
-          headers: {
-            "content-type": "application/json;charset=UTF-8",
-          },
-          body: request.method.toUpperCase() === "GET" ? undefined : request.postData,
-          signal: controller.signal,
-        });
-        return {
-          ok: response.ok,
-          status: response.status,
-          text: await response.text(),
-        };
-      } finally {
-        clearTimeout(timer);
-      }
-    },
-    { request, timeoutMs: REQUEST_TIMEOUT_MS },
-  );
-  if (!result.ok) throw new Error(`Detail request failed for ${row.crm_order_no || row.crm_order_id}: HTTP ${result.status}`);
-  const body = parseJson(result.text, `Detail response ${row.crm_order_no || row.crm_order_id}`);
-  if (allowLoginRetry && isLoginExpired(body)) {
-    await autoLogin(page);
-    return replayDetail(page, detailRequest, row, false);
+  const activeToken = await page.getActiveFsToken();
+  let request = makeDetailRequest(detailRequest, row);
+  if (activeToken) {
+    request = injectActiveToken(request, activeToken);
   }
-  assertFxiaokeSuccess(body, `Detail request ${row.crm_order_no || row.crm_order_id}`);
-  return body;
+  if (!request.url) throw new Error("Detail request missing url");
+  let lastError = null;
+  for (let retry = 0; retry <= REQUEST_RETRY_MAX; retry++) {
+    try {
+      const result = await page.evaluate(
+        async ({ request, timeoutMs }) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const response = await fetch(request.url, {
+              method: request.method,
+              credentials: "include",
+              headers: {
+                "content-type": "application/json;charset=UTF-8",
+              },
+              body: request.method.toUpperCase() === "GET" ? undefined : request.postData,
+              signal: controller.signal,
+            });
+            return {
+              ok: response.ok,
+              status: response.status,
+              text: await response.text(),
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        { request, timeoutMs: REQUEST_TIMEOUT_MS },
+      );
+      if (!result.ok) throw new Error(`Detail request failed for ${row.crm_order_no || row.crm_order_id}: HTTP ${result.status}`);
+      const body = parseJson(result.text, `Detail response ${row.crm_order_no || row.crm_order_id}`);
+      if (allowLoginRetry && isLoginExpired(body)) {
+        await autoLogin(page);
+        return replayDetail(page, detailRequest, row, false);
+      }
+      assertFxiaokeSuccess(body, `Detail request ${row.crm_order_no || row.crm_order_id}`);
+      return body;
+    } catch (error) {
+      lastError = error;
+      const message = String(error.message || error);
+      const isNetworkError = /fetch failed|NetworkError|timeout|timed out|abort|signal/i.test(message);
+      const isServerError = /502|503|504|5\d{2}/.test(message);
+      if (retry < REQUEST_RETRY_MAX && (isNetworkError || isServerError)) {
+        await new Promise((resolve) => setTimeout(resolve, REQUEST_RETRY_DELAY_MS * (retry + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError || new Error(`Detail request ${row.crm_order_no || row.crm_order_id} failed after retries`);
 }
 
 async function firstProfileEmail(page, ...employeeIds) {
@@ -1171,6 +1489,15 @@ async function main() {
   if (singleRowPath && !detailRequest) throw new Error("Single row detail sync requires --detail-request");
 
   const page = await connectReplayPage();
+  await ensureLoggedInForSync(page);
+
+  const activeToken = await page.getActiveFsToken();
+  if (activeToken) {
+    if (listRequest) {
+      listRequest = injectActiveToken(listRequest, activeToken);
+    }
+  }
+
   const rows = [];
   const rawPages = [];
   let total = null;
@@ -1185,13 +1512,43 @@ async function main() {
     try {
       for (let offset = 0; total === null || offset < total; offset += PAGE_SIZE) {
         if (MAX_PAGES > 0 && fetchedPages >= MAX_PAGES) break;
-        const body = await replayList(page, listRequest, offset, PAGE_SIZE);
+        // 每页请求也带重连保护
+        let body;
+        for (let pageAttempt = 0; pageAttempt <= 1; pageAttempt++) {
+          try {
+            body = await replayList(page, listRequest, offset, PAGE_SIZE);
+            break;
+          } catch (error) {
+            const message = String(error.message || error);
+            const isConnectionError = /CDP command timed out|Target closed|Session closed|Browser has disconnected|websocket|ECONNREFUSED/i.test(message);
+            if (isConnectionError && pageAttempt === 0) {
+              // 重新连接 CDP
+              await page.close().catch(() => {});
+              page = await connectReplayPage();
+              await ensureLoggedInForSync(page);
+              continue;
+            }
+            throw error;
+          }
+        }
         const dataList = body.Value?.dataList || [];
-        rawPages.push({ offset, count: dataList.length, result: body.Result, total: dataList[0]?.total_num ?? null });
-        for (const item of dataList) rows.push(normalizeOrder(item));
+        const normalizedPageRows = dataList.map((item) => normalizeOrder(item));
+        const reachedMinOrderDate = Boolean(MIN_ORDER_DATE && normalizedPageRows.some((row) => isBeforeMinOrderDate(row)));
+        rawPages.push({
+          offset,
+          count: dataList.length,
+          result: body.Result,
+          total: dataList[0]?.total_num ?? null,
+          minOrderDate: MIN_ORDER_DATE || null,
+          reachedMinOrderDate,
+        });
+        for (const row of normalizedPageRows) {
+          if (!isBeforeMinOrderDate(row)) rows.push(row);
+        }
         if (total === null) total = Number(dataList[0]?.total_num || dataList.length || 0);
         fetchedPages += 1;
         if (dataList.length === 0) break;
+        if (reachedMinOrderDate) break;
       }
     } catch (error) {
       if (!DOM_FALLBACK_ENABLED) throw error;
@@ -1205,53 +1562,96 @@ async function main() {
   const deduped = Array.from(new Map(rows.map((row) => [row.crm_order_no || row.crm_order_id, row])).values());
   const detailPages = [];
   if (detailRequest && DETAIL_ENABLED) {
-    for (const row of deduped) {
+    const pageFactory = createPageFactory();
+    const limiter = semaphore(DETAIL_CONCURRENCY);
+
+    /** 带页面重连保护的单个详情拉取 */
+    async function fetchOneDetail(row) {
+      await limiter.acquire();
       try {
-        const body = await replayDetail(page, detailRequest, row);
-        const normalized = normalizeOrderDetail(body, row);
-        if (!Array.isArray(normalized.order_items) || normalized.order_items.length === 0) {
+        let page = await pageFactory.getOrCreate();
+        // 首选用 API 拉取详情
+        for (let apiAttempt = 0; apiAttempt <= 1; apiAttempt++) {
           try {
-            const domDetail = await readDetailFromDom(page, { ...row, ...normalized });
-            if (Array.isArray(domDetail.order_items) && domDetail.order_items.length > 0) {
-              normalized.order_items = domDetail.order_items;
-              normalized.detail_product_source = domDetail.detail_source || "DomDetailOrderProducts";
-              normalized.raw_dom_product_fields = domDetail.raw_dom_fields || [];
+            const body = await replayDetail(page, detailRequest, row);
+            const normalized = normalizeOrderDetail(body, row);
+
+            let apiItems = [];
+            const activeToken = await page.getActiveFsToken();
+            if (activeToken && normalized.crm_order_id) {
+              apiItems = await fetchOrderItemsViaApi(page, activeToken, normalized.crm_order_id);
             }
-          } catch (productError) {
-            normalized.detail_product_sync_error = String(productError.message || productError);
+
+            if (Array.isArray(apiItems) && apiItems.length > 0) {
+              normalized.order_items = apiItems;
+              normalized.detail_product_source = "ApiRelationSalesOrderProductObj";
+            } else if (!Array.isArray(normalized.order_items) || normalized.order_items.length === 0) {
+              try {
+                const domDetail = await readDetailFromDom(page, { ...row, ...normalized });
+                if (Array.isArray(domDetail.order_items) && domDetail.order_items.length > 0) {
+                  normalized.order_items = domDetail.order_items;
+                  normalized.detail_product_source = domDetail.detail_source || "DomDetailOrderProducts";
+                  normalized.raw_dom_product_fields = domDetail.raw_dom_fields || [];
+                }
+              } catch (productError) {
+                normalized.detail_product_sync_error = String(productError.message || productError);
+              }
+            }
+            if (!normalized.sales_user_email) {
+              normalized.sales_user_email = await firstProfileEmail(
+                page,
+                normalized.owner_profile_id,
+                normalized.created_by_profile_id,
+                normalized.last_modified_by_profile_id,
+              );
+            }
+            Object.assign(row, normalized);
+            detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Synced" });
+            return;
+          } catch (error) {
+            const message = String(error.message || error);
+            const isConnectionError = /CDP command timed out|Target closed|Session closed|Browser has disconnected|websocket|ECONNREFUSED|socket hang up/i.test(message);
+            if (isConnectionError && apiAttempt === 0) {
+              // CDP 连接断开，重连后重试一次
+              pageFactory.invalidate();
+              page = await pageFactory.getOrCreate();
+              continue;
+            }
+            // API 失败，尝试 DOM fallback
+            if (DOM_FALLBACK_ENABLED) {
+              try {
+                const normalized = await readDetailFromDom(page, row);
+                if (!normalized.sales_user_email) {
+                  normalized.sales_user_email = await firstProfileEmail(
+                    page,
+                    normalized.owner_profile_id,
+                    normalized.created_by_profile_id,
+                    normalized.last_modified_by_profile_id,
+                  );
+                }
+                normalized.detail_sync_error = String(error.message || error);
+                Object.assign(row, normalized);
+                detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Synced", source: "DOM", source_error: row.detail_sync_error });
+                return;
+              } catch (fallbackError) {
+                row.detail_sync_status = "Failed";
+                row.detail_sync_error = `${String(error.message || error)}; DOM fallback failed: ${String(fallbackError.message || fallbackError)}`;
+                detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Failed", error: row.detail_sync_error });
+                return;
+              }
+            }
+            throw error;
           }
         }
-        if (!normalized.sales_user_email) {
-          normalized.sales_user_email = await firstProfileEmail(
-            page,
-            normalized.owner_profile_id,
-            normalized.created_by_profile_id,
-            normalized.last_modified_by_profile_id,
-          );
-        }
-        Object.assign(row, normalized);
-        detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Synced" });
-      } catch (error) {
-        try {
-          const normalized = await readDetailFromDom(page, row);
-          if (!normalized.sales_user_email) {
-            normalized.sales_user_email = await firstProfileEmail(
-              page,
-              normalized.owner_profile_id,
-              normalized.created_by_profile_id,
-              normalized.last_modified_by_profile_id,
-            );
-          }
-          normalized.detail_sync_error = String(error.message || error);
-          Object.assign(row, normalized);
-          detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Synced", source: "DOM", source_error: row.detail_sync_error });
-        } catch (fallbackError) {
-          row.detail_sync_status = "Failed";
-          row.detail_sync_error = `${String(error.message || error)}; DOM fallback failed: ${String(fallbackError.message || fallbackError)}`;
-          detailPages.push({ crm_order_id: row.crm_order_id, crm_order_no: row.crm_order_no, status: "Failed", error: row.detail_sync_error });
-        }
+      } finally {
+        limiter.release();
       }
     }
+
+    // 并行拉取所有详情（受 semaphore 限制并发数）
+    await Promise.all(deduped.map((row) => fetchOneDetail(row)));
+    // 确保连接被关闭
+    pageFactory.invalidate();
   } else {
     for (const row of deduped) row.detail_sync_status = "ListOnly";
   }

@@ -1,6 +1,6 @@
 from backend.app.models import ProductSKU
 from backend.app.services.rules import BlockerLevel, OrderContext, ValidationResult
-from backend.app.services.jsonutil import loads
+from backend.app.services.jsonutil import dumps, loads
 
 
 class KnownSkuRule:
@@ -21,6 +21,16 @@ class KnownSkuRule:
                     reason = str(mapping.get("reason") or "unknown")
                     product_name = str(mapping.get("product_name") or item.product_name or "").strip()
                     candidates = mapping.get("candidates") if isinstance(mapping.get("candidates"), list) else []
+                    evidence.append(
+                        "SKU_MATCH_JSON:"
+                        + dumps(
+                            {
+                                "product_name": product_name,
+                                "reason": reason,
+                                "candidates": candidates[:5],
+                            }
+                        )
+                    )
                     top = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
                     if reason == "low_confidence":
                         evidence.append(

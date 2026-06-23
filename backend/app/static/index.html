@@ -560,10 +560,10 @@
             <label>Chrome CDP 地址
               <input name="crm_cdp_url" placeholder="http://127.0.0.1:9333" />
             </label>
-            <label>托管浏览器模式
+            <label>浏览器排障模式
               <select name="crm_cdp_browser_mode">
-                <option value="headless">无头运行（默认）</option>
-                <option value="headed">可视运行</option>
+                <option value="headless">后台运行（默认同步）</option>
+                <option value="headed">可视排障</option>
               </select>
             </label>
             <label>CDP 端口
@@ -584,6 +584,9 @@
             <label>每页条数
               <input name="crm_sync_page_size" type="number" min="1" max="200" />
             </label>
+            <label>最大页数
+              <input name="crm_sync_max_pages" type="number" min="0" max="200" placeholder="0 表示按最早下单日期停止" />
+            </label>
             <label>超时(秒)
               <input name="crm_sync_timeout_seconds" type="number" min="30" max="600" />
             </label>
@@ -602,7 +605,7 @@
             </label>
             <div class="actions wide">
               <button type="submit" class="button">保存 CRM 配置</button>
-              <button id="crm-browser-start" type="button" class="button ghost">启动专用浏览器</button>
+              <button id="crm-browser-start" type="button" class="button ghost">后台启动浏览器</button>
               <button id="crm-browser-login" type="button" class="button ghost">人工登录模式</button>
               <button id="crm-browser-stop" type="button" class="button ghost">停止浏览器</button>
               <button id="crm-sync-queue" type="button" class="button ghost">入队同步</button>
@@ -1354,7 +1357,27 @@
           <button id="crm-order-detail-close" type="button" class="icon-button" aria-label="关闭">×</button>
         </div>
         <div id="crm-order-detail-summary" class="crm-order-detail-summary"></div>
-        <section class="crm-order-flow-section">
+        <div class="tabs crm-order-detail-tabs" id="crm-order-detail-tabs">
+          <button type="button" class="active" data-tab="order">订单信息</button>
+          <button type="button" data-tab="delivery">交付信息</button>
+          <button type="button" data-tab="party">主体信息</button>
+          <button type="button" data-tab="products">产品信息</button>
+          <button type="button" data-tab="flow">流程</button>
+          <button type="button" data-tab="raw">原始数据</button>
+        </div>
+        <section class="crm-order-detail-tab-panel is-active" id="crm-order-detail-order-tab">
+          <div id="crm-order-detail-fields" class="mail-detail-fields crm-order-detail-fields"></div>
+        </section>
+        <section class="crm-order-detail-tab-panel" id="crm-order-detail-delivery-tab" hidden>
+          <div id="crm-order-detail-delivery" class="mail-detail-fields crm-order-detail-fields"></div>
+        </section>
+        <section class="crm-order-detail-tab-panel" id="crm-order-detail-party-tab" hidden>
+          <div id="crm-order-detail-party" class="mail-detail-fields crm-order-detail-fields"></div>
+        </section>
+        <section class="crm-order-detail-tab-panel" id="crm-order-detail-products-tab" hidden>
+          <div id="crm-order-detail-products" class="crm-order-products"></div>
+        </section>
+        <section class="crm-order-detail-tab-panel crm-order-flow-section" id="crm-order-detail-flow-tab" hidden>
           <div class="crm-order-flow-head">
             <div>
               <h3>当前流程</h3>
@@ -1366,18 +1389,7 @@
           <div id="crm-order-flow" class="crm-order-flow"></div>
           <div id="crm-order-flow-evidence" class="crm-order-flow-evidence"></div>
         </section>
-        <div class="crm-order-detail-grid">
-          <section>
-            <h3>订单信息</h3>
-            <div id="crm-order-detail-fields" class="mail-detail-fields crm-order-detail-fields"></div>
-          </section>
-          <section>
-            <h3>交付与附件</h3>
-            <div id="crm-order-detail-delivery" class="mail-detail-fields crm-order-detail-fields"></div>
-          </section>
-        </div>
-        <section>
-          <h3>原始 CRM 数据</h3>
+        <section class="crm-order-detail-tab-panel" id="crm-order-detail-raw-tab" hidden>
           <pre id="crm-order-detail-raw" class="mail-detail-body crm-order-detail-raw"></pre>
         </section>
       </section>

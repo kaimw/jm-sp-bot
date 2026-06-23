@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.models import MailMessage, ProcessingJob, now_utc
-from backend.app.services.crm_sync import run_crm_sales_order_sync
+from backend.app.services.crm_sync import CrmSyncBusyError, run_crm_sales_order_sync
 from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.exception_diagnosis import diagnose_exception_case
 from backend.app.services.jsonutil import dumps, loads
@@ -18,6 +18,17 @@ from backend.app.services.workflow import process_inbound_mail
 
 
 REPEATABLE_JOB_TYPES = {"OMS_PUSH_NOTICE", "PLATFORM_FULFILLMENT_SYNC", "sync_crm_sales_orders", "OMS_STATUS_POLL"}
+
+# 支持失败重试的 Job 类型（带指数退避）
+RETRYABLE_JOB_TYPES = {
+    "CRM_ORDER_PARSED",
+    "OMS_PUSH_NOTICE",
+    "OMS_STATUS_POLL",
+    "PLATFORM_FULFILLMENT_SYNC",
+    "DIAGNOSE_EXCEPTION",
+}
+MAX_JOB_ATTEMPTS = 5  # 最大重试次数（含首次）
+RETRY_BASE_DELAY_SECONDS = 10  # 基础退避秒数
 
 
 def run_platform_sync_async(job_id: str, payload: dict) -> None:
@@ -208,17 +219,40 @@ def run_pending_jobs(session: Session, *, limit: int = 20) -> dict:
             job.version += 1
             job.updated_at = now_utc()
             session.commit()
+        except CrmSyncBusyError as exc:
+            session.rollback()
+            job = session.get(ProcessingJob, job_id)
+            if job is None:
+                continue
+            job.status = "Pending"
+            job.error_message = str(exc)
+            job.next_retry_at = now_utc() + timedelta(seconds=60)
+            clear_processing_lock(job)
+            job.version += 1
+            job.updated_at = now_utc()
+            session.commit()
         except Exception as exc:
             session.rollback()
             job = session.get(ProcessingJob, job_id)
             if job is None:
                 continue
-            job.status = "Failed"
-            job.error_message = str(exc)
+            should_retry = (
+                job.job_type in RETRYABLE_JOB_TYPES
+                and (job.attempt_count or 0) < MAX_JOB_ATTEMPTS
+            )
+            if should_retry:
+                attempts = (job.attempt_count or 0)
+                delay = min(RETRY_BASE_DELAY_SECONDS * (2 ** (attempts - 1)), 3600)
+                job.status = "Pending"
+                job.error_message = f"[Attempt {attempts}/{MAX_JOB_ATTEMPTS}] {exc}"
+                job.next_retry_at = now_utc() + timedelta(seconds=delay)
+            else:
+                job.status = "Failed"
+                job.error_message = str(exc)
+                failed += 1
             clear_processing_lock(job)
             job.version += 1
             job.updated_at = now_utc()
-            failed += 1
             session.commit()
     return {"completed": completed, "failed": failed, "total": handled}
 

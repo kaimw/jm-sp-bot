@@ -156,7 +156,10 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "crm_fxiaoke_detail_request_file", "", is_secret=False)
     ensure_config(session, "crm_fxiaoke_detail_request_json", "", is_secret=True)
     ensure_config(session, "crm_sync_page_size", "20", is_secret=False)
+    ensure_config(session, "crm_sync_max_pages", "0", is_secret=False)
     ensure_config(session, "crm_sync_timeout_seconds", "120", is_secret=False)
+    ensure_config(session, "crm_sync_max_retries", "3", is_secret=False)
+    ensure_config(session, "crm_sync_detail_concurrency", "3", is_secret=False)
     ensure_config(session, "crm_sales_orders_last_sync_at", "", is_secret=False)
     ensure_config(session, "v2_crm_phase1_scope_enabled", "true", is_secret=False)
     ensure_config(session, "v2_crm_phase1_scope_json", dumps({

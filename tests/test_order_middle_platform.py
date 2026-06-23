@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,10 +10,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.app.database import Base
-from backend.app.models import AgentRunLog, AuditEvent, ChannelPricing, CrmOrderSnapshot, CrmSalesOrder, DeliveryNotice, ExceptionCase, IntegrationEvent, MiddlePlatformOrder, ModelCallLog, ModelProviderConfig, OrderAttachment, OutboundMailJob, ProcessingJob, ProductInventorySnapshot, ProductSKU, ProductSPU, SystemConfig
+from backend.app.models import AgentRunLog, AuditEvent, ChannelPricing, CrmOrderItem, CrmOrderSnapshot, CrmSalesOrder, DeliveryNotice, ExceptionCase, IntegrationEvent, MiddlePlatformOrder, MiddlePlatformOrderItem, ModelCallLog, ModelProviderConfig, OrderAttachment, OutboundMailJob, ProcessingJob, ProductInventorySnapshot, ProductSKU, ProductSPU, SystemConfig
 from backend.app.services.attachment_parser import parse_attachment
 from backend.app.services.bootstrap import seed_defaults, set_config
-from backend.app.services.crm_sync import config_value as crm_sync_config_value, ensure_request_file, retry_crm_order_detail_sync, sync_crm_products_as_skus, sync_customer_mapping_from_masters, upsert_crm_sales_orders
+from backend.app.services.crm_sync import CrmSyncBusyError, config_value as crm_sync_config_value, ensure_request_file, preflight_crm_cdp_browser, retry_crm_order_detail_sync, sync_crm_products_as_skus, sync_customer_mapping_from_masters, upsert_crm_sales_orders
 from backend.app.services.crypto import encrypt_value
 from backend.app.services.customer_mapping import enqueue_oms_customer_missing_notification, find_customer_in_oms_response, query_oms_customer, upsert_customer_mapping
 from backend.app.services.crm_attachment_extraction import enrich_order_from_attachment_text
@@ -31,7 +33,7 @@ from backend.app.services.order_middle_platform import (
 )
 from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.rules import DEFAULT_RULES, review_rule_config
-from backend.app.main import exception_context, exception_diagnosis_feedback, list_agent_run_logs, list_model_call_logs, replay_v2_delivery_notice, serialize_crm_order, serialize_crm_order_with_flow, update_crm_config, update_oms_config
+from backend.app.main import delete_crm_order, exception_context, exception_diagnosis_feedback, list_agent_run_logs, list_model_call_logs, replay_v2_delivery_notice, serialize_crm_order, serialize_crm_order_with_flow, update_crm_config, update_oms_config
 from backend.app.schemas import CrmRuntimeConfigUpdate, OmsRuntimeConfigUpdate
 
 
@@ -85,6 +87,33 @@ def complete_crm_order_required_fields(session, crm_order_id: str = "crm_obj_001
     return crm
 
 
+def add_crm_order_item(session, crm: CrmSalesOrder, **overrides) -> CrmOrderItem:
+    payload = {
+        "product_name": "3D Scanner",
+        "quantity": "1",
+        "unit_price": "100.00",
+        "line_amount": "100.00",
+        **overrides,
+    }
+    item = CrmOrderItem(
+        order_id=crm.id,
+        source_system=crm.source_system,
+        crm_item_id=payload.get("crm_item_id") or f"{crm.crm_order_id}:1",
+        crm_order_id=crm.crm_order_id,
+        crm_order_no=crm.crm_order_no,
+        sku_code=payload.get("sku_code"),
+        product_name=payload.get("product_name"),
+        specification=payload.get("specification"),
+        quantity=payload.get("quantity"),
+        unit_price=payload.get("unit_price"),
+        line_amount=payload.get("line_amount"),
+        payload_hash=crm.payload_hash,
+        raw_json=dumps({key: value for key, value in payload.items() if value is not None}),
+    )
+    session.add(item)
+    return item
+
+
 def valid_crm_order_row(**overrides):
     row = {
         "crm_order_id": "crm_obj_001",
@@ -106,7 +135,7 @@ def valid_crm_order_row(**overrides):
         "receipt_address": "湖北省武汉市东湖高新区测试路 1 号",
         "delivery_date": "2026-06-30",
         "attachment_files": "采购订单.pdf; 合同盖章版.pdf",
-        "items": [{"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 50, "unit_price": "2500", "line_amount": "125000"}],
+        "order_items": [{"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 50, "unit_price": "2500", "line_amount": "125000"}],
     }
     row.update(overrides)
     return row
@@ -153,6 +182,44 @@ def test_crm_order_event_builds_delivery_preview_then_pushes_after_confirmation(
     assert order.status == OrderStatus.OMS_ACCEPTED.value
     assert order.delivery_notices[0].status == "Accepted"
     assert order.delivery_notices[0].confirmed_by == "tester"
+
+
+def test_delete_crm_order_clears_local_workflow_for_resync():
+    session = make_session()
+    order = create_delivery_ready_order(session)
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id=order.crm_order_id).one()
+    session.add(
+        ProcessingJob(
+            job_type="OMS_PUSH_NOTICE",
+            payload_json=dumps({"order_id": order.id, "notice_id": order.delivery_notices[0].id}),
+            status="Pending",
+        )
+    )
+    session.add(
+        ExceptionCase(
+            exception_type="VALIDATION_BLOCKED",
+            severity="High",
+            detail=dumps({"order_no": order.order_no, "crm_order_no": crm.crm_order_no}),
+        )
+    )
+    session.commit()
+
+    result = delete_crm_order(crm.id, session=session, current_user=SimpleNamespace(username="admin"))
+
+    assert result["ok"] is True
+    assert result["crm_order_no"] == crm.crm_order_no
+    assert session.query(CrmSalesOrder).filter_by(crm_order_id=crm.crm_order_id).count() == 0
+    assert session.query(CrmOrderItem).filter_by(crm_order_id=crm.crm_order_id).count() == 0
+    assert session.query(CrmOrderSnapshot).filter_by(crm_order_id=crm.crm_order_id).count() == 0
+    assert session.query(OrderAttachment).filter_by(crm_order_id=crm.crm_order_id).count() == 0
+    assert session.query(MiddlePlatformOrder).filter_by(crm_order_id=crm.crm_order_id).count() == 0
+    assert session.query(MiddlePlatformOrderItem).count() == 0
+    assert session.query(DeliveryNotice).count() == 0
+    assert session.query(ProcessingJob).filter(ProcessingJob.payload_json.contains(crm.crm_order_id)).count() == 0
+    assert session.query(IntegrationEvent).filter_by(biz_key=crm.crm_order_id).count() == 0
+    assert session.query(ExceptionCase).count() == 0
+    audit = session.query(AuditEvent).filter_by(event_type="CrmOrderLocalDeleted").one()
+    assert audit.related_object_id == crm.crm_order_id
 
 
 def test_delivery_confirmation_blocks_when_oms_required_config_missing():
@@ -207,7 +274,7 @@ def test_ecommerce_order_amount_apportionment_preserves_paid_total():
         total_discount="40.00",
         shipping_fee="20.00",
         total_paid_amount="380.00",
-        items=[
+        order_items=[
             {"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 1, "unit_price": "100.00", "line_amount": "100.00"},
             {"sku_code": "SKU-3D-SCANNER-LITE", "quantity": 1, "unit_price": "300.00", "line_amount": "300.00"},
         ],
@@ -239,7 +306,7 @@ def test_channel_shop_sku_maps_to_standard_sku_before_pre_review():
         channel_code="amazon_us",
         shop_code="AMZ-US-01",
         platform_order_no="AMZ-ORDER-001",
-        items=[{"shop_sku_code": "AMZ-SCANNER-PRO", "quantity": 50, "unit_price": "2500", "line_amount": "125000"}],
+        order_items=[{"shop_sku_code": "AMZ-SCANNER-PRO", "quantity": 50, "unit_price": "2500", "line_amount": "125000"}],
     )
     result = upsert_crm_sales_orders(session, [row])
     session.commit()
@@ -266,7 +333,7 @@ def test_missing_channel_shop_sku_mapping_blocks_pre_review():
     row = valid_crm_order_row(
         channel_code="amazon_us",
         shop_code="AMZ-US-01",
-        items=[{"shop_sku_code": "UNKNOWN-AMZ-SKU", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
+        order_items=[{"shop_sku_code": "UNKNOWN-AMZ-SKU", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
         order_amount="100.00",
         product_amount="100.00",
         received_amount="20.00",
@@ -925,6 +992,31 @@ def test_retry_crm_order_detail_sync_refreshes_failed_detail(monkeypatch):
     assert detail["crm_detail_status"] == "detail_available"
     assert any(item["file_name"] == "盖章合同.pdf" and item["has_download"] for item in detail["attachments"])
     assert session.query(AuditEvent).filter_by(event_type="CrmOrderDetailRetrySucceeded", related_object_id=crm.id).count() == 1
+
+
+def test_crm_sync_lock_reports_busy_and_recovers_stale_lock():
+    import backend.app.services.crm_sync as crm_sync
+
+    session = make_session()
+    assert crm_sync.CRM_SYNC_LOCK.acquire(blocking=False) is True
+    crm_sync.CRM_SYNC_LOCK_STATE.clear()
+    crm_sync.CRM_SYNC_LOCK_STATE.update({"operation": "CRM 销售订单同步", "acquired_at": crm_sync.time.time(), "lease_seconds": 180})
+    try:
+        with pytest.raises(CrmSyncBusyError) as exc:
+            with crm_sync.crm_sync_lock(session, "CRM 订单详情同步"):
+                pass
+        assert "当前有 CRM 同步任务正在进行，请稍后重试" in str(exc.value)
+
+        crm_sync.CRM_SYNC_LOCK_STATE["acquired_at"] = crm_sync.time.time() - 1000
+        crm_sync.CRM_SYNC_LOCK_STATE["lease_seconds"] = 180
+        with crm_sync.crm_sync_lock(session, "CRM 订单详情同步") as state:
+            assert state["stale_lock_recovered"] is True
+    finally:
+        crm_sync.CRM_SYNC_LOCK_STATE.clear()
+        try:
+            crm_sync.CRM_SYNC_LOCK.release()
+        except RuntimeError:
+            pass
 
 
 def test_crm_attachment_extraction_fills_oms_receiver_fields_without_confusing_contract_signer():
@@ -1725,6 +1817,70 @@ def test_crm_sync_recreates_missing_request_file_from_saved_json(tmp_path):
     assert missing_path.read_text(encoding="utf-8") == '{"method":"POST","url":"https://example.test/List"}'
 
 
+def test_crm_cdp_preflight_fails_fast_on_login_page(monkeypatch):
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_urlopen(url, timeout):
+        assert url == "http://127.0.0.1:9334/json/list"
+        assert timeout == 3
+        return FakeResponse(json.dumps([{"title": "CRM登录系统 - 纷享销客CRM", "url": "https://www.fxiaoke.com/proj/page/loginv2"}]).encode())
+
+    monkeypatch.setattr("backend.app.services.crm_sync.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.app.services.crm_sync._cdp_cleanup_extra_pages", lambda cdp_url: {"pages": [], "kept": None, "closed": 0, "is_login_page": True})
+    monkeypatch.setattr("backend.app.services.crm_sync._remaining_login_cooldown_seconds", lambda: 42)
+
+    with pytest.raises(RuntimeError, match="CRM 自动登录仍在风控冷却期"):
+        preflight_crm_cdp_browser("http://127.0.0.1:9334")
+
+
+def test_crm_cdp_preflight_allows_login_page_when_auto_login_available(monkeypatch):
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse(json.dumps([{"title": "CRM登录系统 - 纷享销客CRM", "url": "https://www.fxiaoke.com/proj/page/loginv2"}]).encode())
+
+    monkeypatch.setattr("backend.app.services.crm_sync.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("backend.app.services.crm_sync._cdp_cleanup_extra_pages", lambda cdp_url: {"pages": [], "kept": None, "closed": 0, "is_login_page": True})
+    monkeypatch.setattr("backend.app.services.crm_sync._remaining_login_cooldown_seconds", lambda: 0)
+
+    result = preflight_crm_cdp_browser("http://127.0.0.1:9334", allow_login_page=True)
+
+    assert result["login_page_count"] == 1
+    assert result["logged_in_page_count"] == 0
+    assert result["login_page_blocked"] is True
+    assert result["login_page_allowed_for_auto_login"] is True
+
+
+def test_crm_cdp_preflight_returns_page_summary(monkeypatch):
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse(json.dumps([{"title": "销售订单-纷享销客", "url": "https://www.fxiaoke.com/XV/UI/Home#crm/list/=/SalesOrderObj"}]).encode())
+
+    monkeypatch.setattr("backend.app.services.crm_sync.urllib.request.urlopen", fake_urlopen)
+
+    result = preflight_crm_cdp_browser("http://127.0.0.1:9334")
+
+    assert result["page_count"] == 1
+    assert result["login_page_count"] == 0
+    assert result["titles"] == ["销售订单-纷享销客"]
+
+
 def test_crm_sync_backfills_settlement_method_from_order_items():
     session = make_session()
     result = upsert_crm_sales_orders(
@@ -1760,7 +1916,7 @@ def test_crm_detail_empty_dom_fallback_preserves_existing_raw_items_and_attachme
             valid_crm_order_row(
                 crm_order_id="crm_obj_degraded_detail",
                 crm_order_no="SO-DEGRADED-DETAIL",
-                items=[{"product_name": "Whale—overseas", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"product_name": "Whale—overseas", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachments=[{"file_name": "客户PO.pdf", "file_url": "https://example.test/po.pdf"}],
                 attachment_files="客户PO.pdf",
             )
@@ -2068,6 +2224,61 @@ def test_crm_config_updates_browser_ops_options():
     assert session.get(SystemConfig, "crm_chrome_bin").value.endswith("Google Chrome")
 
 
+def test_crm_browser_default_start_ignores_saved_headed_mode(monkeypatch):
+    import backend.app.main as main_app
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+
+        def poll(self):
+            return None
+
+    calls = []
+
+    def fake_popen(command, **kwargs):
+        calls.append(command)
+        return FakeProcess()
+
+    session = make_session()
+    set_config(session, "crm_cdp_browser_mode", "headed")
+    monkeypatch.setattr(main_app, "_crm_browser_process", None)
+    monkeypatch.setattr(main_app, "_crm_browser_meta", {})
+    monkeypatch.setattr(main_app.subprocess, "Popen", fake_popen)
+
+    result = main_app.start_crm_browser_process(session)
+
+    assert result["mode"] == "headless"
+    assert "--headed" not in calls[0]
+
+
+def test_crm_browser_manual_login_explicitly_uses_headed(monkeypatch):
+    import backend.app.main as main_app
+
+    class FakeProcess:
+        pid = 12346
+        returncode = None
+
+        def poll(self):
+            return None
+
+    calls = []
+
+    def fake_popen(command, **kwargs):
+        calls.append(command)
+        return FakeProcess()
+
+    session = make_session()
+    monkeypatch.setattr(main_app, "_crm_browser_process", None)
+    monkeypatch.setattr(main_app, "_crm_browser_meta", {})
+    monkeypatch.setattr(main_app.subprocess, "Popen", fake_popen)
+
+    result = main_app.start_crm_browser_process(session, requested_mode="headed")
+
+    assert result["mode"] == "headed"
+    assert "--headed" in calls[0]
+
+
 def test_crm_config_rejects_invalid_system_owner_email():
     session = make_session()
 
@@ -2201,6 +2412,72 @@ def test_crm_cancel_during_oms_pending_cancels_pending_push_job():
     assert detail["exception"]["responsible_role"] == "商务/物流"
 
 
+def test_crm_order_items_are_synced_from_order_products_only():
+    session = make_session()
+    upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                crm_order_id="crm_obj_raw_items",
+                crm_order_no="SO-RAW-ITEMS",
+                order_items=[
+                    {
+                        "sku_code": "SKU-J6M",
+                        "product_name": "MagicScan SC-J6M",
+                        "specification": "J6M 标准版",
+                        "quantity": "1",
+                        "unit_price": "40000.000",
+                        "line_amount": "40000.000",
+                    }
+                ],
+            )
+        ],
+    )
+    session.commit()
+    crm_order = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_raw_items").one()
+    item = session.query(CrmOrderItem).filter_by(order_id=crm_order.id).one()
+
+    event = crm_order_parsed_event(crm_order)
+
+    assert item.product_name == "MagicScan SC-J6M"
+    assert item.specification == "J6M 标准版"
+    assert event["data"]["order_items"] == [
+        {
+            "sku_code": "SKU-J6M",
+            "product_name": "MagicScan SC-J6M",
+            "specification": "J6M 标准版",
+            "quantity": "1",
+            "unit_price": "40000.000",
+            "line_amount": "40000.000",
+            "raw": {
+                "sku_code": "SKU-J6M",
+                "product_name": "MagicScan SC-J6M",
+                "specification": "J6M 标准版",
+                "quantity": "1",
+                "unit_price": "40000.000",
+                "line_amount": "40000.000",
+            },
+        }
+    ]
+
+
+def test_crm_order_parsed_event_does_not_fallback_to_raw_items_when_relation_empty():
+    session = make_session()
+    crm = CrmSalesOrder(
+        source_system="fxiaoke",
+        crm_order_id="crm_obj_legacy_items",
+        crm_order_no="SO-LEGACY-ITEMS",
+        payload_hash="hash-legacy-items",
+        raw_json=dumps({"items": [{"product_name": "硬件设备—空间扫描仪", "quantity": "1"}]}),
+    )
+    session.add(crm)
+    session.commit()
+
+    event = crm_order_parsed_event(crm)
+
+    assert event["data"]["order_items"] == []
+
+
 def test_crm_change_during_oms_retry_uses_retry_exception_type(monkeypatch):
     import backend.app.services.order_middle_platform as omp
 
@@ -2265,6 +2542,16 @@ def test_validation_blocked_creates_context_pack_exception():
         raw_json=dumps({"items": [{"sku_code": "UNKNOWN-SKU", "quantity": 1}]}),
     )
     session.add(crm)
+    session.flush()
+    add_crm_order_item(
+        session,
+        crm,
+        sku_code="UNKNOWN-SKU",
+        product_name="未知 SKU 产品",
+        quantity="1",
+        unit_price="100.00",
+        line_amount="100.00",
+    )
     session.commit()
 
     payload = {
@@ -2320,6 +2607,22 @@ def test_middle_order_items_prefer_crm_order_items_over_legacy_items():
         ),
     )
     session.add(crm)
+    session.flush()
+    session.add(
+        CrmOrderItem(
+            order_id=crm.id,
+            source_system=crm.source_system,
+            crm_item_id="crm-order-items-priority:1",
+            crm_order_id=crm.crm_order_id,
+            crm_order_no=crm.crm_order_no,
+            product_name="seal扫描仪",
+            quantity="1",
+            unit_price="6000.000",
+            line_amount="6000.000",
+            payload_hash=crm.payload_hash,
+            raw_json=dumps({"product_name": "seal扫描仪", "quantity": "1", "unit_price": "6000.000", "line_amount": "6000.000"}),
+        )
+    )
     session.commit()
 
     order = upsert_middle_platform_order(session, crm)
@@ -2348,6 +2651,22 @@ def test_middle_order_items_map_sku_by_product_name_semantic_match():
         ),
     )
     session.add(crm)
+    session.flush()
+    session.add(
+        CrmOrderItem(
+            order_id=crm.id,
+            source_system=crm.source_system,
+            crm_item_id="crm-product-name-sku:1",
+            crm_order_id=crm.crm_order_id,
+            crm_order_no=crm.crm_order_no,
+            product_name="Moose 扫描仪",
+            quantity="1",
+            unit_price="5999.00",
+            line_amount="5999.00",
+            payload_hash=crm.payload_hash,
+            raw_json=dumps({"product_name": "Moose 扫描仪", "quantity": "1", "unit_price": "5999.00", "line_amount": "5999.00"}),
+        )
+    )
     session.commit()
 
     order = upsert_middle_platform_order(session, crm)
@@ -2381,6 +2700,15 @@ def test_middle_order_items_keep_manual_review_when_product_name_match_low_confi
         ),
     )
     session.add(crm)
+    session.flush()
+    add_crm_order_item(
+        session,
+        crm,
+        product_name="完全未知产品",
+        quantity="1",
+        unit_price="5999.00",
+        line_amount="5999.00",
+    )
     session.commit()
 
     order = upsert_middle_platform_order(session, crm)
@@ -2433,6 +2761,15 @@ def test_pre_review_blocks_when_product_name_sku_match_requires_manual_confirmat
         ),
     )
     session.add(crm)
+    session.flush()
+    add_crm_order_item(
+        session,
+        crm,
+        product_name="硬件设备—Moose",
+        quantity="1",
+        unit_price="5999.00",
+        line_amount="5999.00",
+    )
     session.commit()
 
     result = process_crm_order_parsed_event(session, crm_order_parsed_event(crm))
@@ -2445,6 +2782,13 @@ def test_pre_review_blocks_when_product_name_sku_match_requires_manual_confirmat
     assert order.status == OrderStatus.VALIDATION_BLOCKED.value
     assert "KNOWN_ACTIVE_SKU" in failed_codes
     assert order.delivery_notices == []
+    mail = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").one()
+    assert "商品/SKU 匹配问题" in mail.body
+    assert "CRM 商品：硬件设备—Moose" in mail.body
+    assert "当前值：候选 SKU 过多，无法自动选择" in mail.body
+    assert "可能匹配项（按相似度排序）：" in mail.body
+    assert "SKU-MOOSE-0｜Moose 扫描仪 0｜相似度" in mail.body
+    assert "SKU-MOOSE-1｜Moose 扫描仪 1｜相似度" in mail.body
 
 
 def test_force_revalidate_resets_delivery_ready_order_and_blocks_failed_review():
@@ -2489,6 +2833,14 @@ def test_force_revalidate_resets_delivery_ready_order_and_blocks_failed_review()
     )
     session.add(crm)
     session.flush()
+    add_crm_order_item(
+        session,
+        crm,
+        product_name="硬件设备—Moose",
+        quantity="1",
+        unit_price="125000.00",
+        line_amount="125000.00",
+    )
     order = MiddlePlatformOrder(
         order_no="MP-SO-FORCE-REVALIDATE-AMBIGUOUS",
         source_system=crm.source_system,
@@ -2846,7 +3198,9 @@ def test_validation_failure_notification_cancels_stale_pending_for_same_order():
     mails = session.query(OutboundMailJob).filter_by(mail_type="V2ValidationFailed").order_by(OutboundMailJob.created_at).all()
     assert [mail.status for mail in mails] == ["Cancelled", "Pending"]
     assert mails[0].last_error == "superseded by newer validation failure notification"
-    assert "KNOWN_ACTIVE_SKU" in mails[1].body
+    assert "商品/SKU 匹配问题" in mails[1].body
+    assert "CRM 商品：未映射商品" in mails[1].body
+    assert "KNOWN_ACTIVE_SKU" not in mails[1].body
 
 
 def test_validation_failure_notification_requeues_cancelled_same_digest():
@@ -3064,7 +3418,7 @@ def test_pre_review_parses_registered_attachments_even_when_receiver_fields_comp
                 product_amount="50000.00",
                 received_amount="0.00",
                 receivable_amount="50000.00",
-                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachment_files="客户PO.pdf",
             )
         ],
@@ -3106,7 +3460,7 @@ def test_attachment_product_consistency_blocks_and_notifies_sales_owner(monkeypa
                 product_amount="50000.00",
                 received_amount="0.00",
                 receivable_amount="50000.00",
-                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachment_files="客户PO.pdf",
             )
         ],
@@ -3149,7 +3503,7 @@ def test_attachment_product_consistency_reads_po_table_amounts(monkeypatch):
                 product_amount="50000.00",
                 received_amount="0.00",
                 receivable_amount="50000.00",
-                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachment_files="客户PO.png",
             )
         ],
@@ -3211,7 +3565,7 @@ def test_attachment_product_consistency_uses_order_total_when_table_ocr_degrades
                 product_amount="50000.00",
                 received_amount="0.00",
                 receivable_amount="50000.00",
-                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "硬件设备—空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachment_files="客户PO.png",
             )
         ],
@@ -3256,7 +3610,7 @@ def test_attachment_product_consistency_blocks_when_price_quantity_or_total_mism
                 product_amount="50000.00",
                 received_amount="0.00",
                 receivable_amount="50000.00",
-                items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "product_name": "空间扫描仪", "quantity": 1, "unit_price": "50000", "line_amount": "50000"}],
                 attachment_files="客户PO.pdf",
             )
         ],
@@ -3292,7 +3646,7 @@ def test_customer_mapping_failure_interrupts_and_notifies_with_evidence_summary(
                 crm_order_id="crm_obj_unknown_customer",
                 crm_order_no="SO-UNKNOWN-CUSTOMER",
                 customer_name="未映射客户",
-                items=[{"product_name": "未映射商品", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
+                order_items=[{"product_name": "未映射商品", "quantity": 1, "unit_price": "100", "line_amount": "100"}],
             )
         ],
     )
@@ -3315,8 +3669,11 @@ def test_customer_mapping_failure_interrupts_and_notifies_with_evidence_summary(
     assert "客户资料/客户主数据映射" in mail.body
     assert "商品明细、SKU 主数据或数量" in mail.body
     assert "附件：采购订单.pdf" in mail.body
-    assert "CUSTOMER_MAPPING" in mail.body
-    assert "KNOWN_ACTIVE_SKU" in mail.body
+    assert "客户映射" in mail.body
+    assert "商品/SKU 匹配问题" in mail.body
+    assert "当前值：未映射客户" in mail.body
+    assert "CUSTOMER_MAPPING" not in mail.body
+    assert "KNOWN_ACTIVE_SKU" not in mail.body
 
 
 def test_validation_exception_queues_and_writes_diagnosis():

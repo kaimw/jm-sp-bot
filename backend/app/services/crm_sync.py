@@ -4,6 +4,11 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +16,7 @@ from typing import Any
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from backend.app.models import AuditEvent, ChannelPricing, CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, ProductInventorySnapshot, ProductSKU, ProductSPU, PromotionRule, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
+from backend.app.models import AuditEvent, ChannelPricing, CrmOrderItem, CrmOrderSnapshot, CrmSalesOrder, OrderAttachment, ProductInventorySnapshot, ProductSKU, ProductSPU, PromotionRule, CrmSyncRun, ProcessingJob, SystemConfig, now_utc
 from backend.app.services.crm_attachment_cache import cache_order_attachment_file
 from backend.app.services.bootstrap import set_config
 from backend.app.services.crypto import decrypt_value
@@ -21,6 +26,111 @@ from backend.app.services.order_middle_platform import enqueue_crm_order_parsed_
 
 DEFAULT_SOURCE_SYSTEM = "fxiaoke"
 DEFAULT_CDP_URL = "http://127.0.0.1:9333"
+FXIAOKE_LOGIN_STATE_FILE = Path("/private/tmp/fxiaoke-login-renewal-state.json")
+FXIAOKE_LOGIN_COOLDOWN_SECONDS = 10 * 60
+CRM_SYNC_LOCK_MESSAGE = "当前有 CRM 同步任务正在进行，请稍后重试。"
+CRM_SYNC_LOCK_STALE_MESSAGE = "检测到上一次 CRM 同步锁超时，已自动释放并继续执行。"
+CRM_SYNC_LOCK = threading.Lock()
+CRM_SYNC_LOCK_STATE: dict[str, Any] = {}
+
+# 单订单详情同步使用独立的锁字典，不同订单可以并行
+CRM_DETAIL_LOCK = threading.Lock()  # 保护 _detail_locks 字典的元锁
+_detail_locks: dict[str, threading.Lock] = {}
+MAX_CONCURRENT_DETAIL_SYNCS = 3  # 最多同时进行3个详情同步（避免 CDP 浏览器压力过大）
+_detail_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_DETAIL_SYNCS)
+
+
+class CrmSyncBusyError(RuntimeError):
+    pass
+
+
+def crm_sync_lock_lease_seconds(session: Session) -> int:
+    configured_timeout = max(30, config_int(session, "crm_sync_timeout_seconds", 120))
+    return max(180, min(900, configured_timeout + 90))
+
+
+@contextmanager
+def crm_sync_lock(session: Session, operation: str):
+    lease_seconds = crm_sync_lock_lease_seconds(session)
+    acquired = CRM_SYNC_LOCK.acquire(blocking=False)
+    if not acquired:
+        now = time.time()
+        acquired_at = float(CRM_SYNC_LOCK_STATE.get("acquired_at") or 0)
+        age_seconds = int(now - acquired_at) if acquired_at > 0 else None
+        if age_seconds is not None and age_seconds > lease_seconds:
+            try:
+                CRM_SYNC_LOCK.release()
+            except RuntimeError:
+                pass
+            acquired = CRM_SYNC_LOCK.acquire(blocking=False)
+            if acquired:
+                CRM_SYNC_LOCK_STATE.clear()
+                CRM_SYNC_LOCK_STATE.update(
+                    {
+                        "operation": operation,
+                        "acquired_at": now,
+                        "lease_seconds": lease_seconds,
+                        "stale_lock_recovered": True,
+                    }
+                )
+        if not acquired:
+            running_operation = CRM_SYNC_LOCK_STATE.get("operation") or "CRM 同步"
+            detail = f"{CRM_SYNC_LOCK_MESSAGE} 当前任务：{running_operation}"
+            if age_seconds is not None:
+                detail += f"，已运行约 {age_seconds} 秒"
+            raise CrmSyncBusyError(detail)
+    else:
+        CRM_SYNC_LOCK_STATE.clear()
+        CRM_SYNC_LOCK_STATE.update(
+            {
+                "operation": operation,
+                "acquired_at": time.time(),
+                "lease_seconds": lease_seconds,
+                "stale_lock_recovered": False,
+            }
+        )
+    try:
+        yield CRM_SYNC_LOCK_STATE.copy()
+    finally:
+        if acquired:
+            CRM_SYNC_LOCK_STATE.clear()
+            try:
+                CRM_SYNC_LOCK.release()
+            except RuntimeError:
+                pass
+
+
+@contextmanager
+def crm_detail_lock(order_key: str, timeout_seconds: int = 300):
+    """单订单详情同步锁，基于 order_key 隔离，不同订单可以并行。
+
+    使用信号量限制最大并发数，避免 CDP 浏览器压力过大。
+    """
+    with CRM_DETAIL_LOCK:
+        if order_key not in _detail_locks:
+            _detail_locks[order_key] = threading.Lock()
+        lock = _detail_locks[order_key]
+
+    acquired_sem = _detail_semaphore.acquire(timeout=timeout_seconds)
+    if not acquired_sem:
+        raise CrmSyncBusyError(f"当前进行中的 CRM 详情同步已达上限（{MAX_CONCURRENT_DETAIL_SYNCS}），请稍后重试。")
+
+    acquired_lock = lock.acquire(blocking=False)
+    if not acquired_lock:
+        _detail_semaphore.release()
+        raise CrmSyncBusyError(f"该订单正在进行 CRM 详情同步，请稍后重试。订单标识：{order_key}")
+
+    try:
+        yield
+    finally:
+        lock.release()
+        _detail_semaphore.release()
+        # 清理长期未使用的锁，避免内存泄漏
+        with CRM_DETAIL_LOCK:
+            # 尝试获取锁判断是否空闲
+            if lock.acquire(blocking=False):
+                lock.release()
+                _detail_locks.pop(order_key, None)
 
 
 def config_value(session: Session, key: str, default: str = "") -> str:
@@ -64,6 +174,337 @@ def ensure_request_file(
     return str(target), target
 
 
+def _remaining_login_cooldown_seconds() -> int:
+    try:
+        state = json.loads(FXIAOKE_LOGIN_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    last_failure_at = float(state.get("last_failure_at") or 0) / 1000
+    if last_failure_at <= 0:
+        return 0
+    remaining = FXIAOKE_LOGIN_COOLDOWN_SECONDS - (time.time() - last_failure_at)
+    return max(0, int(remaining))
+
+
+def _cdp_http_get(cdp_url: str, path: str, timeout: int = 5) -> Any:
+    """向 CDP 浏览器发起 HTTP GET 请求，返回 JSON 解析结果。"""
+    base_url = cdp_url.rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base_url}{path}", timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _cdp_list_pages(cdp_url: str) -> list[dict[str, Any]]:
+    """获取 CDP 浏览器的所有页面列表。"""
+    result = _cdp_http_get(cdp_url, "/json/list", timeout=3)
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def _cdp_close_page(cdp_url: str, page_id: str) -> bool:
+    """关闭 CDP 浏览器的一个页面。"""
+    result = _cdp_http_get(cdp_url, f"/json/close/{page_id}", timeout=3)
+    return result is not None
+
+
+def _cdp_page_is_login(page: dict[str, Any]) -> bool:
+    """判断页面是否停留在登录页。"""
+    return "login" in str(page.get("url") or "").lower() or "CRM登录系统" in str(page.get("title") or "")
+
+
+def _cdp_page_is_crm_home(page: dict[str, Any]) -> bool:
+    """判断页面是否在 CRM 首页（已登录状态）。"""
+    url = str(page.get("url") or "").lower()
+    return "fxiaoke.com" in url and "/xv/ui/home" in url
+
+
+def _cdp_page_is_sales_order(page: dict[str, Any]) -> bool:
+    """判断页面是否在销售订单列表。"""
+    return "salesorderobj" in str(page.get("url") or "").lower()
+
+
+def _cdp_cleanup_extra_pages(cdp_url: str) -> dict[str, Any]:
+    """清理 CDP 浏览器多余页签，只保留一个最佳的页签。
+
+    优先级：销售订单列表 > CRM 首页 > 第一个非登录页 > 第一个页
+    返回清理后的状态。
+    """
+    pages = _cdp_list_pages(cdp_url)
+    if not pages:
+        return {"pages": [], "kept": None, "closed": 0, "message": "no pages found"}
+
+    # 按优先级排序：销售订单 > CRM首页 > 非登录页 > 其他
+    priority = lambda p: (
+        0 if _cdp_page_is_sales_order(p) else
+        1 if _cdp_page_is_crm_home(p) else
+        2 if not _cdp_page_is_login(p) else
+        3
+    )
+    sorted_pages = sorted(pages, key=priority)
+    best_page = sorted_pages[0]
+
+    closed = 0
+    for page in pages:
+        if page.get("id") != best_page.get("id"):
+            if _cdp_close_page(cdp_url, page.get("id", "")):
+                closed += 1
+
+    remaining = _cdp_list_pages(cdp_url)
+    return {
+        "pages": remaining,
+        "kept": {"id": best_page.get("id"), "url": best_page.get("url"), "title": best_page.get("title")},
+        "closed": closed,
+        "remaining_count": len(remaining),
+        "is_login_page": _cdp_page_is_login(best_page),
+    }
+
+
+def crm_external_browser_pids(port: int, user_data_dir: str) -> list[int]:
+    patterns = [
+        f"remote-debugging-port={port}",
+        f"user-data-dir={user_data_dir}",
+        f"fxiaoke_start_cdp_chrome.mjs --port={port}",
+    ]
+    pids: set[int] = set()
+    for pattern in patterns:
+        try:
+            output = subprocess.check_output(["pgrep", "-f", pattern], text=True, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            continue
+        for line in output.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid != os.getpid():
+                pids.add(pid)
+    return sorted(pids)
+
+
+def ensure_crm_browser_headless(session: Session) -> None:
+    port = config_int(session, "crm_cdp_port", 9334)
+    user_data_dir = config_value(session, "crm_cdp_user_data_dir", f"/private/tmp/fxiaoke-cdp-profile-{port}").strip()
+    
+    version = {}
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.5) as response:
+            version = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        pass
+        
+    is_running = bool(version)
+    is_headless = "HeadlessChrome" in str(version.get("User-Agent") or "")
+    
+    if is_running and is_headless:
+        return
+        
+    pids = crm_external_browser_pids(port, user_data_dir)
+    for pid in pids:
+        try:
+            os.kill(pid, 15)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if pids:
+        time.sleep(0.5)
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+                
+    chrome_bin = config_value(session, "crm_chrome_bin", "").strip()
+    script_path = Path(__file__).resolve().parents[3] / "scripts" / "fxiaoke_start_cdp_chrome.mjs"
+    if not script_path.exists():
+        raise RuntimeError(f"CRM 专用浏览器启动脚本不存在：{script_path}")
+        
+    command = [
+        "node",
+        str(script_path),
+        f"--port={port}",
+        f"--user-data-dir={user_data_dir}",
+    ]
+    
+    env = os.environ.copy()
+    if chrome_bin:
+        env["CHROME_BIN"] = chrome_bin
+        
+    try:
+        subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parents[3]),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(2.0)
+    except Exception as exc:
+        raise RuntimeError(f"自动启动无头 CRM 浏览器失败：{exc}") from exc
+
+
+def preflight_crm_cdp_browser(cdp_url: str, *, allow_login_page: bool = False) -> dict[str, Any]:
+    base_url = cdp_url.rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base_url}/json/list", timeout=3) as response:
+            pages = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"CRM 专用浏览器不可连接：{cdp_url}；请先在系统接入页启动 CRM 专用浏览器。原始错误：{exc}") from exc
+    if not isinstance(pages, list):
+        raise RuntimeError(f"CRM 专用浏览器返回异常：{cdp_url}/json/list")
+
+    login_pages = [page for page in pages if _cdp_page_is_login(page)]
+    logged_in_pages = [
+        page for page in pages
+        if "fxiaoke.com" in str(page.get("url") or "").lower()
+        and "/XV/UI/Home" in str(page.get("url") or "")
+        and not _cdp_page_is_login(page)
+    ]
+    login_page_blocked = bool(login_pages and not logged_in_pages)
+    has_multiple_pages = len(pages) > 1
+
+    # 多页签清理
+    cleanup_result: dict[str, Any] = {}
+    if has_multiple_pages:
+        cleanup_result = _cdp_cleanup_extra_pages(cdp_url)
+        # 清理后重新检查登录状态
+        if cleanup_result.get("is_login_page"):
+            login_pages = [{"url": cleanup_result["kept"].get("url"), "title": cleanup_result["kept"].get("title")}]
+            logged_in_pages = []
+            login_page_blocked = True
+        else:
+            login_pages = []
+            logged_in_pages = [{"url": cleanup_result["kept"].get("url"), "title": cleanup_result["kept"].get("title")}]
+            login_page_blocked = False
+
+    # 仅当浏览器停留在登录页且自动登录也被风控阻止时才要求人工登录
+    if login_page_blocked:
+        remaining = _remaining_login_cooldown_seconds()
+        if remaining > 0:
+            raise RuntimeError(
+                f"CRM 自动登录仍在风控冷却期，约 {remaining} 秒后才会重试。"
+                "如需立即使用，请点击「人工登录模式」手动完成登录。"
+            )
+        # 有凭据时允许 Node.js 尝试自动登录；无凭据时也给机会让 Node.js 报出更明确的信息
+        if not allow_login_page:
+            # 无凭据配置，但浏览器在登录页——让 Node.js 尝试，不行会报"未配置 CRM 账号密码"
+            pass
+
+    return {
+        "cdp_url": cdp_url,
+        "page_count": len(pages),
+        "login_page_count": len(login_pages),
+        "logged_in_page_count": len(logged_in_pages),
+        "login_page_blocked": login_page_blocked,
+        "login_page_allowed_for_auto_login": bool(login_page_blocked and allow_login_page),
+        "cleanup": cleanup_result,
+        "titles": [str(page.get("title") or "")[:80] for page in pages[:5]],
+    }
+
+
+def crm_replay_error_message(completed: subprocess.CompletedProcess[str], fallback: str) -> str:
+    text = (completed.stderr or completed.stdout or fallback).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    error = str(parsed.get("error") or "").strip()
+    if error:
+        return error
+    return text
+
+
+def _is_transient_subprocess_error(error_message: str) -> bool:
+    """判断是否为可重试的瞬态错误（网络抖动、浏览器暂时不可用等）。"""
+    transient_markers = [
+        "connection refused",
+        "connection reset",
+        "timeout",
+        "timed out",
+        "CDP websocket connection failed",
+        "CDP command timed out",
+        "Target closed",
+        "Session closed",
+        "Browser has disconnected",
+        "net::ERR_",
+        "net::ERR_TIMED_OUT",
+        "ECONNREFUSED",
+        "ECONNRESET",
+        "ETIMEDOUT",
+        "ENOTFOUND",
+        "EAI_AGAIN",
+        "socket hang up",
+        "fetch failed",
+        "NetworkError",
+        "Network Error",
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+        "504 Gateway Timeout",
+    ]
+    lower = error_message.lower()
+    return any(marker.lower() in lower for marker in transient_markers)
+
+
+def _run_replay_subprocess_with_retry(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: int,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> subprocess.CompletedProcess[str]:
+    """带指数退避重试的 subprocess 执行，仅对瞬态错误重试。"""
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if completed.returncode == 0:
+                return completed
+            error_message = crm_replay_error_message(completed, "CRM 同步脚本执行失败")
+            if attempt < max_retries and _is_transient_subprocess_error(error_message):
+                delay = base_delay * (2 ** attempt)
+                last_error = error_message
+                time.sleep(delay)
+                continue
+            raise RuntimeError(error_message)
+        except subprocess.TimeoutExpired as exc:
+            error_message = f"CRM 同步脚本执行超时 ({timeout}s)"
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                last_error = error_message
+                time.sleep(delay)
+                continue
+            raise RuntimeError(error_message) from exc
+    raise RuntimeError(f"CRM 同步脚本重试 {max_retries} 次后仍失败: {last_error}")
+
+
+def update_crm_sync_stage(session: Session, sync_run: CrmSyncRun, stage: str, detail: dict[str, Any] | None = None) -> None:
+    payload = loads(sync_run.detail_json, {})
+    history = payload.get("stage_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({"stage": stage, "at": now_utc().isoformat(), **(detail or {})})
+    payload["stage"] = stage
+    payload["stage_at"] = now_utc().isoformat()
+    payload["stage_history"] = history[-30:]
+    sync_run.detail_json = dumps(payload)
+    sync_run.finished_at = None
+    session.add(sync_run)
+    session.commit()
+
+
 def crm_order_sync_due(session: Session, *, now: datetime | None = None) -> bool:
     if not config_bool(session, "crm_sync_enabled", False):
         return False
@@ -90,7 +531,7 @@ def schedule_crm_order_sync_if_due(session: Session) -> dict[str, Any]:
         .first()
     )
     if existing is not None:
-        return {"queued": False, "reason": "already queued", "job_id": existing.id}
+        return {"queued": False, "busy": True, "message": CRM_SYNC_LOCK_MESSAGE, "reason": "already queued", "job_id": existing.id}
     job = ProcessingJob(job_type="sync_crm_sales_orders", payload_json=dumps({"source": "auto"}), status="Pending")
     session.add(job)
     session.commit()
@@ -104,42 +545,119 @@ def queue_crm_order_sync(session: Session, *, source: str = "manual") -> dict[st
         .first()
     )
     if existing is not None:
-        return {"queued": False, "reason": "already queued", "job_id": existing.id}
+        return {"queued": False, "busy": True, "message": CRM_SYNC_LOCK_MESSAGE, "reason": "already queued", "job_id": existing.id}
     job = ProcessingJob(job_type="sync_crm_sales_orders", payload_json=dumps({"source": source}), status="Pending")
     session.add(job)
     session.commit()
     return {"queued": True, "job_id": job.id}
 
 
+def recover_stale_crm_sync_runs(session: Session) -> int:
+    """将卡在 Running 状态超过租约时间的 CrmSyncRun 标记为 Failed。"""
+    lease_seconds = crm_sync_lock_lease_seconds(session)
+    cutoff = now_utc().replace(tzinfo=None) if now_utc().tzinfo is None else now_utc()
+    from datetime import timedelta as _td
+    stale = (
+        session.query(CrmSyncRun)
+        .filter(
+            CrmSyncRun.status == "Running",
+            CrmSyncRun.started_at < cutoff - _td(seconds=lease_seconds),
+        )
+        .all()
+    )
+    for sync_run in stale:
+        sync_run.status = "Failed"
+        sync_run.finished_at = now_utc()
+        sync_run.error_message = "同步超时：任务卡在 Running 状态超过租约时间，自动标记为失败"
+        detail = loads(sync_run.detail_json, {})
+        detail.update({"stage": "Failed", "stage_at": now_utc().isoformat(), "error_type": "StaleRunningRecovery"})
+        sync_run.detail_json = dumps(detail)
+        session.add(
+            AuditEvent(
+                event_type="CrmSyncRunStaleRecovered",
+                related_object_type="CrmSyncRun",
+                related_object_id=sync_run.id,
+                detail=dumps({"message": "Stale Running CrmSyncRun recovered", "started_at": sync_run.started_at.isoformat() if sync_run.started_at else None}),
+            )
+        )
+    if stale:
+        session.commit()
+    return len(stale)
+
+
 def run_crm_sales_order_sync(session: Session, *, trigger: str = "manual") -> dict[str, Any]:
+    recover_stale_crm_sync_runs(session)
+    with crm_sync_lock(session, "CRM 销售订单同步") as lock_state:
+        if lock_state.get("stale_lock_recovered"):
+            session.add(
+                AuditEvent(
+                    event_type="CrmSyncStaleLockRecovered",
+                    related_object_type="CrmSyncRun",
+                    related_object_id="",
+                    detail=dumps({"message": CRM_SYNC_LOCK_STALE_MESSAGE, "operation": "CRM 销售订单同步"}),
+                )
+            )
+            session.commit()
+        return _run_crm_sales_order_sync(session, trigger=trigger)
+
+
+def _run_crm_sales_order_sync(session: Session, *, trigger: str = "manual") -> dict[str, Any]:
     sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Running", trigger=trigger)
     session.add(sync_run)
-    session.flush()
+    session.commit()
 
     try:
+        update_crm_sync_stage(session, sync_run, "ReplayRunning", {"message": "正在连接 CRM 专用浏览器并拉取销售订单"})
         rows, command_summary = fetch_sales_orders_via_replay(session)
+        sync_run = session.get(CrmSyncRun, sync_run.id) or sync_run
+        update_crm_sync_stage(session, sync_run, "Upserting", {"source_total": len(rows), "pages": command_summary.get("pages", [])})
         result = upsert_crm_sales_orders(session, rows)
+        sync_run = session.get(CrmSyncRun, sync_run.id) or sync_run
         sync_run.status = "Completed"
         sync_run.finished_at = now_utc()
         sync_run.created_count = result["created"]
         sync_run.updated_count = result["updated"]
         sync_run.unchanged_count = result["unchanged"]
         sync_run.total_count = result["total"]
-        sync_run.detail_json = dumps({"command": command_summary, "source_total": len(rows)})
+        detail = loads(sync_run.detail_json, {})
+        detail.update({"stage": "Completed", "stage_at": now_utc().isoformat(), "command": command_summary, "source_total": len(rows)})
+        sync_run.detail_json = dumps(detail)
         set_config(session, "crm_sales_orders_last_sync_at", now_utc().isoformat(), is_secret=False)
         session.commit()
         return {"ok": True, "sync_run_id": sync_run.id, **result, "command": command_summary}
     except Exception as exc:
         session.rollback()
-        sync_run = session.get(CrmSyncRun, sync_run.id)
-        if sync_run is None:
-            sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Failed", trigger=trigger)
-            session.add(sync_run)
-        sync_run.status = "Failed"
-        sync_run.finished_at = now_utc()
-        sync_run.error_message = str(exc)
-        sync_run.detail_json = dumps({"error_type": exc.__class__.__name__})
-        session.commit()
+        # 多次尝试保存失败状态，避免 CrmSyncRun 永久卡在 Running
+        sync_run_saved = False
+        for save_attempt in range(3):
+            try:
+                sync_run = session.get(CrmSyncRun, sync_run.id)
+                if sync_run is None:
+                    sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Failed", trigger=trigger)
+                    session.add(sync_run)
+                sync_run.status = "Failed"
+                sync_run.finished_at = now_utc()
+                sync_run.error_message = str(exc)
+                detail = loads(sync_run.detail_json, {})
+                detail.update({"stage": "Failed", "stage_at": now_utc().isoformat(), "error_type": exc.__class__.__name__})
+                sync_run.detail_json = dumps(detail)
+                session.commit()
+                sync_run_saved = True
+                break
+            except Exception:
+                session.rollback()
+                time.sleep(0.5)
+        if not sync_run_saved:
+            # 最后的兜底：尝试简化写入
+            try:
+                sync_run = session.get(CrmSyncRun, sync_run.id)
+                if sync_run is not None:
+                    sync_run.status = "Failed"
+                    sync_run.finished_at = now_utc()
+                    sync_run.error_message = str(exc)[:500]
+                    session.commit()
+            except Exception:
+                session.rollback()
         raise
 
 
@@ -177,6 +695,10 @@ def crm_order_single_row(order: CrmSalesOrder) -> dict[str, Any]:
 
 
 def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder) -> tuple[dict[str, Any], dict[str, Any]]:
+    """通过 CDP 浏览器为单个订单拉取详情页。
+
+    也支持传入带有 crm_order_no 的字典（用于强制同步尚未入库的订单）。
+    """
     detail_request_path = config_value(session, "crm_fxiaoke_detail_request_file", "").strip()
     detail_request_json = config_value(session, "crm_fxiaoke_detail_request_json", "").strip()
     if not detail_request_path and not detail_request_json:
@@ -186,11 +708,25 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
     script_path = Path(__file__).resolve().parents[3] / "scripts" / "fxiaoke_replay_sales_orders.mjs"
     if not script_path.exists():
         raise RuntimeError(f"CRM 同步脚本不存在：{script_path}")
+    ensure_crm_browser_headless(session)
+    cdp_preflight = preflight_crm_cdp_browser(
+        cdp_url,
+        allow_login_page=bool(config_value(session, "crm_username", "").strip() and config_value(session, "crm_password", "").strip()),
+    )
 
-    single_row_path = Path("/private/tmp") / f"fxiaoke-single-row-{order.id}.json"
+    if isinstance(order, CrmSalesOrder):
+        row_dict = crm_order_single_row(order)
+        row_id = str(order.id)
+    elif isinstance(order, dict):
+        row_dict = dict(order)
+        row_id = hashlib.md5(str(row_dict.get("crm_order_no") or "").encode()).hexdigest()[:12]
+    else:
+        raise RuntimeError("order 必须是 CrmSalesOrder 或 dict")
+
+    single_row_path = Path("/private/tmp") / f"fxiaoke-single-row-{row_id}.json"
     temp_detail_request_path: Path | None = None
     try:
-        single_row_path.write_text(json.dumps(crm_order_single_row(order), ensure_ascii=False), encoding="utf-8")
+        single_row_path.write_text(json.dumps(row_dict, ensure_ascii=False), encoding="utf-8")
         detail_request_path, temp_detail_request_path = ensure_request_file(
             configured_path=detail_request_path,
             request_json=detail_request_json,
@@ -204,17 +740,16 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
             "FXIAOKE_USERNAME": config_value(session, "crm_username", "").strip(),
             "FXIAOKE_PASSWORD": config_value(session, "crm_password", "").strip(),
         }
-        completed = subprocess.run(
+        timeout = max(30, config_int(session, "crm_sync_timeout_seconds", 120))
+        max_retries = max(0, config_int(session, "crm_sync_max_retries", 3))
+        completed = _run_replay_subprocess_with_retry(
             command,
             cwd=str(Path(__file__).resolve().parents[3]),
             env={**os.environ, **env},
-            capture_output=True,
-            text=True,
-            timeout=max(30, config_int(session, "crm_sync_timeout_seconds", 120)),
-            check=False,
+            timeout=timeout,
+            max_retries=max_retries,
+            base_delay=2.0,
         )
-        if completed.returncode != 0:
-            raise RuntimeError((completed.stderr or completed.stdout or "CRM 单条详情同步脚本执行失败").strip())
         output = json.loads(completed.stdout)
         json_path = output.get("jsonPath")
         if not json_path:
@@ -229,7 +764,7 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
         failed_detail = next((item for item in output.get("detailPages", []) if item.get("status") == "Failed"), None)
         if failed_detail is not None:
             raise RuntimeError(str(failed_detail.get("error") or "CRM 单条详情同步失败"))
-        return row, {"cdp_url": cdp_url, "detail_request_file": detail_request_path, "json_path": json_path, "detail_pages": output.get("detailPages", [])}
+        return row, {"cdp_url": cdp_url, "cdp_preflight": cdp_preflight, "detail_request_file": detail_request_path, "json_path": json_path, "detail_pages": output.get("detailPages", [])}
     finally:
         try:
             single_row_path.unlink()
@@ -242,7 +777,11 @@ def fetch_single_order_detail_via_replay(session: Session, order: CrmSalesOrder)
                 pass
 
 
-def retry_crm_order_detail_sync(session: Session, order: CrmSalesOrder) -> dict[str, Any]:
+def retry_crm_order_detail_sync(session: Session, order: CrmSalesOrder, *, acquire_lock: bool = True) -> dict[str, Any]:
+    if acquire_lock:
+        order_key = f"{order.source_system or DEFAULT_SOURCE_SYSTEM}:{order.crm_order_no or order.id}"
+        with crm_detail_lock(order_key):
+            return retry_crm_order_detail_sync(session, order, acquire_lock=False)
     try:
         row, command = fetch_single_order_detail_via_replay(session, order)
         result = upsert_crm_sales_orders(session, [row])
@@ -263,6 +802,7 @@ def retry_crm_order_detail_sync(session: Session, order: CrmSalesOrder) -> dict[
         order.raw_json = dumps(raw)
         order.sync_status = "DetailFailed"
         order.updated_at = now_utc()
+        session.add(order)
         session.add(
             AuditEvent(
                 event_type="CrmOrderDetailRetryFailed",
@@ -271,7 +811,78 @@ def retry_crm_order_detail_sync(session: Session, order: CrmSalesOrder) -> dict[
                 detail=dumps({"crm_order_id": order.crm_order_id, "crm_order_no": order.crm_order_no, "error": str(exc)}),
             )
         )
+        session.commit()
         raise
+
+
+def force_sync_crm_order_by_no(session: Session, crm_order_no: str) -> dict[str, Any]:
+    with crm_sync_lock(session, f"CRM 指定订单强制同步：{crm_order_no}") as lock_state:
+        if lock_state.get("stale_lock_recovered"):
+            session.add(
+                AuditEvent(
+                    event_type="CrmSyncStaleLockRecovered",
+                    related_object_type="CrmSalesOrder",
+                    related_object_id="",
+                    detail=dumps({"message": CRM_SYNC_LOCK_STALE_MESSAGE, "operation": "CRM 指定订单强制同步", "crm_order_no": crm_order_no}),
+                )
+            )
+            session.commit()
+        return _force_sync_crm_order_by_no(session, crm_order_no)
+
+
+def _force_sync_crm_order_by_no(session: Session, crm_order_no: str) -> dict[str, Any]:
+    order_no = str(crm_order_no or "").strip()
+    if not order_no:
+        raise RuntimeError("CRM 订单号不能为空")
+    order = session.query(CrmSalesOrder).filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, CrmSalesOrder.crm_order_no == order_no).first()
+    list_command = None
+    if order is None:
+        # 优先通过详情接口直接拉取（比全量列表拉取更高效）
+        try:
+            synthetic_row = {"crm_order_no": order_no, "crm_order_id": order_no}
+            row, detail_command = fetch_single_order_detail_via_replay(session, synthetic_row)
+            result = upsert_crm_sales_orders(session, [row])
+            session.flush()
+            order = session.query(CrmSalesOrder).filter(
+                CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM,
+                CrmSalesOrder.crm_order_no == order_no,
+            ).first()
+            if order is None:
+                raise RuntimeError(f"CRM 订单入库失败：{order_no}")
+            list_command = detail_command
+        except Exception as detail_error:
+            # 详情直接拉取失败，回退到全量列表拉取
+            rows, command = fetch_sales_orders_via_replay(session)
+            matched = [row for row in rows if str(row.get("crm_order_no") or "").strip() == order_no]
+            if not matched:
+                raise RuntimeError(f"CRM 列表同步未找到订单：{order_no}（详情拉取也失败：{detail_error}）") from detail_error
+            upsert_crm_sales_orders(session, matched)
+            session.flush()
+            order = session.query(CrmSalesOrder).filter(
+                CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM,
+                CrmSalesOrder.crm_order_no == order_no,
+            ).first()
+            if order is None:
+                raise RuntimeError(f"CRM 订单入库失败：{order_no}")
+            list_command = command
+
+    detail_retry = retry_crm_order_detail_sync(session, order, acquire_lock=False)
+    session.flush()
+    refreshed = session.query(CrmSalesOrder).filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, CrmSalesOrder.crm_order_no == order_no).first() or order
+    from backend.app.services.order_middle_platform import crm_order_parsed_event, process_crm_order_parsed_event
+
+    event = crm_order_parsed_event(refreshed, trace_id=f"force-sync-{order_no}")
+    event["force_revalidate"] = True
+    process_result = process_crm_order_parsed_event(session, event)
+    session.add(
+        AuditEvent(
+            event_type="CrmOrderForceSynced",
+            related_object_type="CrmSalesOrder",
+            related_object_id=refreshed.id,
+            detail=dumps({"crm_order_no": order_no, "detail_retry": detail_retry, "process_result": process_result, "list_command": list_command}),
+        )
+    )
+    return {"ok": True, "crm_order_id": refreshed.id, "crm_order_no": order_no, "detail_retry": detail_retry, "process_result": process_result}
 
 
 def run_crm_integration_test(session: Session) -> dict[str, Any]:
@@ -321,6 +932,11 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
         raise RuntimeError(f"CRM 同步脚本不存在：{script_path}")
     if not request_path and not request_json:
         raise RuntimeError("请先配置 crm_fxiaoke_request_file 或 crm_fxiaoke_request_json")
+    ensure_crm_browser_headless(session)
+    cdp_preflight = preflight_crm_cdp_browser(
+        cdp_url,
+        allow_login_page=bool(config_value(session, "crm_username", "").strip() and config_value(session, "crm_password", "").strip()),
+    )
 
     temp_request_path: Path | None = None
     temp_detail_request_path: Path | None = None
@@ -343,22 +959,24 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
             "FXIAOKE_CDP_URL": cdp_url,
             "FXIAOKE_PAGE_SIZE": page_size,
             "FXIAOKE_MAX_PAGES": max_pages,
+            "FXIAOKE_MIN_ORDER_DATE": config_value(session, "crm_sync_min_order_date", "").strip(),
             "FXIAOKE_DETAIL_ENABLED": "true" if config_bool(session, "crm_sync_detail_enabled", True) else "false",
             "FXIAOKE_REQUEST_TIMEOUT_MS": str(max(1000, config_int(session, "crm_sync_request_timeout_ms", 15000))),
             "FXIAOKE_USERNAME": config_value(session, "crm_username", "").strip(),
             "FXIAOKE_PASSWORD": config_value(session, "crm_password", "").strip(),
+            "FXIAOKE_DETAIL_CONCURRENCY": str(max(1, config_int(session, "crm_sync_detail_concurrency", 3))),
+            "FXIAOKE_REQUEST_RETRY_MAX": str(max(0, config_int(session, "crm_sync_max_retries", 3))),
         }
-        completed = subprocess.run(
+        timeout = max(30, config_int(session, "crm_sync_timeout_seconds", 120))
+        max_retries = max(0, config_int(session, "crm_sync_max_retries", 3))
+        completed = _run_replay_subprocess_with_retry(
             command,
             cwd=str(Path(__file__).resolve().parents[3]),
             env={**os.environ, **env},
-            capture_output=True,
-            text=True,
-            timeout=max(30, config_int(session, "crm_sync_timeout_seconds", 120)),
-            check=False,
+            timeout=timeout,
+            max_retries=max_retries,
+            base_delay=2.0,
         )
-        if completed.returncode != 0:
-            raise RuntimeError((completed.stderr or completed.stdout or "CRM 同步脚本执行失败").strip())
         output = json.loads(completed.stdout)
         json_path = output.get("jsonPath")
         if not json_path:
@@ -369,6 +987,7 @@ def fetch_sales_orders_via_replay(session: Session) -> tuple[list[dict[str, Any]
             raise RuntimeError("CRM 同步脚本返回 rows 格式错误")
         return rows, {
             "cdp_url": cdp_url,
+            "cdp_preflight": cdp_preflight,
             "request_file": request_path,
             "detail_request_file": detail_request_path,
             "json_path": json_path,
@@ -428,8 +1047,9 @@ def protect_degraded_detail_row(session: Session, existing: CrmSalesOrder | None
                 return value
         return None
 
-    incoming_order_items = protected.get("order_items")
+    incoming_order_items = protected.get("order_items") or protected.get("items")
     if isinstance(incoming_order_items, list) and incoming_order_items:
+        protected["order_items"] = incoming_order_items
         protected["items"] = incoming_order_items
     previous_items = first_raw_value("order_items") or first_raw_value("items")
     if not (isinstance(incoming_order_items, list) and incoming_order_items) and isinstance(previous_items, list) and previous_items:
@@ -693,68 +1313,97 @@ def upsert_crm_sales_orders(session: Session, rows: list[dict[str, Any]]) -> dic
     updated = 0
     unchanged = 0
     ignored = 0
+    row_errors = 0
     changed_orders: list[CrmSalesOrder] = []
     for row in rows:
         crm_order_id = str(row.get("crm_order_id") or "").strip()
         crm_order_no = str(row.get("crm_order_no") or "").strip()
         if not crm_order_id and not crm_order_no:
             continue
-        filters = []
-        if crm_order_id:
-            filters.append(CrmSalesOrder.crm_order_id == crm_order_id)
-        if crm_order_no:
-            filters.append(CrmSalesOrder.crm_order_no == crm_order_no)
-        existing = (
-            session.query(CrmSalesOrder)
-            .filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, or_(*filters))
-            .first()
-        )
-        date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
-        if not date_in_scope and existing is None:
-            ignored += 1
-            continue
-        row = protect_degraded_detail_row(session, existing, row)
-        digest = payload_hash(row)
-        was_new = existing is None
-        row_changed = False
-        if existing is None:
-            existing = CrmSalesOrder(
-                source_system=DEFAULT_SOURCE_SYSTEM,
-                crm_order_id=crm_order_id or crm_order_no,
-                crm_order_no=crm_order_no or crm_order_id,
-                payload_hash=digest,
+        try:
+            filters = []
+            if crm_order_id:
+                filters.append(CrmSalesOrder.crm_order_id == crm_order_id)
+            if crm_order_no:
+                filters.append(CrmSalesOrder.crm_order_no == crm_order_no)
+            existing = (
+                session.query(CrmSalesOrder)
+                .filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, or_(*filters))
+                .first()
             )
-            session.add(existing)
-            created += 1
-            row_changed = True
-        elif existing.payload_hash == digest:
-            unchanged += 1
-        else:
-            updated += 1
-            row_changed = True
+            date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
+            if not date_in_scope and existing is None:
+                ignored += 1
+                continue
+            row = protect_degraded_detail_row(session, existing, row)
+            digest = payload_hash(row)
+            was_new = existing is None
+            row_changed = False
+            if existing is None:
+                existing = CrmSalesOrder(
+                    source_system=DEFAULT_SOURCE_SYSTEM,
+                    crm_order_id=crm_order_id or crm_order_no,
+                    crm_order_no=crm_order_no or crm_order_id,
+                    payload_hash=digest,
+                )
+                session.add(existing)
+                created += 1
+                row_changed = True
+            elif existing.payload_hash == digest:
+                unchanged += 1
+            else:
+                updated += 1
+                row_changed = True
 
-        apply_order_row(existing, row, digest)
-        session.flush()
-        snapshot = save_order_snapshot(session, existing, row, digest)
-        existing.latest_snapshot_id = snapshot.id
-        sync_order_attachments(session, existing, row, digest)
-        in_scope, ignore_reason = phase_one_scope_result(session, row, None if was_new else existing)
-        if in_scope:
-            existing.scope_status = "InScope"
-            existing.scope_ignore_reason = None
-            if row_changed:
-                changed_orders.append(existing)
-        else:
-            existing.scope_status = "Ignored"
-            existing.scope_ignore_reason = ignore_reason
-            existing.sync_status = "Ignored"
-            ignored += 1
+            apply_order_row(existing, row, digest)
+            session.flush()
+            sync_crm_order_items(session, existing, row, digest)
+            snapshot = save_order_snapshot(session, existing, row, digest)
+            existing.latest_snapshot_id = snapshot.id
+            sync_order_attachments(session, existing, row, digest)
+            in_scope, ignore_reason = phase_one_scope_result(session, row, None if was_new else existing)
+            if in_scope:
+                existing.scope_status = "InScope"
+                existing.scope_ignore_reason = None
+                if row_changed:
+                    changed_orders.append(existing)
+            else:
+                existing.scope_status = "Ignored"
+                existing.scope_ignore_reason = ignore_reason
+                existing.sync_status = "Ignored"
+                ignored += 1
+        except Exception as row_exc:
+            # 单行 upsert 失败不中断整批，记录错误继续处理
+            session.rollback()
+            row_errors += 1
+            error_detail = {
+                "crm_order_id": crm_order_id,
+                "crm_order_no": crm_order_no,
+                "error": str(row_exc),
+                "error_type": row_exc.__class__.__name__,
+            }
+            try:
+                session.add(
+                    AuditEvent(
+                        event_type="CrmUpsertRowError",
+                        related_object_type="CrmSalesOrder",
+                        related_object_id=crm_order_id or crm_order_no,
+                        detail=dumps(error_detail),
+                    )
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
     session.flush()
     queued = 0
     for order in changed_orders:
-        enqueue_crm_order_parsed_event(session, order)
-        queued += 1
-    return {"created": created, "updated": updated, "unchanged": unchanged, "ignored": ignored, "queued_events": queued, "total": created + updated + unchanged}
+        try:
+            enqueue_crm_order_parsed_event(session, order)
+            queued += 1
+        except Exception:
+            # 单个事件入队失败不影响其他订单
+            session.rollback()
+    return {"created": created, "updated": updated, "unchanged": unchanged, "ignored": ignored, "row_errors": row_errors, "queued_events": queued, "total": created + updated + unchanged}
 
 
 def save_order_snapshot(session: Session, order: CrmSalesOrder, row: dict[str, Any], digest: str) -> CrmOrderSnapshot:
@@ -972,17 +1621,66 @@ def infer_currency(settlement_method: str | None) -> str | None:
 
 
 def settlement_method_from_items(row: dict[str, Any]) -> str:
-    for key in ("order_items", "items"):
-        items = row.get(key)
-        if not isinstance(items, list):
+    items = row.get("order_items") or row.get("items")
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, dict):
             continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            value = normalized_text(item.get("settlement_method") or item.get("订单结算方式") or item.get("结算方式"))
-            if value:
-                return value
+        value = normalized_text(item.get("settlement_method") or item.get("订单结算方式") or item.get("结算方式"))
+        if value:
+            return value
     return ""
+
+
+def crm_order_item_text(item: dict[str, Any], keys: list[str]) -> str | None:
+    for key in keys:
+        value = normalized_text(item.get(key))
+        if value:
+            return value
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    for key in keys:
+        value = normalized_text(raw.get(key))
+        if value:
+            return value
+    return None
+
+
+def sync_crm_order_items(session: Session, order: CrmSalesOrder, row: dict[str, Any], digest: str) -> None:
+    session.query(CrmOrderItem).filter(CrmOrderItem.order_id == order.id).delete(synchronize_session=False)
+    raw_items = row.get("order_items") or row.get("items")
+    if not isinstance(raw_items, list):
+        return
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        product_name = crm_order_item_text(item, ["product_name", "name", "productName", "产品名称", "商品名称", "货物名称"])
+        specification = crm_order_item_text(item, ["specification", "model", "规格型号", "规格", "型号", "主要规格/详细配置"])
+        quantity = crm_order_item_text(item, ["quantity", "qty", "数量"])
+        unit_price = crm_order_item_text(item, ["unit_price", "price", "销售单价", "单价", "价格(元)", "不含税单价（元）"])
+        line_amount = crm_order_item_text(item, ["line_amount", "amount", "销售订单金额", "小计", "总价", "总金额（含税）", "不含税总价（元）"])
+        sku_code = crm_order_item_text(item, ["sku_code", "skuCode", "sku_id", "product_code", "商品编码", "产品编码", "SKU"])
+        crm_item_id = crm_order_item_text(item, ["crm_item_id", "item_id", "id", "订单产品编号"]) or f"{order.crm_order_id}:{index + 1}"
+        if not any([product_name, specification, quantity, unit_price, line_amount, sku_code]):
+            continue
+        session.add(
+            CrmOrderItem(
+                order_id=order.id,
+                source_system=order.source_system,
+                crm_item_id=crm_item_id,
+                crm_order_id=order.crm_order_id,
+                crm_order_no=order.crm_order_no,
+                sku_code=sku_code,
+                product_name=product_name,
+                specification=specification,
+                quantity=quantity,
+                unit_price=unit_price,
+                line_amount=line_amount,
+                raw_json=dumps(item),
+                payload_hash=digest,
+                synced_at=now_utc(),
+            )
+        )
 
 
 def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> None:
