@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -21,7 +22,10 @@ from backend.app.services.crm_attachment_cache import cache_order_attachment_fil
 from backend.app.services.bootstrap import set_config
 from backend.app.services.crypto import decrypt_value
 from backend.app.services.jsonutil import dumps, loads
+from backend.app.services.order_region import DOMESTIC_SETTLEMENT_METHOD, is_overseas_order_payload
 from backend.app.services.order_middle_platform import enqueue_crm_order_parsed_event
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SOURCE_SYSTEM = "fxiaoke"
@@ -605,6 +609,8 @@ def _run_crm_sales_order_sync(session: Session, *, trigger: str = "manual") -> d
     sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Running", trigger=trigger)
     session.add(sync_run)
     session.commit()
+    # 在 try 之前缓存 id，避免 rollback 后 detached 对象取不到 id
+    sync_run_id: str | None = sync_run.id
 
     try:
         update_crm_sync_stage(session, sync_run, "ReplayRunning", {"message": "正在连接 CRM 专用浏览器并拉取销售订单"})
@@ -627,38 +633,44 @@ def _run_crm_sales_order_sync(session: Session, *, trigger: str = "manual") -> d
         return {"ok": True, "sync_run_id": sync_run.id, **result, "command": command_summary}
     except Exception as exc:
         session.rollback()
-        # 多次尝试保存失败状态，避免 CrmSyncRun 永久卡在 Running
-        sync_run_saved = False
-        for save_attempt in range(3):
-            try:
-                sync_run = session.get(CrmSyncRun, sync_run.id)
-                if sync_run is None:
-                    sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Failed", trigger=trigger)
-                    session.add(sync_run)
-                sync_run.status = "Failed"
-                sync_run.finished_at = now_utc()
-                sync_run.error_message = str(exc)
-                detail = loads(sync_run.detail_json, {})
-                detail.update({"stage": "Failed", "stage_at": now_utc().isoformat(), "error_type": exc.__class__.__name__})
-                sync_run.detail_json = dumps(detail)
-                session.commit()
-                sync_run_saved = True
-                break
-            except Exception:
-                session.rollback()
-                time.sleep(0.5)
-        if not sync_run_saved:
-            # 最后的兜底：尝试简化写入
-            try:
-                sync_run = session.get(CrmSyncRun, sync_run.id)
-                if sync_run is not None:
-                    sync_run.status = "Failed"
-                    sync_run.finished_at = now_utc()
-                    sync_run.error_message = str(exc)[:500]
-                    session.commit()
-            except Exception:
-                session.rollback()
+        # 快速保存失败状态，避免 CrmSyncRun 永久卡在 Running
+        if not _save_sync_run_failure(session, sync_run_id, trigger, exc, retries=3):
+            logger.error("CRM 同步异常：无法保存 sync_run 失败状态", exc_info=True)
         raise
+
+
+def _save_sync_run_failure(session: Session, sync_run_id: str | None, trigger: str, exc: Exception, retries: int = 3) -> bool:
+    """多次尝试保存 sync_run 失败状态，避免 rollback 后的 detached 问题。"""
+    for attempt in range(retries):
+        try:
+            sync_run = session.get(CrmSyncRun, sync_run_id) if sync_run_id else None
+            if sync_run is None:
+                sync_run = CrmSyncRun(source_system=DEFAULT_SOURCE_SYSTEM, sync_type="sales_orders", status="Failed", trigger=trigger)
+                session.add(sync_run)
+            sync_run.status = "Failed"
+            sync_run.finished_at = now_utc()
+            sync_run.error_message = str(exc)
+            detail = loads(sync_run.detail_json, {})
+            detail.update({"stage": "Failed", "stage_at": now_utc().isoformat(), "error_type": exc.__class__.__name__})
+            sync_run.detail_json = dumps(detail)
+            session.commit()
+            return True
+        except Exception:
+            session.rollback()
+            if attempt < retries - 1:
+                time.sleep(0.5)
+    # 最后的兜底：尝试极简写入
+    try:
+        sync_run = session.get(CrmSyncRun, sync_run_id) if sync_run_id else None
+        if sync_run is not None:
+            sync_run.status = "Failed"
+            sync_run.finished_at = now_utc()
+            sync_run.error_message = str(exc)[:500]
+            session.commit()
+            return True
+    except Exception:
+        session.rollback()
+    return False
 
 
 def crm_order_single_row(order: CrmSalesOrder) -> dict[str, Any]:
@@ -1320,80 +1332,86 @@ def upsert_crm_sales_orders(session: Session, rows: list[dict[str, Any]]) -> dic
         crm_order_no = str(row.get("crm_order_no") or "").strip()
         if not crm_order_id and not crm_order_no:
             continue
+        # 使用 savepoint 隔离单行 upsert，失败只回退当前行不波及其他行
         try:
-            filters = []
-            if crm_order_id:
-                filters.append(CrmSalesOrder.crm_order_id == crm_order_id)
-            if crm_order_no:
-                filters.append(CrmSalesOrder.crm_order_no == crm_order_no)
-            existing = (
-                session.query(CrmSalesOrder)
-                .filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, or_(*filters))
-                .first()
-            )
-            date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
-            if not date_in_scope and existing is None:
-                ignored += 1
-                continue
-            row = protect_degraded_detail_row(session, existing, row)
-            digest = payload_hash(row)
-            was_new = existing is None
-            row_changed = False
-            if existing is None:
-                existing = CrmSalesOrder(
-                    source_system=DEFAULT_SOURCE_SYSTEM,
-                    crm_order_id=crm_order_id or crm_order_no,
-                    crm_order_no=crm_order_no or crm_order_id,
-                    payload_hash=digest,
-                )
-                session.add(existing)
-                created += 1
-                row_changed = True
-            elif existing.payload_hash == digest:
-                unchanged += 1
-            else:
-                updated += 1
-                row_changed = True
-
-            apply_order_row(existing, row, digest)
-            session.flush()
-            sync_crm_order_items(session, existing, row, digest)
-            snapshot = save_order_snapshot(session, existing, row, digest)
-            existing.latest_snapshot_id = snapshot.id
-            sync_order_attachments(session, existing, row, digest)
-            in_scope, ignore_reason = phase_one_scope_result(session, row, None if was_new else existing)
-            if in_scope:
-                existing.scope_status = "InScope"
-                existing.scope_ignore_reason = None
-                if row_changed:
-                    changed_orders.append(existing)
-            else:
-                existing.scope_status = "Ignored"
-                existing.scope_ignore_reason = ignore_reason
-                existing.sync_status = "Ignored"
-                ignored += 1
-        except Exception as row_exc:
-            # 单行 upsert 失败不中断整批，记录错误继续处理
-            session.rollback()
-            row_errors += 1
-            error_detail = {
-                "crm_order_id": crm_order_id,
-                "crm_order_no": crm_order_no,
-                "error": str(row_exc),
-                "error_type": row_exc.__class__.__name__,
-            }
-            try:
-                session.add(
-                    AuditEvent(
-                        event_type="CrmUpsertRowError",
-                        related_object_type="CrmSalesOrder",
-                        related_object_id=crm_order_id or crm_order_no,
-                        detail=dumps(error_detail),
+            with session.begin_nested():
+                try:
+                    filters = []
+                    if crm_order_id:
+                        filters.append(CrmSalesOrder.crm_order_id == crm_order_id)
+                    if crm_order_no:
+                        filters.append(CrmSalesOrder.crm_order_no == crm_order_no)
+                    existing = (
+                        session.query(CrmSalesOrder)
+                        .filter(CrmSalesOrder.source_system == DEFAULT_SOURCE_SYSTEM, or_(*filters))
+                        .first()
                     )
-                )
-                session.commit()
-            except Exception:
-                session.rollback()
+                    date_in_scope, date_ignore_reason = min_order_date_scope_result(session, row)
+                    if not date_in_scope and existing is None:
+                        ignored += 1
+                        continue
+                    row = protect_degraded_detail_row(session, existing, row)
+                    digest = payload_hash(row)
+                    was_new = existing is None
+                    row_changed = False
+                    if existing is None:
+                        existing = CrmSalesOrder(
+                            source_system=DEFAULT_SOURCE_SYSTEM,
+                            crm_order_id=crm_order_id or crm_order_no,
+                            crm_order_no=crm_order_no or crm_order_id,
+                            payload_hash=digest,
+                        )
+                        session.add(existing)
+                        created += 1
+                        row_changed = True
+                    elif existing.payload_hash == digest:
+                        unchanged += 1
+                    else:
+                        updated += 1
+                        row_changed = True
+
+                    apply_order_row(existing, row, digest)
+                    session.flush()
+                    sync_crm_order_items(session, existing, row, digest)
+                    snapshot = save_order_snapshot(session, existing, row, digest)
+                    existing.latest_snapshot_id = snapshot.id
+                    sync_order_attachments(session, existing, row, digest)
+                    in_scope, ignore_reason = phase_one_scope_result(session, row, None if was_new else existing)
+                    if in_scope:
+                        existing.scope_status = "InScope"
+                        existing.scope_ignore_reason = None
+                        if row_changed:
+                            changed_orders.append(existing)
+                    else:
+                        existing.scope_status = "Ignored"
+                        existing.scope_ignore_reason = ignore_reason
+                        existing.sync_status = "Ignored"
+                        ignored += 1
+                except Exception as row_exc:
+                    # savepoint 内的异常会被自动还原到 savepoint；标记行错误
+                    row_errors += 1
+                    error_detail = {
+                        "crm_order_id": crm_order_id,
+                        "crm_order_no": crm_order_no,
+                        "error": str(row_exc),
+                        "error_type": row_exc.__class__.__name__,
+                    }
+                    try:
+                        session.add(
+                            AuditEvent(
+                                event_type="CrmUpsertRowError",
+                                related_object_type="CrmSalesOrder",
+                                related_object_id=crm_order_id or crm_order_no,
+                                detail=dumps(error_detail),
+                            )
+                        )
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                    raise  # 重新抛出让 begin_nested() context manager 捕获
+        except Exception:
+            # savepoint 已自动回滚；继续处理下一行
+            pass
     session.flush()
     queued = 0
     for order in changed_orders:
@@ -1614,6 +1632,8 @@ def infer_currency(settlement_method: str | None) -> str | None:
     }
     if text in enum_mapping:
         return enum_mapping[text]
+    if "人民币" in text or "RMB" in text:
+        return "CNY"
     for code in ("CNY", "USD", "EUR", "JPY", "HKD"):
         if code in text:
             return code
@@ -1733,6 +1753,8 @@ def apply_order_row(order: CrmSalesOrder, row: dict[str, Any], digest: str) -> N
         if item_settlement_method:
             row["settlement_method"] = item_settlement_method
     order.settlement_method = keep_existing("settlement_method", order.settlement_method)
+    if not normalized_text(order.settlement_method) and not is_overseas_order_payload(row):
+        order.settlement_method = DOMESTIC_SETTLEMENT_METHOD
     order.currency = infer_currency(order.settlement_method)
     order.order_amount = keep_existing("order_amount", order.order_amount)
     order.received_amount = keep_existing("received_amount", order.received_amount)
@@ -1771,19 +1793,13 @@ def latest_crm_sync_run(session: Session) -> CrmSyncRun | None:
 
 
 def crm_order_summary(session: Session) -> dict[str, Any]:
-    rows = session.query(CrmSalesOrder).all()
-    total = len(rows)
-    latest = latest_crm_sync_run(session)
-    pending_job = (
-        session.query(ProcessingJob)
-        .filter(ProcessingJob.job_type == "sync_crm_sales_orders", ProcessingJob.status.in_(["Pending", "Running"]))
-        .order_by(ProcessingJob.created_at)
-        .first()
-    )
+    # 改用聚合查询替代全表扫描
+    total = session.query(func.count(CrmSalesOrder.id)).scalar() or 0
+
     def amount_sum(field: str) -> float:
+        """仅加载指定金额列，Python 求和（兼容 VARCHAR 逗号金额字段）"""
         total_amount = 0.0
-        for row in rows:
-            value = getattr(row, field, None)
+        for (value,) in session.query(getattr(CrmSalesOrder, field)).all():
             if value in (None, ""):
                 continue
             try:
@@ -1791,6 +1807,14 @@ def crm_order_summary(session: Session) -> dict[str, Any]:
             except ValueError:
                 continue
         return round(total_amount, 2)
+
+    latest = latest_crm_sync_run(session)
+    pending_job = (
+        session.query(ProcessingJob)
+        .filter(ProcessingJob.job_type == "sync_crm_sales_orders", ProcessingJob.status.in_(["Pending", "Running"]))
+        .order_by(ProcessingJob.created_at)
+        .first()
+    )
 
     latest_serialized = serialize_sync_run(latest) if latest else None
     return {

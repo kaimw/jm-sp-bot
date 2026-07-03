@@ -39,28 +39,28 @@
       </div>
       <nav aria-label="主导航">
         <div class="nav-group">
-          <span class="nav-group-label">运营看板</span>
-          <a href="#dashboard" data-page-link="dashboard"><span>总览</span><small>地图 / KPI / 告警</small></a>
+          <span class="nav-group-label">核心工作</span>
+          <a href="#dashboard" data-page-link="dashboard"><span>📊 工作台</span><small>总览 / KPI / 动态</small></a>
+          <a href="#orders" data-page-link="orders"><span>📦 订单处理</span><small>预审 / 制单 / 发货</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">监控与追溯</span>
+          <a href="#exceptions" data-page-link="exceptions"><span>⚠️ 异常中心</span><small>阻断 / 待办 / 诊断</small></a>
+          <a href="#outbound" data-page-link="outbound"><span>📨 消息中心</span><small>邮件发送 / 留痕</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">主数据</span>
+          <a href="#master-data" data-page-link="master-data"><span>📋 主数据</span><small>价格 / 别名 / 映射</small></a>
+          <a href="#inventory" data-page-link="inventory"><span>📦 库存管理</span><small>查询 / Excel导入</small></a>
+        </div>
+        <div class="nav-group">
+          <span class="nav-group-label">旧模块</span>
           <a href="#crm-orders" data-page-link="crm-orders"><span>CRM 订单</span><small>同步与预审</small></a>
-        </div>
-        <div class="nav-group">
-          <span class="nav-group-label">商务处理</span>
-          <a href="#exceptions" data-page-link="exceptions"><span>异常接管</span><small>阻断与高危</small></a>
-          <a href="#tasks" data-page-link="tasks"><span>生产任务</span><small>任务单与历史流</small></a>
-        </div>
-        <div class="nav-group">
-          <span class="nav-group-label">履约与资产</span>
-          <a href="#logistics-tasks" data-page-link="logistics-tasks"><span>发货执行</span><small>物流与库存</small></a>
-          <a href="#products" data-page-link="products"><span>物料中心</span><small>SKU / 库存</small></a>
-        </div>
-        <div class="nav-group">
-          <span class="nav-group-label">运维监控</span>
-          <a href="#outbound" data-page-link="outbound"><span>通知队列</span><small>邮件外发</small></a>
-          <a href="#mails" data-page-link="mails"><span>邮件留痕</span><small>入库与分类</small></a>
-          <a href="#ops" data-page-link="ops"><span>队列审计</span><small>Job / 附件 / 备份</small></a>
+          <a href="#tasks" data-page-link="tasks"><span>生产任务</span><small>任务单</small></a>
+          <a href="#ops" data-page-link="ops"><span>队列审计</span><small>Job / 附件</small></a>
         </div>
         <div class="nav-group nav-bottom">
-          <a href="#integration" data-page-link="integration" class="settings-entry"><span>Settings</span><small>接入 / 规则 / 通知 / Agent</small></a>
+          <a href="#integration" data-page-link="integration" class="settings-entry"><span>🔧 设置</span><small>接入 / 规则 / 通知 / Agent</small></a>
         </div>
       </nav>
     </aside>
@@ -103,6 +103,9 @@
           <p id="page-subtitle">核心状态、队列水位和待处理风险。</p>
         </div>
         <div class="top-actions">
+          <button id="bell-button" type="button" class="button ghost bell-button" title="通知中心">
+            🔔<span id="bell-badge" class="bell-badge" hidden></span>
+          </button>
           <button id="copilot-open" type="button" class="button ghost">Agent</button>
           <button id="system-toggle" type="button" class="button system-toggle">暂停机器人</button>
           <button id="business-data-clear" type="button" class="button warn">清空数据</button>
@@ -110,8 +113,22 @@
           <button id="logout" type="button" class="button ghost">退出</button>
         </div>
       </header>
-      <div id="global-exception-ticker" class="global-exception-ticker" aria-live="polite" hidden></div>
       <div id="notice-trail" class="notice-trail" role="status" aria-live="polite"></div>
+
+      <!-- 🔔 通知中心抽屉 -->
+      <div id="bell-drawer" class="bell-drawer" style="display:none;">
+        <div class="bell-drawer-header">
+          <span>🔔 通知中心</span>
+          <span id="bell-drawer-close" style="cursor:pointer;font-size:18px;padding:4px 8px;border-radius:6px;">✕</span>
+        </div>
+        <div class="bell-drawer-body" id="bell-drawer-body">
+          <div class="bell-empty">加载中...</div>
+        </div>
+        <div class="bell-drawer-footer">
+          <a href="#exceptions" id="bell-view-all" style="color:var(--accent);text-decoration:none;font-size:13px;">📋 查看全部异常 →</a>
+        </div>
+      </div>
+      <div id="bell-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:99;"></div>
 
       <section class="page is-active" data-page="dashboard" data-title="Agent 概览" data-subtitle="商务待办、运维水位和关键业务状态。">
         <div id="dashboard-metrics" class="metrics dashboard-metrics"></div>
@@ -396,6 +413,163 @@
           <label>周报抄送 <input name="cc" placeholder="dingyong@jimuyida.com, jinlei@jimuyida.com" /></label>
           <button type="submit" class="button">保存周报收件人</button>
         </form>
+      </section>
+
+      <!-- 📦 订单处理（核心页面） -->
+      <section class="page" data-page="orders" data-title="📦 订单处理" data-subtitle="所有订单的统一处理入口：预审→制单→发货通知。">
+        <div id="order-metrics" class="metrics order-metrics" style="display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap;"></div>
+        <div class="order-table-head">
+          <div class="order-toolbar">
+            <input id="order-search" type="search" placeholder="搜索订单号/客户/物料..." />
+            <select id="order-status-filter">
+              <option value="">全部状态</option>
+              <option value="IMPORTED">待预审</option>
+              <option value="VALIDATING">预审中</option>
+              <option value="VALIDATION_BLOCKED">预审阻断</option>
+              <option value="VALIDATED">预审通过</option>
+              <option value="ERP_PENDING">待制单</option>
+              <option value="ERP_SAVING">制单中</option>
+              <option value="ERP_SAVED">制单完成</option>
+              <option value="ERP_FAILED">制单失败</option>
+              <option value="DELIVERY_NOTICE_READY">已发通知</option>
+            </select>
+            <select id="order-type-filter">
+              <option value="">全部类型</option>
+              <option value="SALES_ORDER">销售订单</option>
+              <option value="STOCK_REPLENISHMENT">备货订单</option>
+            </select>
+            <button id="order-refresh" type="button" class="button">刷新</button>
+          </div>
+        </div>
+        <div id="order-list" class="list order-table-body"></div>
+        <div id="order-pagination" class="pagination"></div>
+      </section>
+
+      <!-- 📋 主数据 -->
+      <section class="page" data-page="master-data" data-title="📋 主数据" data-subtitle="统一管理物料价格、别名、主体-仓库、客户-主体映射。">
+        <div class="tabs" style="margin-bottom:16px;">
+          <button class="tab is-active" data-tab="product-prices">物料价格</button>
+          <button class="tab" data-tab="entity-warehouse">主体-仓库</button>
+          <button class="tab" data-tab="material-entity">物料例外</button>
+          <button class="tab" data-tab="mail-receivers">收件人配置</button>
+          <button class="tab" data-tab="review-aliases">预审别名</button>
+          <button class="tab" data-tab="crm-business-type">CRM 业务类型</button>
+        </div>
+        <!-- 物料价格 -->
+        <div class="tab-content is-active" data-tab-content="product-prices">
+          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
+            <input id="pp-search" type="search" placeholder="搜索物料编码..." style="width: 240px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
+            <select id="pp-entity-filter" style="width: 160px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;">
+              <option value="">全部主体</option>
+              <option value="SZ">深圳</option>
+              <option value="HK">香港</option>
+              <option value="LU">卢森堡</option>
+              <option value="US">美国</option>
+            </select>
+            <button id="pp-refresh" class="button ghost">刷新</button>
+            <button id="pp-add-btn" class="button">新增价格</button>
+          </div>
+          <div id="pp-table-wrap" style="overflow-x:auto;"></div>
+          <div id="pp-pagination" class="pagination"></div>
+        </div>
+        <!-- 主体-仓库 -->
+        <div class="tab-content" data-tab-content="entity-warehouse">
+          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
+            <select id="ew-entity-filter" style="width: 160px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;">
+              <option value="">全部主体</option>
+            </select>
+            <button id="ew-add-btn" class="button">新增映射</button>
+          </div>
+          <div id="ew-table-wrap" style="overflow-x:auto;"></div>
+        </div>
+        <!-- 收件人配置 -->
+        <div class="tab-content" data-tab-content="mail-receivers">
+          <button id="mr-add-btn" class="button" style="margin-bottom:12px;">新增配置</button>
+          <div id="mr-table-wrap" style="overflow-x:auto;"></div>
+        </div>
+        <!-- 物料例外 -->
+        <div class="tab-content" data-tab-content="material-entity">
+          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
+            <button id="me-add-btn" class="button">新增例外</button>
+            <span style="font-size:12px;color:var(--muted);">特殊物料指定出货主体，覆盖仓库-主体映射</span>
+          </div>
+          <div id="me-table-wrap" style="overflow-x:auto;"></div>
+        </div>
+        <!-- 预审别名 -->
+        <div class="tab-content" data-tab-content="review-aliases">
+          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
+            <input id="ra-upload" type="file" accept=".xlsx" style="width:280px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
+            <button id="ra-preview-btn" class="button">预览导入</button>
+            <button id="ra-confirm-btn" class="button" disabled style="opacity:0.5;">确认导入</button>
+            <span id="ra-status" style="font-size:12px;color:var(--muted);"></span>
+          </div>
+          <div id="ra-preview-area" style="margin-top:6px;">
+            <div id="ra-summary" style="margin-bottom:10px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);display:none;"></div>
+            <div id="ra-table-wrap" style="overflow-x:auto;"></div>
+          </div>
+          <div style="margin-top:12px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);font-size:12px;color:var(--muted);">
+            <strong>导入说明：</strong>支持上传纷享销客导出的「产品对象新建导入模板」Excel 文件。
+            系统会自动将「产品名称」和「规格型号」作为预审别名导入到对应产品编码的成品 SPU 中，已存在的别名不会重复添加。
+          </div>
+        </div>
+
+        <!-- CRM 业务类型-主体映射 -->
+        <div class="tab-content" data-tab-content="crm-business-type">
+          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
+            <input id="cbt-search" type="search" placeholder="搜索业务类型编码/名称..." style="width: 240px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
+            <button id="cbt-refresh" class="button ghost">刷新</button>
+            <button id="cbt-add-btn" class="button">新增映射</button>
+          </div>
+          <div id="cbt-table-wrap" style="overflow-x:auto;"></div>
+        </div>
+      </section>
+
+      <!-- 📦 库存管理 -->
+      <section class="page" data-page="inventory" data-title="📦 库存管理" data-subtitle="库存查询与Excel导入。">
+        <div class="tabs" style="margin-bottom:16px;">
+          <button class="tab is-active" data-tab="inv-query">库存查询</button>
+          <button class="tab" data-tab="inv-import">Excel导入</button>
+          <button class="tab" data-tab="inv-records">导入历史</button>
+        </div>
+        <!-- 库存查询 -->
+        <div class="tab-content is-active" data-tab-content="inv-query">
+          <div class="inventory-query-toolbar">
+            <select id="inv-wh-filter">
+              <option value="">全部仓库</option>
+            </select>
+            <input id="inv-search" type="search" placeholder="搜索仓库/物料编码/品名（回车搜索）..." />
+            <label class="inventory-shortage-toggle">
+              <input id="inv-out-of-stock" type="checkbox" />
+              <span>只看缺货</span>
+            </label>
+            <button id="inv-refresh" class="button ghost">刷新</button>
+          </div>
+          <div id="inv-table-wrap" style="overflow-x:auto;"></div>
+          <div id="inv-pagination" class="pagination"></div>
+        </div>
+        <!-- Excel导入 -->
+        <div class="tab-content" data-tab-content="inv-import">
+          <div style="max-width:600px;">
+            <p style="margin-bottom:12px; color:var(--muted);">下载模板 → 填写库存数据 → 上传Excel → 预览确认</p>
+            <div style="display:flex; gap:8px; margin-bottom:16px;">
+              <a href="/api/inventory/template" id="inv-download-template" class="button ghost">📥 下载Excel模板</a>
+            </div>
+            <div style="border:2px dashed var(--line); border-radius:8px; padding:24px; text-align:center; margin-bottom:16px; cursor:pointer;" id="inv-drop-zone">
+              <p style="font-size:16px; margin-bottom:8px;">点击选择Excel文件或拖放到此处</p>
+              <input type="file" id="inv-file-input" accept=".xlsx,.xls" hidden />
+            </div>
+            <div id="inv-preview" hidden>
+              <h3 style="margin-bottom:8px;">预览确认</h3>
+              <div id="inv-preview-table" style="overflow-x:auto; margin-bottom:12px;"></div>
+              <button id="inv-confirm-import" class="button">✅ 确认导入</button>
+            </div>
+          </div>
+        </div>
+        <!-- 导入历史 -->
+        <div class="tab-content" data-tab-content="inv-records">
+          <button id="inv-refresh-records" class="button ghost" style="margin-bottom:12px;">刷新</button>
+          <div id="inv-records-table" style="overflow-x:auto;"></div>
+        </div>
       </section>
 
       <section class="page crm-orders-page" data-page="crm-orders" data-title="CRM 订单" data-subtitle="CRM 审批订单的入口页：同步、去重、预审、变更和撤销都从这里进入中台。">
@@ -1579,6 +1753,41 @@
       </section>
     </div>
 
+    <div id="crm-business-type-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="crm-business-type-title">
+        <div class="modal-head">
+          <div><small>主数据</small><h2 id="crm-business-type-title">配置 CRM 业务类型-主体映射</h2></div>
+          <button id="crm-business-type-close" type="button" class="icon-button" aria-label="关闭">×</button>
+        </div>
+        <form id="crm-business-type-form" class="form-grid compact-form">
+          <label class="wide">业务类型编码 (record_type) <input name="business_type_code" required placeholder="例如: record_hnH91__c" /></label>
+          <label class="wide">业务类型名称 <input name="business_type_name" required placeholder="例如: 深圳积木易搭订单" /></label>
+          <label class="wide">主体公司
+            <select name="entity_code" required style="width:100%; padding:6px; border:1px solid var(--line); border-radius:4px; box-sizing:border-box;">
+              <option value="SZ">深圳积木易搭科技技术有限公司 (SZ)</option>
+              <option value="SZ_WH">深圳积木易搭武汉分公司 (SZ_WH)</option>
+              <option value="WH">武汉尺子科技有限公司 (WH)</option>
+              <option value="SZ_3D">深圳积木三维科技有限公司 (SZ_3D)</option>
+              <option value="WH_RX">武汉睿数信息技术有限公司 (WH_RX)</option>
+              <option value="SZ_3D_WH">深圳积木三维武汉分公司 (SZ_3D_WH)</option>
+              <option value="HK">积木易搭（香港）有限公司 (HK)</option>
+              <option value="GZ">广州积木易搭数字科技有限公司 (GZ)</option>
+              <option value="SZ_SZ">深圳积木数智软件技术有限公司 (SZ_SZ)</option>
+              <option value="LU">积木易搭（卢森堡）有限公司 (LU)</option>
+              <option value="US">积木易搭（美国）有限公司 (US)</option>
+            </select>
+          </label>
+          <label class="wide">是否启用
+            <select name="is_active" style="width:100%; padding:6px; border:1px solid var(--line); border-radius:4px; box-sizing:border-box;">
+              <option value="true">启用</option>
+              <option value="false">禁用</option>
+            </select>
+          </label>
+          <button type="submit" class="button wide">保存</button>
+        </form>
+      </section>
+    </div>
+
     <div id="product-promotion-modal" class="modal-backdrop" hidden>
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="product-promotion-title">
         <div class="modal-head">
@@ -1633,6 +1842,12 @@
       </section>
     </div>
 
+    <div id="kingdee-preview-modal" class="modal-backdrop" hidden>
+      <section class="modal-panel kd-modal-panel" role="dialog" aria-modal="true" aria-labelledby="kingdee-preview-title">
+        <div id="kingdee-preview-body"></div>
+      </section>
+    </div>
+
     <div id="copilot-drawer" class="modal-backdrop copilot-backdrop" hidden>
       <section class="modal-panel copilot-panel" role="dialog" aria-modal="true" aria-labelledby="copilot-title">
         <div class="modal-head">
@@ -1644,6 +1859,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260616-crm-retry"></script>
+    <script src="/static/app.js?v=20260701-status-labels"></script>
   </body>
 </html>

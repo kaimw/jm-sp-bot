@@ -160,6 +160,11 @@ def ensure_runtime_schema() -> None:
                 "shop_code": "VARCHAR(128)",
                 "channel_code": "VARCHAR(128)",
                 "fulfillment_type": "VARCHAR(64)",
+                # V2 Phase 1 新增字段
+                "order_type": "VARCHAR(32)",
+                "entity_code": "VARCHAR(32)",
+                "fulfillment_entity": "VARCHAR(32)",
+                "erp_bill_no": "VARCHAR(64)",
             },
         )
     if "middle_platform_order_items" in tables:
@@ -218,6 +223,23 @@ def ensure_runtime_schema() -> None:
             },
         )
 
+    # V2 Phase 1 新表（如果尚未创建，Base.metadata.create_all 会自动创建）
+    for new_table in ("order_sequences", "entity_mappings", "customer_entity_mappings",
+                      "inter_entity_transfers", "mail_receiver_configs",
+                      "product_prices", "inventory_import_records",
+                      "inventory_snapshot_histories"):
+        if new_table not in tables:
+            import logging
+            logging.getLogger(__name__).warning("新表 %s 尚未创建，将在下次重启时自动创建", new_table)
+
+    if "product_inventory_snapshots" in tables:
+        _ensure_indexes(
+            {
+                "ix_inventory_warehouse_material": "CREATE INDEX IF NOT EXISTS ix_inventory_warehouse_material ON product_inventory_snapshots (warehouse_code, material_code)",
+                "ix_inventory_qty_warehouse_material": "CREATE INDEX IF NOT EXISTS ix_inventory_qty_warehouse_material ON product_inventory_snapshots (qty, warehouse_code, material_code)",
+            }
+        )
+
 
 def _datetime_type() -> str:
     if engine.dialect.name == "postgresql":
@@ -234,6 +256,19 @@ def _ensure_columns(table_name: str, columns: dict[str, str]) -> None:
     with engine.begin() as connection:
         for name, sql_type in missing:
             connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {sql_type}"))
+
+
+def _ensure_indexes(index_sql: dict[str, str]) -> None:
+    inspector = inspect(engine)
+    existing: set[str] = set()
+    for table_name in inspector.get_table_names():
+        existing.update(index["name"] for index in inspector.get_indexes(table_name) if index.get("name"))
+    missing = [sql for name, sql in index_sql.items() if name not in existing]
+    if not missing:
+        return
+    with engine.begin() as connection:
+        for sql in missing:
+            connection.execute(text(sql))
 
 
 @contextmanager

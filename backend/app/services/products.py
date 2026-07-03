@@ -1473,3 +1473,135 @@ def semantic_match_skus(session: Session, query: str, limit: int = 5) -> list[Pr
     except Exception as exc:
         logger.exception("LLM semantic product matching failed: %s", exc)
         return []
+
+
+def preview_alias_import_from_excel(file_path: str, session: Session) -> dict:
+    """预览 CRM 产品导入模板中的别名导入结果。
+
+    模板格式（来自纷享销客）：
+      产品名称 | 规格型号 | ... | 产品编码 | ...
+    产品编码 → ProductSPU.spu_id
+    产品名称 + 规格型号 → 预审别名
+    """
+    import openpyxl
+    from backend.app.services.jsonutil import dumps
+
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    sheet = wb["产品导入模版"] if "产品导入模版" in wb.sheetnames else wb.active
+
+    rows_iter = sheet.iter_rows(values_only=True)
+    # Skip header row and example row
+    next(rows_iter, None)  # header
+    next(rows_iter, None)  # example/description
+
+    items: list[dict] = []
+    spu_cache: dict[str, ProductSPU | None] = {}
+    matched = 0
+    skipped_no_code = 0
+    skipped_no_spu = 0
+    skipped_no_alias = 0
+
+    for row in rows_iter:
+        if not row or not any(row):
+            continue
+        product_name = str(row[0] or "").strip() if len(row) > 0 else ""
+        specification = str(row[1] or "").strip() if len(row) > 1 else ""
+        product_code = str(row[3] or "").strip() if len(row) > 3 else ""  # 产品编码
+
+        if not product_code:
+            skipped_no_code += 1
+            continue
+
+        # Generate aliases: product_name and specification are both useful as search terms
+        new_aliases_raw = []
+        if product_name:
+            new_aliases_raw.append(product_name)
+        if specification and specification != product_name:
+            new_aliases_raw.append(specification)
+
+        if not new_aliases_raw:
+            skipped_no_alias += 1
+            continue
+
+        # Look up SPU by spu_id (product code)
+        if product_code not in spu_cache:
+            spu = session.query(ProductSPU).filter(ProductSPU.spu_id == product_code).first()
+            spu_cache[product_code] = spu
+        spu = spu_cache[product_code]
+
+        if spu is None:
+            skipped_no_spu += 1
+            continue
+
+        matched += 1
+        existing_aliases = spu_review_aliases(spu)
+        all_merged = normalize_product_review_aliases(existing_aliases + new_aliases_raw)
+        new_count = len(all_merged) - len(existing_aliases)
+
+        items.append({
+            "spu_uuid": spu.id,
+            "spu_id": spu.spu_id,
+            "product_name": spu.name,
+            "existing_aliases": list(existing_aliases),
+            "new_aliases": [a for a in new_aliases_raw if a not in existing_aliases],
+            "merged_aliases": list(all_merged),
+            "new_count": new_count,
+        })
+
+    wb.close()
+
+    return {
+        "total_rows": len(items),
+        "matched": matched,
+        "skipped_no_code": skipped_no_code,
+        "skipped_no_spu": skipped_no_spu,
+        "skipped_no_alias": skipped_no_alias,
+        "items": items,
+        "summary": {
+            "spus_with_new": sum(1 for i in items if i["new_count"] > 0),
+            "total_new_aliases": sum(i["new_count"] for i in items),
+        },
+    }
+
+
+def confirm_alias_import_from_excel(preview_data: dict, session: Session) -> dict:
+    """确认导入，将预览结果写入 SPU 别名（绕过 finished inventory 限制）。"""
+    items = preview_data.get("items", [])
+    updated = 0
+    errors = 0
+    error_details: list[str] = []
+
+    for item in items:
+        spu_uuid = item.get("spu_uuid")
+        if not spu_uuid:
+            continue
+        try:
+            spu = session.get(ProductSPU, spu_uuid)
+            if spu is None:
+                errors += 1
+                error_details.append(f"{item.get('spu_id', '?')}: SPU 不存在")
+                continue
+            # Merge new aliases with existing
+            existing = item.get("existing_aliases", [])
+            new_raw = item.get("new_aliases", [])
+            merged = normalize_product_review_aliases(existing + new_raw)
+            info = loads(spu.extended_info_json, {}) if spu.extended_info_json else {}
+            if not isinstance(info, dict):
+                info = {}
+            info["review_aliases"] = merged
+            spu.extended_info_json = json.dumps(info, ensure_ascii=False)
+            spu.updated_at = now_utc()
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            error_details.append(f"{item.get('spu_id', '?')}: {exc}")
+
+    if errors:
+        # 部分失败不影响已成功的写入
+        session.flush()
+
+    return {
+        "updated": updated,
+        "errors": errors,
+        "error_details": error_details[:10],
+    }

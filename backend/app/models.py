@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -721,6 +721,14 @@ class MiddlePlatformOrder(Base):
     currency: Mapped[str | None] = mapped_column(String(16))
     order_amount: Mapped[float | None] = mapped_column(Numeric(15, 2))
     status: Mapped[str] = mapped_column(String(32), default="CRM_APPROVED", nullable=False)
+    # 订单类型：SALES_ORDER / STOCK_REPLENISHMENT
+    order_type: Mapped[str | None] = mapped_column(String(32))
+    # 下单主体编码（如 SZ / HK / LU）
+    entity_code: Mapped[str | None] = mapped_column(String(32))
+    # 实际出货主体编码（调货时可能与 entity_code 不同）
+    fulfillment_entity: Mapped[str | None] = mapped_column(String(32))
+    # 金蝶 ERP 销售单号（制单成功后金蝶生成的 FBillNo）
+    erp_bill_no: Mapped[str | None] = mapped_column(String(64))
     validation_summary_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -863,7 +871,11 @@ class ProductSKU(Base):
 
 class ProductInventorySnapshot(Base):
     __tablename__ = "product_inventory_snapshots"
-    __table_args__ = (UniqueConstraint("material_code", "warehouse_code", name="uq_inventory_material_warehouse"),)
+    __table_args__ = (
+        UniqueConstraint("material_code", "warehouse_code", name="uq_inventory_material_warehouse"),
+        Index("ix_inventory_warehouse_material", "warehouse_code", "material_code"),
+        Index("ix_inventory_qty_warehouse_material", "qty", "warehouse_code", "material_code"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     material_code: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -934,3 +946,172 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
+
+# ═══════════════════════════════════════
+# V2 Phase 1 — 新 增 模 型
+# ═══════════════════════════════════════
+
+class OrderSequence(Base):
+    """中台订单号序列表（连续不跳号，年度重置）
+    预审通过后分配，格式 MP-{年份}{序号}
+    """
+    __tablename__ = "order_sequences"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    year: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    last_seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class EntityMapping(Base):
+    """主体-仓库映射配置（管理台配置，用于库存预审 Step 1）"""
+    __tablename__ = "entity_mappings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    entity_code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    entity_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    erp_org_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    warehouses_json: Mapped[str] = mapped_column(Text, nullable=False)
+    finance_notify_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class CustomerEntityMapping(Base):
+    """客户名称-主体映射表（备货订单用，Q4 决策）
+    CRM 客户名称 → 关联主体编码 + 仓库 + ERP组织ID + 备注
+    """
+    __tablename__ = "customer_entity_mappings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    customer_name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    entity_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    warehouse: Mapped[str] = mapped_column(String(128), nullable=False)
+    remark: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class CrmBusinessTypeMapping(Base):
+    """CRM业务类型-主体映射表（管理台配置，决定推单销售组织主体）"""
+    __tablename__ = "crm_business_type_mappings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    business_type_code: Mapped[str] = mapped_column(String(128), unique=True, nullable=False) # e.g. "record_hnH91__c"
+    business_type_name: Mapped[str] = mapped_column(String(255), nullable=False) # e.g. "深圳积木易搭订单"
+    entity_code: Mapped[str] = mapped_column(String(32), nullable=False) # e.g. "SZ"
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class InterEntityTransfer(Base):
+    """跨主体调货记录
+    涉及跨主体发货时（如深圳接单、从香港海外仓出），中台记录调货信息。
+    一期只做记录+通知，二期实现自动拆单+结算。
+    """
+    __tablename__ = "inter_entity_transfers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source_entity: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_entity: Mapped[str] = mapped_column(String(32), nullable=False)
+    crm_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    order_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("middle_platform_orders.id"))
+    material_json: Mapped[str] = mapped_column(Text, nullable=False)
+    transfer_price: Mapped[float | None] = mapped_column(Numeric(15, 2))
+    status: Mapped[str] = mapped_column(String(32), default="Draft", nullable=False)
+    notified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class MailReceiverConfig(Base):
+    """发货通知邮件收件人配置（按场景配置）
+    场景：国内仓发货/海外仓发货/备货武汉/备货海外
+    """
+    __tablename__ = "mail_receiver_configs"
+    __table_args__ = (UniqueConstraint("scene", name="uq_mail_receiver_scene"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scene: Mapped[str] = mapped_column(String(64), nullable=False)
+    to_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    cc_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class ProductPrice(Base):
+    """产品内部价格表（支持按主体维度维护）
+    同一 SKU 在不同主体下财务内部报价可能不同
+    """
+    __tablename__ = "product_prices"
+    __table_args__ = (UniqueConstraint("sku_id", "entity_code", name="uq_product_price_sku_entity"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    sku_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    sku_uuid: Mapped[str | None] = mapped_column(String(36), ForeignKey("product_skus.id"))
+    entity_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    unit_price: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(16), default="CNY", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+
+class InventoryImportRecord(Base):
+    """库存导入记录 — 记录每次导入的源文件、时间、仓库、行数"""
+    __tablename__ = "inventory_import_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    warehouse: Mapped[str] = mapped_column(String(128), nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Completed", nullable=False)
+    operated_by: Mapped[str | None] = mapped_column(String(128))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class InventorySnapshotHistory(Base):
+    """库存快照历史 — 每次导入时记录每个物料的库存快照，用于追踪变化走势"""
+    __tablename__ = "inventory_snapshot_histories"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    material_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    material_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    warehouse_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    qty: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    import_record_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("inventory_import_records.id"))
+    snapshot_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class WarehouseEntityMapping(Base):
+    """仓库-主体映射表：从哪个仓发货，库存组织就填谁"""
+    __tablename__ = "warehouse_entity_mappings"
+    __table_args__ = (UniqueConstraint("warehouse", name="uq_warehouse_entity"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    warehouse: Mapped[str] = mapped_column(String(128), nullable=False)
+    entity_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class MaterialEntityException(Base):
+    """物料例外表：特殊物料指定出货主体（覆盖仓库-主体映射）"""
+    __tablename__ = "material_entity_exceptions"
+    __table_args__ = (UniqueConstraint("material_code", name="uq_material_entity_exception"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    material_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    entity_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)

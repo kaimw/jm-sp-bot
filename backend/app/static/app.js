@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const hiddenPages = new Set(["orders", "templates"]);
+const hiddenPages = new Set(["templates"]);
 let initialReviewState = { enabled: true, required_fields: [], rules: [], field_options: [], operator_options: [] };
 let v2ReviewRulesState = { rules: [] };
 let workflowRulesState = { items: [], editingVersionId: "", editingRules: null, readonly: false };
@@ -70,7 +70,29 @@ async function api(path, options = {}) {
     if (response.status === 401 && !skipAuthRedirect) {
       showLogin();
     }
-    throw new Error(error.detail || response.statusText);
+    // 后端返回的带面包屑的错误（CRM 同步/查询异常）
+    if (error.detail && typeof error.detail === "string") {
+      try {
+        const parsed = JSON.parse(error.detail);
+        if (parsed.breadcrumbs && Array.isArray(parsed.breadcrumbs)) {
+          const enriched = new Error(error.detail);
+          enriched.breadcrumbData = parsed;
+          throw enriched;
+        }
+      } catch (e) {
+        if (e.breadcrumbData) throw e;
+        // 不是 JSON 面包屑，原样抛出
+      }
+    }
+    // 无面包屑的常规错误：但将 detail 附在 error 上供 notifyError 使用
+    const msg = error.detail || response.statusText;
+    const enriched = new Error(msg);
+    enriched.statusCode = response.status;
+    if (error.detail && typeof error.detail === "object" && error.detail.detail) {
+      // 有时 FastAPI 会把 detail 再包一层
+      enriched.rawDetail = error.detail.detail;
+    }
+    throw enriched;
   }
   return response.json();
 }
@@ -105,8 +127,51 @@ function messageFromError(error) {
 
 function notifyError(error, parts = ["系统", "操作异常"]) {
   const message = messageFromError(error);
+  // 后端返回的带结构面包屑的错误
+  if (error && error.breadcrumbData) {
+    const data = error.breadcrumbData;
+    notifyErrorWithBreadcrumbs(data, parts);
+    return;
+  }
+  // 传统无面包屑的错误
   noticeTrail(parts, message, "error");
   toast(message);
+}
+
+function notifyErrorWithBreadcrumbs(data, topParts) {
+  const node = $("#notice-trail");
+  if (!node) return;
+  const crumbs = data.breadcrumbs || [];
+  const failedStep = crumbs.find((c) => c.status === "fail");
+  const resolution = data.resolution || "请检查相关配置或联系 IT 运维";
+  const item = document.createElement("div");
+  item.className = "notice-crumb is-error is-breadcrumb";
+  item.innerHTML = `
+    <div class="crumb-summary">
+      <span class="crumb-prefix">${(topParts || []).map((p) => h(p)).join(" <b>/</b> ")}</span>
+    </div>
+    <div class="crumb-chain">
+      ${crumbs
+        .map(
+          (c, i) =>
+            `<span class="crumb-step is-${c.status}">
+              ${c.status === "fail" ? "✕" : c.status === "ok" ? "✓" : "○"}
+              ${h(c.label)}
+              ${c.error ? `<span class="crumb-step-error">${h(c.error.slice(0, 100))}</span>` : ""}
+            </span>`
+        )
+        .join('<span class="crumb-arrow">→</span>')}
+    </div>
+    <div class="crumb-resolution">
+      <strong>💡 解决建议：</strong>${h(resolution)}
+    </div>
+  `;
+  node.prepend(item);
+  while (node.children.length > 4) {
+    node.lastElementChild.remove();
+  }
+  setTimeout(() => item.remove(), 15000);
+  toast(`⚠ ${failedStep ? failedStep.label + " 失败" : "操作失败"} · ${resolution.slice(0, 40)}`);
 }
 
 async function guardedAction(parts, action) {
@@ -290,6 +355,13 @@ function currentPageName() {
   return (window.location.hash || "#dashboard").slice(1) || "dashboard";
 }
 
+function initPageFeature(pageName = currentPageName()) {
+  if (!document.body.classList.contains("is-authenticated")) return;
+  if (pageName === "orders") initOrdersPage();
+  else if (pageName === "master-data") initMasterDataPage();
+  else if (pageName === "inventory") initInventoryPage();
+}
+
 function copilotContextForPage(pageName = currentPageName()) {
   const activePage = document.querySelector(".page.is-active");
   const title = activePage?.dataset?.title || $("#page-title")?.textContent || "当前页面";
@@ -399,6 +471,7 @@ function setActivePage(pageName = currentPageName()) {
   if (pageName === "products") {
     refreshProductsSku();
   }
+  initPageFeature(target.dataset.page);
 }
 
 async function refreshDashboard() {
@@ -2618,7 +2691,26 @@ function middleOrderStatusLabel(status) {
     FINANCE_EXCEPTION: "财务异常",
     CLOSED: "已关闭",
     CANCELLED: "已取消",
+    OUT_OF_SCOPE: "不在处理范围",
   }[status] || status || "未进入中台";
+}
+
+function deliveryNoticeStatusLabel(status) {
+  return {
+    Created: "已创建",
+    Previewed: "已生成预览",
+    Confirmed: "已确认",
+    Pending: "待处理",
+    Pushing: "推送中",
+    Pushed: "已推送",
+    Accepted: "已接收",
+    Failed: "失败",
+    Blocked: "阻断",
+    Stale: "已过期",
+    Cancelled: "已取消",
+    NotRequested: "未请求",
+    NotRequired: "无需处理",
+  }[status] || status || "-";
 }
 
 function flowBadgeClass(status) {
@@ -2892,6 +2984,7 @@ async function openCrmOrderDetail(orderId) {
     $("#crm-order-detail-products").innerHTML = renderCrmOrderProducts(row.order_items, row.currency);
     $("#crm-order-detail-raw").textContent = JSON.stringify(row.raw || row, null, 2);
   } catch (error) {
+    notifyError(error, ["CRM 订单", "读取订单详情失败"]);
     $("#crm-order-detail-meta").textContent = "CRM 销售订单 · 读取失败";
     $("#crm-order-detail-summary").innerHTML = `<div class="empty-note">读取失败：${h(error.message || "未知错误")}</div>`;
     currentCrmOrderDetailFlow = null;
@@ -3424,11 +3517,17 @@ function crmContactConfidenceHtml(row = {}) {
 }
 
 async function refreshCrmOrders() {
-  const [listPayload, summary, v2Summary] = await Promise.all([
-    api(`/api/crm/orders?${queryFromState(tableStates.crmOrders)}`),
-    api("/api/crm/sync/summary"),
-    api("/api/v2/order-dashboard"),
-  ]);
+  let listPayload, summary, v2Summary;
+  try {
+    [listPayload, summary, v2Summary] = await Promise.all([
+      api(`/api/crm/orders?${queryFromState(tableStates.crmOrders)}`),
+      api("/api/crm/sync/summary"),
+      api("/api/v2/order-dashboard"),
+    ]);
+  } catch (error) {
+    notifyError(error, ["CRM 订单", "列表刷新失败"]);
+    return;
+  }
   const data = normalizeListPayload(listPayload, tableStates.crmOrders);
   renderCrmOrderSummary(data.summary || summary || {}, v2Summary || {});
   renderCrmSyncRuns((summary && summary.runs) || []);
@@ -4323,7 +4422,7 @@ $("#oms-config-form")?.addEventListener("submit", async (event) => {
   }
 });
 
-async function runCrmSyncAction(endpoint, pendingText) {
+async function runCrmSyncAction(endpoint, pendingText, crumbParts) {
   const resultNode = $("#crm-sync-result");
   if (resultNode) {
     resultNode.classList.add("show");
@@ -4340,21 +4439,21 @@ async function runCrmSyncAction(endpoint, pendingText) {
     toast(result.message || "CRM 同步已触发");
     await refreshCrmOrders();
   } catch (error) {
-    notifyError(error, ["系统接入", "CRM 同步失败"]);
+    notifyError(error, crumbParts || ["系统接入", "CRM 同步失败"]);
     if (resultNode) resultNode.textContent = messageFromError(error);
   }
 }
 
 $("#crm-sync-queue")?.addEventListener("click", async () => {
-  await runCrmSyncAction("/api/crm/sync/queue", "正在投递 CRM 订单同步任务...");
+  await runCrmSyncAction("/api/crm/sync/queue", "正在投递 CRM 订单同步任务...", ["系统接入", "CRM 同步投递"]);
 });
 
 $("#crm-sync-run")?.addEventListener("click", async () => {
-  await runCrmSyncAction("/api/crm/sync/run", "正在直接同步 CRM 订单，可能需要几十秒...");
+  await runCrmSyncAction("/api/crm/sync/run", "正在直接同步 CRM 订单，可能需要几十秒...", ["系统接入", "CRM 同步执行"]);
 });
 
 $("#crm-sync-test")?.addEventListener("click", async () => {
-  await runCrmSyncAction("/api/crm/sync/test-connection", "正在执行 CRM 接入测试，验证列表、详情、附件和发货字段映射...");
+  await runCrmSyncAction("/api/crm/sync/test-connection", "正在执行 CRM 接入测试，验证列表、详情、附件和发货字段映射...", ["系统接入", "CRM 连接测试"]);
 });
 
 $("#test-oms-connection")?.addEventListener("click", async (event) => {
@@ -5780,7 +5879,7 @@ async function refreshProductsInventory() {
       // Restore selected value if set in state
       selectNode.value = tableStates.productsInventory.warehouse_code || "";
     } catch (e) {
-      console.error("Failed to load warehouses list:", e);
+      notifyError(e, ["物料中心", "加载仓库列表失败"]);
     }
   }
 
@@ -6705,6 +6804,7 @@ setActivePage();
 ensureAuthenticated()
   .then((authenticated) => {
     if (authenticated) {
+      setActivePage();
       return refreshAll();
     }
     return null;
@@ -6713,3 +6813,1349 @@ ensureAuthenticated()
     showLogin();
     toast(error.message || "请先登录");
   });
+
+// ═══════════════════════════════════════
+// V2 Phase 1 — 前端新功能
+// ═══════════════════════════════════════
+
+// —— 页面切换时初始化 ——
+document.addEventListener('click', function(e) {
+  var link = e.target.closest('[data-page-link]');
+  if (!link) return;
+  var page = link.dataset.pageLink;
+  setTimeout(function() {
+    if (page === 'orders') initOrdersPage();
+    else if (page === 'master-data') initMasterDataPage();
+    else if (page === 'inventory') initInventoryPage();
+  }, 200);
+});
+
+// —— Tab 切换 ——
+function initTabs(container) {
+  container.querySelectorAll('.tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      container.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('is-active'); });
+      container.querySelectorAll('.tab-content').forEach(function(tc) { tc.classList.remove('is-active'); });
+      this.classList.add('is-active');
+      var target = document.querySelector('[data-tab-content="' + this.dataset.tab + '"]');
+      if (target) target.classList.add('is-active');
+    });
+  });
+}
+
+// —— API ——
+async function apiPost(path, data) {
+  return api(path, { method: 'POST', body: JSON.stringify(data), headers: {'Content-Type':'application/json'} });
+}
+
+// —— 通知中心 🔔 ——
+function refreshBellBadge() {
+  api('/api/global-exception-ticker').then(function(data) {
+    var count = (data && data.exceptions ? data.exceptions.length : 0);
+    var badge = document.getElementById('bell-badge');
+    var body = document.getElementById('bell-drawer-body');
+    if (!badge || !body) return;
+    if (count > 0) {
+      badge.textContent = count > 99 ? '99+' : count;
+      badge.style.display = 'inline';
+      var html = '';
+      data.exceptions.forEach(function(ex) {
+        var lc = (ex.severity === 'Critical' || ex.severity === 'High') ? 'critical' : 'high';
+        html += '<div class="bell-item" data-id="' + ex.id + '">' +
+          '<div class="bell-item-header"><span class="bell-item-type">⚠️ ' + (ex.exception_type || '异常') + '</span><span class="bell-item-level ' + lc + '">' + (ex.severity || 'High') + '</span></div>' +
+          '<div class="bell-item-order">' + (ex.related_order_no || '') + '</div>' +
+          '<div class="bell-item-desc">' + (ex.summary || ex.reason || '').slice(0, 80) + '</div>' +
+          '<div class="bell-item-time">' + (ex.created_at || '').slice(0, 16) + '</div></div>';
+      });
+      body.innerHTML = html;
+    } else {
+      badge.style.display = 'none';
+      body.innerHTML = '<div class="bell-empty">暂无待处理异常</div>';
+    }
+  }).catch(function() {});
+}
+
+function openBell() {
+  var d = document.getElementById('bell-drawer');
+  var o = document.getElementById('bell-overlay');
+  if (d) d.style.display = 'flex';
+  if (o) o.style.display = 'block';
+  refreshBellBadge();
+}
+function closeBell() {
+  var d = document.getElementById('bell-drawer');
+  var o = document.getElementById('bell-overlay');
+  if (d) d.style.display = 'none';
+  if (o) o.style.display = 'none';
+}
+
+(function() {
+  var btn = document.getElementById('bell-button');
+  if (btn) btn.addEventListener('click', function() {
+    var d = document.getElementById('bell-drawer');
+    if (!d || d.style.display === 'none') openBell(); else closeBell();
+  });
+  var c = document.getElementById('bell-drawer-close');
+  if (c) c.addEventListener('click', closeBell);
+  var va = document.getElementById('bell-view-all');
+  if (va) va.addEventListener('click', function() { closeBell(); });
+  var ov = document.getElementById('bell-overlay');
+  if (ov) ov.addEventListener('click', closeBell);
+  setInterval(refreshBellBadge, 30000);
+  refreshBellBadge();
+})();
+
+// —— 订单处理页面 ——
+var _ordersInited = false;
+function initOrdersPage() {
+  if (_ordersInited) return;
+  _ordersInited = true;
+  loadOrders();
+  var btn = document.getElementById('order-refresh');
+  if (btn) btn.addEventListener('click', loadOrders);
+  var search = document.getElementById('order-search');
+  if (search) search.addEventListener('keydown', function(e) { if (e.key === 'Enter') loadOrders(); });
+  ['order-status-filter', 'order-type-filter'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('change', loadOrders);
+  });
+}
+
+function orderDetailValue(value) {
+  return h(value === undefined || value === null || value === "" ? "-" : value);
+}
+
+function orderDetailRow(label, value) {
+  return '<div class="order-detail-row"><span class="order-detail-label">' + h(label) + '</span><span class="order-detail-value">' + orderDetailValue(value) + '</span></div>';
+}
+
+function orderTypeLabel(type) {
+  if (type === 'STOCK_REPLENISHMENT') return '备货';
+  if (type === 'SALES_ORDER') return '销售';
+  return type || '-';
+}
+
+function firstPresent() {
+  for (var i = 0; i < arguments.length; i += 1) {
+    if (arguments[i] !== undefined && arguments[i] !== null && String(arguments[i]).trim() !== '') return arguments[i];
+  }
+  return '';
+}
+
+function renderOrderBasicCard(detail) {
+  return '<section class="order-detail-card">' +
+    '<h3>基本信息</h3>' +
+    '<div class="order-detail-grid">' +
+    orderDetailRow('中台单号', detail.order_no) +
+    orderDetailRow('CRM单号', detail.crm_order_no || detail.crm_order_id) +
+    orderDetailRow('客户', detail.customer_name) +
+    orderDetailRow('销售', detail.sales_user_name) +
+    orderDetailRow('类型', orderTypeLabel(detail.order_type)) +
+    orderDetailRow('状态', middleOrderStatusLabel(detail.status)) +
+    orderDetailRow('下单主体', detail.entity_code) +
+    orderDetailRow('出货主体', detail.fulfillment_entity || detail.entity_code) +
+    orderDetailRow('渠道', detail.channel_code) +
+    orderDetailRow('店铺', detail.shop_code) +
+    orderDetailRow('金额', detail.order_amount ? detail.order_amount + (detail.currency ? ' ' + detail.currency : '') : '') +
+    orderDetailRow('金蝶单号', detail.erp_bill_no) +
+    '</div>' +
+    '</section>';
+}
+
+function parseRuleValues(code, reason, skuNamesMap) {
+  var current = '校验未通过';
+  var expected = '符合规则定义';
+  skuNamesMap = skuNamesMap || {};
+
+  if (code === "REQUIRED_HEAD_FIELDS") {
+    current = '必填头部字段缺失';
+    expected = '基础头部字段完整';
+  } else if (code === "PHASE1_COMPLETE_PRE_REVIEW_FIELDS") {
+    current = '三要素或结算方式等必填项缺失';
+    expected = '一期必备信息完整';
+  } else if (code === "CUSTOMER_MAPPING") {
+    current = '未映射到 OMS 客户主数据';
+    expected = '客户主数据已匹配';
+  } else if (code === "POSITIVE_ORDER_AMOUNT") {
+    current = '金额为 0 或为空';
+    expected = '订单金额大于 0';
+  } else if (code === "AMOUNT_CONSISTENCY") {
+    current = '财务金额核算不一致';
+    expected = '金额勾稽关系一致';
+  } else if (code === "HAS_ORDER_ITEMS") {
+    current = '商品明细为空';
+    expected = '包含有效明细行';
+  } else if (code === "KNOWN_ACTIVE_SKU") {
+    current = '未在主数据启用/不存在';
+    expected = 'SKU 存在且已启用';
+  } else if (code === "RULE_SKU_BOM_MATCH") {
+    current = 'CRM 商品无法匹配标准 SKU/BOM';
+    expected = '匹配标准 SKU/BOM';
+  } else if (code === "RULE_CONTRACT_AMOUNT_CONSISTENCY") {
+    current = '合同解析金额不符';
+    expected = '合同金额与订单一致';
+  } else if (code === "ATTACHMENT_PRODUCT_CONSISTENCY") {
+    current = '附件商品解析匹配失败';
+    expected = '附件商品与订单一致';
+  } else if (code === "LOCAL_INVENTORY_AVAILABLE") {
+    current = '库存不足或无快照';
+    expected = '本地库存可用';
+  } else if (code === "INVENTORY_THREE_STEP") {
+    current = '所有仓库均缺货';
+    expected = '本地仓或海外仓有可用库存';
+  } else if (code === "CONTRACT_APPROVAL") {
+    current = '合同状态未审批';
+    expected = '合同状态为已审批';
+  }
+
+  if (reason) {
+    if (code === "KNOWN_ACTIVE_SKU") {
+      var match = reason.match(/SKU 未在主数据启用：(.*)/) || reason.match(/匹配标准 SKU，需人工确认：(.*)/);
+      if (match) {
+        var rawSku = match[1].trim();
+        var name = skuNamesMap[rawSku] || rawSku;
+        current = '商品【' + name + '】未在主数据启用/不存在';
+      }
+    } else if (code === "LOCAL_INVENTORY_AVAILABLE") {
+      var match = reason.match(/未找到库存快照：(.*)/);
+      if (match) {
+        var rawSku = match[1].trim();
+        var name = skuNamesMap[rawSku] || rawSku;
+        current = '商品【' + name + '】无库存快照';
+      } else if (reason.includes("库存可用量不足")) {
+        current = '库存量不足';
+      }
+    } else if (code === "INVENTORY_THREE_STEP") {
+      if (reason.includes("均缺货")) {
+        current = '各发货仓均处于缺货状态';
+      }
+    } else if (code === "CONTRACT_APPROVAL") {
+      var match = reason.match(/合同审批状态为 \[(.*?)\]/);
+      if (match) {
+        current = '合同审批状态为 ' + match[1];
+      }
+    } else if (code === "POSITIVE_ORDER_AMOUNT") {
+      if (reason.includes("必须大于 0")) {
+        current = '订单金额 <= 0';
+      }
+    } else if (code === "ATTACHMENT_PRODUCT_CONSISTENCY") {
+      var match = reason.match(/不一致：(.*)/);
+      if (match) {
+        current = match[1];
+      }
+    } else if (code === "AMOUNT_CONSISTENCY") {
+      current = reason;
+    }
+  }
+
+  return {
+    current: current,
+    expected: expected
+  };
+}
+
+function formatCellLines(text) {
+  if (!text) return '';
+  var lines = text.split('；');
+  return lines.map(function(line, idx) {
+    if (!line.trim()) return '';
+    var suffix = idx < lines.length - 1 ? '；' : '';
+    return '<div style="margin-bottom: 6px; line-height: 1.5; font-size: 12px; word-break: break-all;">' + h(line.trim() + suffix) + '</div>';
+  }).join('');
+}
+
+function renderValidationSummaryTable(failedRules, skuNamesMap) {
+  if (!failedRules || !failedRules.length) return '';
+
+  var RULE_NAMES_ZH = {
+    "REQUIRED_HEAD_FIELDS": "订单头基础字段",
+    "PHASE1_COMPLETE_PRE_REVIEW_FIELDS": "一期完整性预审",
+    "CUSTOMER_MAPPING": "客户主数据映射",
+    "POSITIVE_ORDER_AMOUNT": "订单金额有效性",
+    "AMOUNT_CONSISTENCY": "金额一致性",
+    "HAS_ORDER_ITEMS": "订单商品明细",
+    "KNOWN_ACTIVE_SKU": "SKU 主数据启用",
+    "RULE_SKU_BOM_MATCH": "SKU/BOM 匹配",
+    "RULE_CONTRACT_AMOUNT_CONSISTENCY": "合同金额一致性",
+    "ATTACHMENT_PRODUCT_CONSISTENCY": "附件商品一致性",
+    "LOCAL_INVENTORY_AVAILABLE": "本地库存可用量",
+    "INVENTORY_THREE_STEP": "库存三步判断",
+    "CONTRACT_APPROVAL": "商务审核前置条件"
+  };
+
+  var html = '<div class="validation-summary-table-wrap" style="grid-column: 1 / -1; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px;">' +
+    '<h4 style="font-size: 13px; font-weight: bold; margin-bottom: 8px; color: #ef4444;">❌ 预审未通过细则 (' + failedRules.length + ' 项)</h4>' +
+    '<table class="data-table" style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; background: #ffffff;">' +
+    '<thead>' +
+      '<tr style="background: var(--surface-soft); color: var(--ink); border-bottom: 1px solid var(--line);">' +
+        '<th style="padding: 8px 10px; font-weight: bold; width: 25%;">未通过规则</th>' +
+        '<th style="padding: 8px 10px; font-weight: bold; width: 50%;">现值</th>' +
+        '<th style="padding: 8px 10px; font-weight: bold; width: 25%;">预期值</th>' +
+      '</tr>' +
+    '</thead>' +
+    '<tbody>';
+
+  failedRules.forEach(function(rule) {
+    var code = rule.rule_code || 'UNKNOWN';
+    var ruleName = RULE_NAMES_ZH[code] || code;
+    var reason = rule.reason || rule.message || '校验未通过';
+    var parsed = parseRuleValues(code, reason, skuNamesMap);
+    
+    html += '<tr style="border-bottom: 1px solid var(--line);">' +
+      '<td style="padding: 10px; color: var(--accent); font-weight: bold; vertical-align: top; line-height: 1.5;">' + h(ruleName) + '</td>' +
+      '<td style="padding: 10px; color: #ef4444; vertical-align: top;">' + formatCellLines(parsed.current) + '</td>' +
+      '<td style="padding: 10px; color: #10b981; font-weight: bold; vertical-align: top; line-height: 1.5;">' + h(parsed.expected) + '</td>' +
+    '</tr>';
+  });
+
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderOrderFlowCard(detail) {
+  var flow = detail.flow || {};
+  var notices = detail.delivery_notices || [];
+  var latestNotice = notices[0] || {};
+  var validation = flow.validation_summary || detail.validation_summary || {};
+  var failedRules = (validation.results || []).filter(function(rule) { return rule && rule.passed === false; });
+  var validationText = validation.summary || validation.message || validation.reason || '';
+
+  var skuNamesMap = {};
+  (detail.items || []).forEach(function(item) {
+    if (item.sku_code && item.product_name) {
+      skuNamesMap[String(item.sku_code).trim()] = item.product_name;
+    }
+  });
+
+  return '<section class="order-detail-card">' +
+    '<h3>流程信息</h3>' +
+    '<div class="order-detail-grid">' +
+    orderDetailRow('来源策略', flow.source_policy || detail.source_policy) +
+    orderDetailRow('当前状态', middleOrderStatusLabel(flow.status || detail.status)) +
+    orderDetailRow('导入时间', formatTime(flow.imported_at || detail.created_at)) +
+    orderDetailRow('预审时间', formatTime(flow.validated_at)) +
+    orderDetailRow('更新时间', formatTime(flow.updated_at || detail.updated_at)) +
+    orderDetailRow('流程版本', flow.version || detail.version) +
+    orderDetailRow('发货预览单', latestNotice.notice_no) +
+    orderDetailRow('预览状态', deliveryNoticeStatusLabel(latestNotice.status)) +
+    orderDetailRow('OMS单号', latestNotice.oms_order_no) +
+    orderDetailRow('运单号', latestNotice.waybill_no || latestNotice.platform_fulfillment_synced_waybill_no) +
+    orderDetailRow('确认人', latestNotice.confirmed_by) +
+    orderDetailRow('推送时间', formatTime(latestNotice.pushed_at)) +
+    (validationText && !failedRules.length ? orderDetailRow('预审摘要', validationText) : '') +
+    (failedRules.length ? renderValidationSummaryTable(failedRules, skuNamesMap) : '') +
+    '</div>' +
+    '</section>';
+}
+
+function renderProductLogisticsCards(detail) {
+  var items = detail.items || [];
+  var receipt = detail.receipt || {};
+  var notices = detail.delivery_notices || [];
+  var latestNotice = notices[0] || {};
+  var groups = ((latestNotice.split_preview || {}).groups || []);
+  if (!items.length) {
+    return '<section class="order-detail-card"><h3>产品-物流（邮寄信息）</h3><div class="empty-note">暂无产品明细</div></section>';
+  }
+  var cards = items.map(function(item, index) {
+    var itemLogistics = item.logistics || {};
+    var group = groups.find(function(g) {
+      return (g.items || []).some(function(groupItem) {
+        return groupItem.sku_code && item.sku_code && String(groupItem.sku_code) === String(item.sku_code);
+      });
+    }) || groups[0] || {};
+    return '<div class="order-product-logistics-card">' +
+      '<div class="order-product-title"><strong>' + orderDetailValue(item.product_name || item.sku_code || ('产品 ' + (index + 1))) + '</strong><small>' + orderDetailValue(item.sku_code) + '</small></div>' +
+      '<div class="order-detail-grid">' +
+      orderDetailRow('数量', item.quantity) +
+      orderDetailRow('平台SKU', item.shop_sku_code) +
+      orderDetailRow('仓库', firstPresent(itemLogistics.warehouse_code, group.warehouse_name, group.warehouse_code, latestNotice.warehouse_code)) +
+      orderDetailRow('物流方式', firstPresent(itemLogistics.shipping_method, latestNotice.logistic_code, detail.fulfillment_type)) +
+      orderDetailRow('收货人', firstPresent(itemLogistics.contact, receipt.contact)) +
+      orderDetailRow('联系电话', firstPresent(itemLogistics.phone, receipt.phone)) +
+      orderDetailRow('期望交期', firstPresent(itemLogistics.delivery_date, receipt.delivery_date)) +
+      orderDetailRow('邮寄地址', firstPresent(itemLogistics.address, receipt.address)) +
+      '</div>' +
+      '</div>';
+  }).join('');
+  return '<section class="order-detail-card"><h3>产品-物流（邮寄信息）</h3><div class="order-product-logistics-list">' + cards + '</div></section>';
+}
+
+function renderOrderDetailDrawer(detail) {
+  return '<div class="order-detail-header"><span>📋 ' + orderDetailValue(detail.order_no) + '</span><button class="button ghost" onclick="this.parentElement.parentElement.remove();this.closest(\'.drawer-overlay\')&&this.closest(\'.drawer-overlay\').remove()">✕</button></div>' +
+    '<div class="order-detail-body">' +
+    renderOrderBasicCard(detail) +
+    renderOrderFlowCard(detail) +
+    renderProductLogisticsCards(detail) +
+    '</div>';
+}
+
+function loadOrders() {
+  var q = (document.getElementById('order-search') || {}).value || '';
+  var status = (document.getElementById('order-status-filter') || {}).value || '';
+  var type = (document.getElementById('order-type-filter') || {}).value || '';
+  api('/api/v2/order-dashboard').then(function(dash) {
+    if (dash && dash.status_counts) {
+      var metrics = document.getElementById('order-metrics');
+      if (metrics) {
+        var html = '';
+        Object.keys(dash.status_counts).forEach(function(k) {
+          html += '<div class="metrics-card"><div class="num">' + dash.status_counts[k] + '</div><div class="label">' + middleOrderStatusLabel(k) + '</div></div>';
+        });
+        metrics.innerHTML = html;
+      }
+    }
+  }).catch(function(err) {
+    notifyError(err, ["订单处理", "加载仪表盘失败"]);
+  });
+  var url = '/api/v2/orders?page=1&page_size=50&q=' + encodeURIComponent(q) + '&status=' + encodeURIComponent(status);
+  api(url).then(function(data) {
+    var orders = data.items || data.orders || [];
+    var list = document.getElementById('order-list');
+    if (!list) return;
+    if (!orders.length) {
+      list.innerHTML = '<div style="text-align:center;padding:48px;color:var(--muted);">暂无匹配订单</div>';
+      return;
+    }
+    var html = '<table class="data-table"><thead><tr><th>单号</th><th>客户</th><th>类型</th><th>状态</th><th>主体</th><th>操作</th></tr></thead><tbody>';
+    orders.forEach(function(o) {
+      var sc = 'pending';
+      var outOfScope = o.status === 'OUT_OF_SCOPE';
+      if (o.status === 'ERP_SAVED' || o.status === 'DELIVERY_NOTICE_READY') sc = 'success';
+      else if (o.status === 'ERP_FAILED' || o.status === 'VALIDATION_BLOCKED') sc = 'failed';
+      else if (o.status === 'ERP_SAVING' || o.status === 'ERP_PENDING') sc = 'running';
+      if (outOfScope) sc = 'muted';
+      html += '<tr' + (outOfScope ? ' class="order-row-out-of-scope"' : '') + '><td>' + (o.order_no || '').slice(-12) + '</td><td>' + (o.customer_name || '').slice(0, 16) + '</td>' +
+        '<td>' + (o.order_type === 'STOCK_REPLENISHMENT' ? '备货' : '销售') + '</td>' +
+        '<td><span class="status-tag ' + sc + '">' + h(middleOrderStatusLabel(o.status)) + '</span></td>' +
+        '<td>' + (o.entity_code || '') + '</td>' +
+        '<td>' + (outOfScope ? '<span class="muted-action">—</span>' : 
+          '<a href="#" class="order-view" data-id="' + (o.id || '') + '">详情</a> | ' +
+          '<a href="#" class="order-kingdee-preview" data-id="' + (o.id || '') + '">金蝶预览</a>'
+        ) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    list.innerHTML = html;
+    list.querySelectorAll('.order-view').forEach(function(a) {
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        var id = this.dataset.id;
+        if (!id) return;
+        api('/api/v2/orders/' + id).then(function(detail) {
+          if (!detail) return;
+          var d = document.createElement('div');
+          d.className = 'order-detail-drawer';
+          d.innerHTML = renderOrderDetailDrawer(detail);
+          document.body.appendChild(d);
+          var ov = document.createElement('div');
+          ov.className = 'drawer-overlay';
+          ov.addEventListener('click', function() { d.remove(); ov.remove(); });
+          document.body.appendChild(ov);
+        }).catch(function(err) { notifyError(err, ["订单处理", "加载订单详情失败"]); });
+      });
+    });
+    list.querySelectorAll('.order-kingdee-preview').forEach(function(a) {
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        var id = this.dataset.id;
+        if (!id) return;
+        api('/api/v2/orders/' + id).then(function(detail) {
+          if (!detail) return;
+          openKingdeePreviewModal(detail);
+        }).catch(function(err) { notifyError(err, ["订单处理", "加载金蝶预览失败"]); });
+      });
+    });
+  }).catch(function(e) { notifyError(e, ["订单处理", "加载订单列表失败"]); });
+}
+
+function getEntityName(code) {
+  var names = {
+    'SZ': '深圳积木易搭科技技术有限公司',
+    'SZ_WH': '深圳积木易搭武汉分公司',
+    'WH': '武汉尺子科技有限公司',
+    'SZ_3D': '深圳积木三维科技有限公司',
+    'WH_RX': '武汉睿数信息技术有限公司',
+    'SZ_3D_WH': '深圳积木三维武汉分公司',
+    'HK': '积木易搭（香港）有限公司',
+    'GZ': '广州积木易搭数字科技有限公司',
+    'SZ_SZ': '深圳积木数智软件技术有限公司',
+    'LU': '积木易搭（卢森堡）有限公司',
+    'US': '积木易搭（美国）有限公司'
+  };
+  return names[code] || code;
+}
+
+function openKingdeePreviewModal(detail) {
+  var validation = detail.flow?.validation_summary || detail.validation_summary || {};
+  var failedRules = (validation.results || []).filter(function(r) { return r && r.passed === false; });
+  var failedCodes = failedRules.map(function(r) { return r.rule_code; });
+
+  var erpBillNo = detail.erp_bill_no;
+  var isBillNoErr = !erpBillNo; 
+  var billNoHtml = isBillNoErr 
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>' 
+    : h(erpBillNo);
+
+  var customerName = detail.customer_name;
+  var isCustErr = failedCodes.indexOf("CUSTOMER_MAPPING") !== -1 || !customerName;
+  var customerHtml = isCustErr
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+    : h(customerName);
+
+  var orgId = detail.fulfillment_entity || detail.entity_code || '';
+  var isOrgErr = failedCodes.indexOf("REQUIRED_HEAD_FIELDS") !== -1 && !orgId;
+  var orgName = getEntityName(orgId);
+  
+  var orgHtml = isOrgErr || !orgName
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+    : h(orgName);
+
+  var orderDate = detail.created_at ? formatTime(detail.created_at).split(' ')[0] : '';
+  var dateHtml = orderDate ? h(orderDate) : h(new Date().toISOString().split('T')[0].replace(/-/g, '/'));
+
+  var currency = detail.currency || '人民币';
+  var currencyHtml = h(currency);
+
+  var deptName = detail.dept_name || '国内营销中心教育事业部';
+  var salesperson = detail.sales_user_name || '杜红刚';
+
+  var orderNo = detail.order_no;
+  var orderNoHtml = h(orderNo);
+
+  var billStatus = (detail.status === 'ERP_SAVED' || detail.status === 'DELIVERY_NOTICE_READY') ? '已审核' : '暂存';
+
+  var receipt = detail.receipt || {};
+  var isReceiptErr = failedCodes.indexOf("PHASE1_COMPLETE_PRE_REVIEW_FIELDS") !== -1;
+  var contactHtml = (isReceiptErr && !receipt.contact) 
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>' 
+    : h(receipt.contact || '-');
+  var phoneHtml = (isReceiptErr && !receipt.phone) 
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>' 
+    : h(receipt.phone || '-');
+  var addressHtml = (isReceiptErr && !receipt.address) 
+    ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>' 
+    : h(receipt.address || '-');
+
+  var itemsHtml = '';
+  var items = detail.items || [];
+  items.forEach(function(item, idx) {
+    var isSkuErr = failedCodes.indexOf("KNOWN_ACTIVE_SKU") !== -1 && (!item.sku_code || item.sku_code.length > 20);
+    var itemRulesFailed = failedRules.filter(function(r) {
+      return (r.rule_code === "KNOWN_ACTIVE_SKU" || r.rule_code === "LOCAL_INVENTORY_AVAILABLE") && 
+             (r.reason || '').indexOf(item.sku_code) !== -1;
+    });
+    
+    var isItemSkuErr = isSkuErr || itemRulesFailed.some(function(r) { return r.rule_code === "KNOWN_ACTIVE_SKU"; });
+
+    var skuHtml = isItemSkuErr
+      ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+      : h(item.sku_code);
+
+    var nameHtml = item.official_product_name 
+      ? h(item.official_product_name) 
+      : '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>';
+    var modelHtml = h(item.product_model || item.model_name || '-');
+    var qty = Number(item.quantity || 0);
+    var qtyHtml = h(qty);
+
+    var price = Number(item.price || 0);
+    var isPriceErr = failedCodes.indexOf("POSITIVE_ORDER_AMOUNT") !== -1 && price <= 0;
+    var priceHtml = isPriceErr
+      ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+      : (price ? '¥' + price.toFixed(2) : '-');
+
+    var isGift = price <= 0;
+    var taxRate = 13.00;
+    var totalAmount = qty * price;
+    var netAmount = totalAmount / 1.13;
+    var taxAmount = totalAmount - netAmount;
+
+    var totalHtml = isPriceErr
+      ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+      : '¥' + totalAmount.toFixed(2);
+
+    var netHtml = isPriceErr
+      ? '-'
+      : '¥' + netAmount.toFixed(2);
+
+    var taxAmountHtml = isPriceErr
+      ? '-'
+      : '¥' + taxAmount.toFixed(2);
+
+    itemsHtml += '<tr>' +
+      '<td>' + (idx + 1) + '</td>' +
+      '<td>标准产品</td>' +
+      '<td class="' + (isItemSkuErr ? 'error' : '') + '">' + skuHtml + '</td>' +
+      '<td>' + nameHtml + '</td>' +
+      '<td>' + modelHtml + '</td>' +
+      '<td>' + qtyHtml + '</td>' +
+      '<td>台</td>' +
+      '<td class="' + (isPriceErr ? 'error' : '') + '">' + priceHtml + '</td>' +
+      '<td class="' + (isPriceErr ? 'error' : '') + '">' + priceHtml + '</td>' +
+      '<td style="text-align:center;"><input type="checkbox" class="kd-checkbox" disabled ' + (isGift ? 'checked' : '') + ' /></td>' +
+      '<td>' + taxRate.toFixed(2) + '</td>' +
+      '<td>' + taxAmountHtml + '</td>' +
+      '<td>' + netHtml + '</td>' +
+      '<td class="' + (isPriceErr ? 'error' : '') + '">' + totalHtml + '</td>' +
+    '</tr>';
+  });
+
+  var body = document.getElementById('kingdee-preview-body');
+  if (!body) return;
+
+  function kdField(label, valueHtml, isRequired, isDropdown, isDate, extraStyle, isError) {
+    var asterisk = isRequired ? '<span class="kd-field-required-marker">*</span>' : '';
+    var icon = isDropdown ? '<span class="kd-field-icon">▼</span>' : (isDate ? '<span class="kd-field-icon">📅</span>' : '');
+    var errorClass = isError ? ' error' : '';
+    var notesClass = label === '备注' ? ' notes-field' : '';
+    return '<div class="kd-field-row" style="' + (extraStyle || '') + '">' +
+      '<span class="kd-field-label">' + h(label) + '</span>' +
+      '<div class="kd-field-input-wrap">' +
+        '<div class="kd-input-field' + errorClass + notesClass + '">' + valueHtml + '</div>' +
+        icon +
+        asterisk +
+      '</div>' +
+    '</div>';
+  }
+
+  body.innerHTML = 
+    // Deep Blue Header Bar
+    '<div class="kd-header-bar">' +
+      '<div class="kd-logo-area">' +
+        '<span class="kd-logo-icon">K</span>' +
+        '<span class="kd-logo-text">金蝶云 星空</span>' +
+        '<span class="kd-company-name">深圳积木易搭科技有限公司-2... | 100 深圳积木易搭科技有限公司</span>' +
+      '</div>' +
+      '<div class="kd-header-right">' +
+        '<span class="kd-header-menu-item">帮助</span>' +
+        '<span class="kd-header-menu-item">关于</span>' +
+        '<span class="kd-header-menu-item">👤 刘伟燕</span>' +
+        '<button type="button" id="kd-preview-close" style="font-size: 16px; font-weight: bold;">✕</button>' +
+      '</div>' +
+    '</div>' +
+    // System Tabs
+    '<div class="kd-sys-tabs">' +
+      '<div class="kd-sys-tab">销售订单列表</div>' +
+      '<div class="kd-sys-tab active">销售订单 - 修改 ✕</div>' +
+    '</div>' +
+    // Button Toolbar
+    '<div class="kd-toolbar">' +
+      '<div class="kd-toolbar-buttons">' +
+        '<button class="kd-toolbar-btn primary">新增 ▼</button>' +
+        '<button class="kd-toolbar-btn">保存</button>' +
+        '<button class="kd-toolbar-btn">提交 ▼</button>' +
+        '<button class="kd-toolbar-btn">审核 ▼</button>' +
+        '<button class="kd-toolbar-btn">选单 ▼</button>' +
+        '<button class="kd-toolbar-btn">下推 ▼</button>' +
+        '<button class="kd-toolbar-btn">关联查询 ▼</button>' +
+        '<button class="kd-toolbar-btn">业务操作 ▼</button>' +
+        '<button class="kd-toolbar-btn">业务查询 ▼</button>' +
+        '<button class="kd-toolbar-btn">报价评估</button>' +
+        '<button class="kd-toolbar-btn">前一 ▼</button>' +
+        '<button class="kd-toolbar-btn">后一 ▼</button>' +
+        '<button class="kd-toolbar-btn">列表</button>' +
+        '<button class="kd-toolbar-btn">选项 ▼</button>' +
+        '<button class="kd-toolbar-btn" id="kd-preview-exit">退出</button>' +
+      '</div>' +
+      '<div class="kd-toolbar-right">' +
+        '<span>☁️ 订单风险</span>' +
+        '<span>⚙️ 设置</span>' +
+      '</div>' +
+    '</div>' +
+    // Sub-Tabs Bar
+    '<div class="kd-page-subtabs">' +
+      '<div class="kd-subtab active">基本信息</div>' +
+      '<div class="kd-subtab">客户信息</div>' +
+      '<div class="kd-subtab">财务信息</div>' +
+      '<div class="kd-subtab">明细信息</div>' +
+      '<div class="kd-subtab">明细财务信息</div>' +
+    '</div>' +
+    // Scroll Container
+    '<div class="kd-content-scroll">' +
+      // Basic info Card (Accordion)
+      '<div class="kd-section-accordion">' +
+        '<div class="kd-accordion-head"><span class="kd-accordion-arrow">▼</span>基本信息</div>' +
+        '<div class="kd-accordion-body">' +
+          '<div class="kd-grid-form-5">' +
+            // Row 1
+            kdField('单据类型', '标准销售订单', true, true) +
+            kdField('销售类型', '产品类销售', true, true) +
+            kdField('销售部门', h(deptName), true, true) +
+            kdField('销售项目', '', false, true) +
+            kdField('收货国家', '', false, true) +
+
+            // Row 2
+            kdField('单据编号', billNoHtml, false, false, false, '', isBillNoErr) +
+            kdField('销售组织', orgHtml, true, true, false, '', isOrgErr) +
+            kdField('销售组', '', false, true) +
+            kdField('有无风险', '', false, true) +
+            kdField('收货国家简称', '', false, false) +
+
+            // Row 3
+            kdField('日期', dateHtml, true, false, true) +
+            kdField('客户', customerHtml, true, true, false, '', isCustErr) +
+            kdField('销售员', h(salesperson), true, true) +
+            kdField('订单编号', orderNoHtml, false, false) +
+            kdField('(美国) 州', '', false, true) +
+
+            // Row 4
+            kdField('业务类型', '普通销售', true, true) +
+            kdField('结算币别', currencyHtml, true, true) +
+            kdField('单据状态', h(billStatus), false, true) +
+            kdField('网店订单号', '', false, false) +
+            kdField('(美国) 州简称', '', false, false) +
+
+            // Row 5
+            kdField('交货方式', '', false, true) +
+            kdField('价目表', '', false, true) +
+            kdField('变更原因', '', false, true) +
+            kdField('终端网店单号', '', false, false) +
+            '<div class="kd-field-row"></div>' +
+
+            // Row 6
+            kdField('交货地点', '', false, true) +
+            kdField('收款条件', '', false, true) +
+            kdField('备注', '中台订单 ' + orderNoHtml + ' | ' + customerHtml, false, false) +
+            kdField('销售渠道', '', false, true) +
+            '<div class="kd-field-row"></div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      // Other Collapsed Accordions
+      '<div class="kd-section-accordion">' +
+        '<div class="kd-accordion-head collapsed"><span class="kd-accordion-arrow">▶</span>客户信息</div>' +
+      '</div>' +
+      '<div class="kd-section-accordion">' +
+        '<div class="kd-accordion-head collapsed"><span class="kd-accordion-arrow">▶</span>收款执行明细</div>' +
+      '</div>' +
+      '<div class="kd-section-accordion">' +
+        '<div class="kd-accordion-head collapsed"><span class="kd-accordion-arrow">▶</span>财务信息</div>' +
+      '</div>' +
+      // Detail list Card
+      '<div class="kd-section-accordion">' +
+        '<div class="kd-accordion-head"><span class="kd-accordion-arrow">▼</span>明细信息</div>' +
+        '<div class="kd-accordion-body">' +
+          '<div class="kd-table-toolbar">' +
+            '<button class="kd-table-btn">新增行</button>' +
+            '<button class="kd-table-btn">删除行</button>' +
+            '<button class="kd-table-btn">批量填充</button>' +
+            '<button class="kd-table-btn">业务操作 ▼</button>' +
+            '<button class="kd-table-btn">业务查询 ▼</button>' +
+            '<button class="kd-table-btn">锁库 ▼</button>' +
+            '<button class="kd-table-btn">套件展开 ▼</button>' +
+            '<button class="kd-table-btn">本单累计数量取价</button>' +
+            '<button class="kd-table-btn" style="color: #004ea2; font-weight: bold;">附件</button>' +
+          '</div>' +
+          '<div class="kd-table-wrap">' +
+            '<table class="kd-table">' +
+              '<thead>' +
+                '<tr>' +
+                  '<th>序号</th>' +
+                  '<th>产品类型</th>' +
+                  '<th>物料编码 <span style="color:#ef4444;">*</span></th>' +
+                  '<th>物料名称</th>' +
+                  '<th>规格型号</th>' +
+                  '<th>父项产品</th>' +
+                  '<th>销售数量 <span style="color:#ef4444;">*</span></th>' +
+                  '<th>销售单位</th>' +
+                  '<th>计价数量</th>' +
+                  '<th>计价单位</th>' +
+                  '<th>单价</th>' +
+                  '<th>含税单价 <span style="color:#ef4444;">*</span></th>' +
+                  '<th>是否赠品</th>' +
+                  '<th>税率%</th>' +
+                  '<th>税额</th>' +
+                  '<th>金额</th>' +
+                  '<th>价税合计</th>' +
+                '</tr>' +
+              '</thead>' +
+              '<tbody>' +
+                itemsHtml +
+              '</tbody>' +
+            '</table>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+
+  var modal = document.getElementById('kingdee-preview-modal');
+  if (modal) {
+    modal.removeAttribute('hidden');
+    modal.style.display = 'flex';
+  }
+
+  var closeBtn = document.getElementById('kd-preview-close');
+  var exitBtn = document.getElementById('kd-preview-exit');
+  
+  function closeModal() {
+    if (modal) {
+      modal.setAttribute('hidden', 'true');
+      modal.style.display = 'none';
+    }
+  }
+
+  if (closeBtn) closeBtn.addEventListener('click', closeModal);
+  if (exitBtn) exitBtn.addEventListener('click', closeModal);
+}
+
+// —— 主数据页面 ——
+var _mdInited = false;
+function initMasterDataPage() {
+  if (_mdInited) return;
+  _mdInited = true;
+  initTabs(document.querySelector('[data-page="master-data"]'));
+  loadPP(); loadEW(); loadMR(); loadME(); loadCBT();
+  var ppR = document.getElementById('pp-refresh');
+  if (ppR) ppR.addEventListener('click', loadPP);
+  var ppA = document.getElementById('pp-add-btn');
+  if (ppA) ppA.addEventListener('click', function() { showModal('price'); });
+  var ewA = document.getElementById('ew-add-btn');
+  if (ewA) ewA.addEventListener('click', function() { showModal('entitywh'); });
+  var mrA = document.getElementById('mr-add-btn');
+  if (mrA) mrA.addEventListener('click', function() { showModal('receiver'); });
+  var meA = document.getElementById('me-add-btn');
+  if (meA) meA.addEventListener('click', function() { showModal('materialEntity'); });
+
+  var cbtR = document.getElementById('cbt-refresh');
+  if (cbtR) cbtR.addEventListener('click', loadCBT);
+  var cbtA = document.getElementById('cbt-add-btn');
+  if (cbtA) cbtA.addEventListener('click', function() { showModal('crmBusinessType'); });
+  var cbtSearch = document.getElementById('cbt-search');
+  if (cbtSearch) cbtSearch.addEventListener('input', loadCBT);
+
+  var mdTabs = document.querySelector('[data-page="master-data"]');
+  if (mdTabs) {
+    mdTabs.querySelectorAll('.tab').forEach(function(tab) {
+      tab.addEventListener('click', function() {
+        if (this.dataset.tab === 'crm-business-type') loadCBT();
+      });
+    });
+  }
+
+  // 预审别名导入
+  var raPreview = document.getElementById('ra-preview-btn');
+  if (raPreview) raPreview.addEventListener('click', loadAliasesPreview);
+  var raConfirm = document.getElementById('ra-confirm-btn');
+  if (raConfirm) raConfirm.addEventListener('click', confirmAliasesImport);
+}
+
+var _aliasesPreviewData = null;
+
+function loadAliasesPreview() {
+  var fileInput = document.getElementById('ra-upload');
+  var status = document.getElementById('ra-status');
+  var summary = document.getElementById('ra-summary');
+  var tableWrap = document.getElementById('ra-table-wrap');
+  var confirmBtn = document.getElementById('ra-confirm-btn');
+  if (!fileInput || !fileInput.files.length) { toast('请先选择 Excel 文件'); return; }
+  var file = fileInput.files[0];
+  if (!file.name.endsWith('.xlsx')) { toast('仅支持 .xlsx 格式'); return; }
+
+  status.textContent = '正在解析文件...';
+  var formData = new FormData();
+  formData.append('file', file);
+  fetch('/api/review-aliases/import/preview', { method: 'POST', body: formData, credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) { status.textContent = '解析失败: ' + data.error; return; }
+      _aliasesPreviewData = data;
+      status.textContent = '共 ' + data.matched + ' 行匹配，' + (data.skipped_no_spu || 0) + ' 行未找到 SPU';
+      if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.style.opacity = '1'; }
+
+      // Summary
+      if (summary) {
+        summary.style.display = 'block';
+        var s = data.summary || {};
+        summary.innerHTML = '<strong>预览结果：</strong>'
+          + s.spus_with_new + ' 个 SPU 将新增 ' + s.total_new_aliases + ' 个别名'
+          + (data.skipped_no_spu ? '，' + data.skipped_no_spu + ' 个产品编码未匹配到 SPU（将跳过）' : '')
+          + (data.skipped_no_alias ? '，' + data.skipped_no_alias + ' 行无别名数据（将跳过）' : '');
+      }
+
+      // Table
+      if (tableWrap) {
+        var items = data.items || [];
+        if (!items.length) { tableWrap.innerHTML = '<div class="empty-note">无匹配数据</div>'; return; }
+        var html = '<table class="data-table"><thead><tr><th>产品编码</th><th>SPU 名称</th><th>现有别名</th><th>新增别名</th><th>合并后总数</th></tr></thead><tbody>';
+        var shown = 0;
+        items.forEach(function(item) {
+          if (shown >= 200) return;
+          shown++;
+          var existingHtml = (item.existing_aliases || []).slice(0, 3).join(', ') + ((item.existing_aliases || []).length > 3 ? '...' : '') || '-';
+          var newHtml = (item.new_aliases || []).join(', ') || '-';
+          html += '<tr><td>' + h(item.spu_id) + '</td><td>' + h(item.product_name) + '</td><td><small>' + h(existingHtml) + '</small></td><td>' + h(newHtml) + '</td><td>' + (item.merged_aliases || []).length + '</td></tr>';
+        });
+        if (items.length > 200) html += '<tr><td colspan="5" style="text-align:center;color:var(--muted);">仅显示前 200 条，共 ' + items.length + ' 条</td></tr>';
+        html += '</tbody></table>';
+        tableWrap.innerHTML = html;
+      }
+    })
+    .catch(function(err) { notifyError(err, ['主数据', '别名预览失败']); status.textContent = '解析失败'; });
+}
+
+function confirmAliasesImport() {
+  if (!_aliasesPreviewData) { toast('请先预览'); return; }
+  var confirmBtn = document.getElementById('ra-confirm-btn');
+  var statusEl = document.getElementById('ra-status');
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.style.opacity = '0.5'; }
+  statusEl.textContent = '正在导入...';
+  api('/api/review-aliases/import/confirm', {
+    method: 'POST',
+    body: JSON.stringify({ items: _aliasesPreviewData.items }),
+  })
+  .then(function(result) {
+    toast(result.message || '别名导入成功');
+    statusEl.textContent = result.message || '导入完成';
+    _aliasesPreviewData = null;
+  })
+  .catch(function(err) {
+    notifyError(err, ['主数据', '别名确认导入失败']);
+    if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.style.opacity = '1'; }
+  });
+}
+
+function loadPP() {
+  api('/api/config/product-prices?page_size=200').then(function(data) {
+    var items = data.items || [];
+    var html = '<table class="data-table"><thead><tr><th>物料编码</th><th>主体</th><th>内部价格</th><th>币种</th><th>操作</th></tr></thead><tbody>';
+    items.forEach(function(p) {
+      html += '<tr><td>' + p.sku_id + '</td><td>' + p.entity_code + '</td><td>¥' + (p.unit_price / 100).toFixed(2) + '</td><td>' + p.currency + '</td>' +
+        '<td><a href="#" class="pp-edit" data-sku="' + p.sku_id + '" data-ent="' + p.entity_code + '" data-pr="' + p.unit_price + '">编辑</a></td></tr>';
+    });
+    html += '</tbody></table>';
+    var w = document.getElementById('pp-table-wrap');
+    if (w) w.innerHTML = html;
+    document.querySelectorAll('.pp-edit').forEach(function(a) {
+      a.addEventListener('click', function(e) { e.preventDefault(); showModal('price', {sku:this.dataset.sku, ent:this.dataset.ent, pr:this.dataset.pr}); });
+    });
+  }).catch(function() {});
+}
+
+function loadEW() {
+  api('/api/config/warehouse-entity').then(function(data) {
+    var items = data.items || [];
+    // 填充主体筛选下拉
+    var filter = document.getElementById('ew-entity-filter');
+    if (filter) {
+      var entities = {};
+      items.forEach(function(m) { entities[m.entity_code] = 1; });
+      var fhtml = '<option value="">全部主体</option>';
+      Object.keys(entities).sort().forEach(function(e) { fhtml += '<option value="' + e + '">' + e + '</option>'; });
+      filter.innerHTML = fhtml;
+      filter.onchange = function() { loadEWFilter(); };
+    }
+    renderEWTable(items);
+  }).catch(function() {});
+}
+
+function loadEWFilter() {
+  var entity = (document.getElementById('ew-entity-filter') || {}).value || '';
+  api('/api/config/warehouse-entity').then(function(data) {
+    var items = data.items || [];
+    if (entity) items = items.filter(function(m) { return m.entity_code === entity; });
+    renderEWTable(items);
+  }).catch(function() {});
+}
+
+function renderEWTable(items) {
+  var html = '<table class="data-table"><thead><tr><th>仓库</th><th>出货主体</th><th>操作</th></tr></thead><tbody>';
+  items.forEach(function(m) {
+    html += '<tr><td>' + m.warehouse + '</td><td>' + m.entity_code + '</td>' +
+      '<td><a href="#" class="ew-edit" data-wh="' + m.warehouse + '" data-ent="' + m.entity_code + '">编辑</a></td></tr>';
+  });
+  html += '</tbody></table>';
+  var w = document.getElementById('ew-table-wrap');
+  if (w) w.innerHTML = html;
+  document.querySelectorAll('.ew-edit').forEach(function(a) {
+    a.addEventListener('click', function(e) { e.preventDefault(); showModal('entitywh', {wh:this.dataset.wh, ent:this.dataset.ent}); });
+  });
+}
+
+function loadCBT() {
+  api('/api/config/crm-business-type-mappings').then(function(data) {
+    var items = data.items || [];
+    renderCBTTable(items);
+  }).catch(function(e) {
+    notifyError(e, ["主数据", "加载 CRM 业务类型映射失败"]);
+  });
+}
+
+function renderCBTTable(items) {
+  var html = '<table class="data-table"><thead><tr>' +
+    '<th>业务类型编码 (record_type)</th>' +
+    '<th>业务类型名称</th>' +
+    '<th>销售主体编码</th>' +
+    '<th>销售主体名称</th>' +
+    '<th>状态</th>' +
+    '<th>操作</th>' +
+    '</tr></thead><tbody>';
+
+  var searchVal = (document.getElementById('cbt-search') || {}).value || '';
+  if (searchVal) {
+    searchVal = searchVal.toLowerCase();
+    items = items.filter(function(m) {
+      return (m.business_type_code || '').toLowerCase().indexOf(searchVal) !== -1 ||
+             (m.business_type_name || '').toLowerCase().indexOf(searchVal) !== -1;
+    });
+  }
+
+  if (items.length === 0) {
+    html += '<tr><td colspan="6" style="text-align:center; color:var(--muted);">暂无匹配的数据</td></tr>';
+  } else {
+    items.forEach(function(m) {
+      var statusHtml = m.is_active 
+        ? '<span class="status-tag success">启用</span>' 
+        : '<span class="status-tag danger">禁用</span>';
+      
+      html += '<tr>' +
+        '<td><code>' + h(m.business_type_code) + '</code></td>' +
+        '<td>' + h(m.business_type_name) + '</td>' +
+        '<td><code>' + h(m.entity_code) + '</code></td>' +
+        '<td>' + h(getEntityName(m.entity_code)) + '</td>' +
+        '<td>' + statusHtml + '</td>' +
+        '<td>' +
+          '<a href="#" class="cbt-edit" data-code="' + h(m.business_type_code) + '" data-name="' + h(m.business_type_name) + '" data-ent="' + m.entity_code + '" data-act="' + m.is_active + '" style="margin-right: 8px;">编辑</a>' +
+          '<a href="#" class="cbt-delete" data-code="' + h(m.business_type_code) + '" style="color:var(--danger);">删除</a>' +
+        '</td>' +
+        '</tr>';
+    });
+  }
+  html += '</tbody></table>';
+
+  var wrap = document.getElementById('cbt-table-wrap');
+  if (wrap) wrap.innerHTML = html;
+
+  // Bind actions
+  document.querySelectorAll('.cbt-edit').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+      e.preventDefault();
+      var data = {
+        business_type_code: this.dataset.code,
+        business_type_name: this.dataset.name,
+        entity_code: this.dataset.ent,
+        is_active: this.dataset.act === 'true'
+      };
+      showModal('crmBusinessType', data);
+    });
+  });
+
+  document.querySelectorAll('.cbt-delete').forEach(function(el) {
+    el.addEventListener('click', function(e) {
+      e.preventDefault();
+      var code = this.dataset.code;
+      if (confirm('确认删除业务类型 ' + code + ' 的映射关系吗？')) {
+        apiDelete('/api/config/crm-business-type-mappings/' + encodeURIComponent(code)).then(function() {
+          toast('删除成功');
+          loadCBT();
+        }).catch(function(err) {
+          toast('删除失败: ' + (err.message || ''), true);
+        });
+      }
+    });
+  });
+}
+
+function loadMR() {
+  api('/api/config/mail-receivers').then(function(data) {
+    var items = data.items || [];
+    var html = '<table class="data-table"><thead><tr><th>场景</th><th>收件人</th><th>操作</th></tr></thead><tbody>';
+    items.forEach(function(r) {
+      var toArr = r.to || [];
+      try { if (typeof toArr === 'string') toArr = JSON.parse(toArr); } catch(e) {}
+      html += '<tr><td>' + r.scene + '</td><td>' + (Array.isArray(toArr) ? toArr.join(', ') : toArr) + '</td>' +
+        '<td><a href="#" class="mr-edit" data-scene="' + r.scene + '" data-to="' + (Array.isArray(toArr) ? toArr.join(',') : '') + '">编辑</a></td></tr>';
+    });
+    html += '</tbody></table>';
+    var w = document.getElementById('mr-table-wrap');
+    if (w) w.innerHTML = html;
+    document.querySelectorAll('.mr-edit').forEach(function(a) {
+      a.addEventListener('click', function(e) { e.preventDefault(); showModal('receiver', {scene:this.dataset.scene, to:this.dataset.to}); });
+    });
+  }).catch(function() {});
+}
+
+function loadME() {
+  api('/api/config/material-entity').then(function(data) {
+    var items = data.items || [];
+    var html = '<table class="data-table"><thead><tr><th>物料编码</th><th>物料名称</th><th>出货主体</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    items.forEach(function(m) {
+      html += '<tr><td>' + m.material_code + '</td><td>' + (m.material_name || '').slice(0, 30) + '</td><td>' + m.entity_code + '</td><td>' + (m.is_active ? '启用' : '停用') + '</td>' +
+        '<td><a href="#" class="me-edit" data-code="' + m.material_code + '" data-ent="' + m.entity_code + '">编辑</a></td></tr>';
+    });
+    html += '</tbody></table>';
+    var w = document.getElementById('me-table-wrap');
+    if (w) w.innerHTML = html;
+    document.querySelectorAll('.me-edit').forEach(function(a) {
+      a.addEventListener('click', function(e) { e.preventDefault(); showModal('materialEntity', {code:this.dataset.code, ent:this.dataset.ent}); });
+    });
+  }).catch(function() {});
+}
+
+// —— Modal 弹窗 ——
+function showModal(type, data) {
+  data = data || {};
+  var html = '', id = 'modal-' + Date.now();
+  if (type === 'price') {
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>' + (data.sku ? '编辑价格' : '新增价格') + '</h3>' +
+      '<label><span>物料编码</span><input id="m-sku" value="' + (data.sku || '') + '" /></label>' +
+      '<label><span>主体</span><select id="m-ent"><option value="SZ">深圳</option><option value="HK">香港</option><option value="LU">卢森堡</option></select></label>' +
+      '<label><span>价格（分）</span><input id="m-pr" type="number" value="' + (data.pr || '') + '" /></label>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-price">保存</button></div></div></div>';
+  } else if (type === 'entitywh') {
+    var entityOptions = ['SZ','HK','LU','US','WH','GZ'];
+    var entityHtml = entityOptions.map(function(e) { return '<option value="' + e + '"' + (e === (data.ent||'') ? ' selected' : '') + '>' + e + '</option>'; }).join('');
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>' + (data.wh ? '编辑映射' : '新增映射') + '</h3>' +
+      '<label><span>仓库</span><select id="mew-wh">' +
+        '<option value="武汉仓"' + (data.wh === '武汉仓' ? ' selected' : '') + '>武汉仓</option>' +
+        '<option value="美西仓库"' + (data.wh === '美西仓库' ? ' selected' : '') + '>美西仓库</option>' +
+        '<option value="欧洲仓"' + (data.wh === '欧洲仓' ? ' selected' : '') + '>欧洲仓</option>' +
+        '<option value="美国仓"' + (data.wh === '美国仓' ? ' selected' : '') + '>美国仓</option>' +
+        '<option value="德国仓库"' + (data.wh === '德国仓库' ? ' selected' : '') + '>德国仓库</option>' +
+        '<option value="Amazon US"' + (data.wh === 'Amazon US' ? ' selected' : '') + '>Amazon US</option>' +
+        '<option value="Amazon DE"' + (data.wh === 'Amazon DE' ? ' selected' : '') + '>Amazon DE</option>' +
+        '<option value="Amazon UK"' + (data.wh === 'Amazon UK' ? ' selected' : '') + '>Amazon UK</option>' +
+        '<option value="Amazon JP"' + (data.wh === 'Amazon JP' ? ' selected' : '') + '>Amazon JP</option>' +
+      '</select></label>' +
+      '<label><span>出货主体</span><select id="mew-ent">' + entityHtml + '</select></label>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-entitywh">保存</button></div></div></div>';
+    } else if (type === 'materialEntity') {
+    var entityOpts = ['SZ','HK','LU','US','WH','GZ'].map(function(e) { return '<option value="' + e + '"' + (e === (data.ent||'') ? ' selected' : '') + '>' + e + '</option>'; }).join('');
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>' + (data.code ? '编辑物料例外' : '新增物料例外') + '</h3>' +
+      '<label><span>物料编码</span><input id="mme-code" value="' + (data.code || '') + '" placeholder="如 1300100118" /></label>' +
+      '<label><span>出货主体</span><select id="mme-ent">' + entityOpts + '</select></label>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-materialEntity">保存</button></div></div></div>';
+  } else if (type === 'receiver') {
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>编辑收件人</h3>' +
+      '<label><span>场景</span><select id="m-scene"><option value="domestic_delivery">国内仓发货</option><option value="overseas_delivery">海外仓发货</option><option value="replenishment_domestic">备货武汉</option><option value="replenishment_overseas">备货海外</option></select></label>' +
+      '<label><span>收件人（逗号分隔）</span><input id="m-to" value="' + ((data.to || '').replace(/,/g, ', ')) + '" /></label>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-receiver">保存</button></div></div></div>';
+  } else if (type === 'crmBusinessType') {
+    var entityOptions = [
+      {code: 'SZ', name: '深圳积木易搭科技技术有限公司 (SZ)'},
+      {code: 'SZ_WH', name: '深圳积木易搭武汉分公司 (SZ_WH)'},
+      {code: 'WH', name: '武汉尺子科技有限公司 (WH)'},
+      {code: 'SZ_3D', name: '深圳积木三维科技有限公司 (SZ_3D)'},
+      {code: 'WH_RX', name: '武汉睿数信息技术有限公司 (WH_RX)'},
+      {code: 'SZ_3D_WH', name: '深圳积木三维武汉分公司 (SZ_3D_WH)'},
+      {code: 'HK', name: '积木易搭（香港）有限公司 (HK)'},
+      {code: 'GZ', name: '广州积木易搭数字科技有限公司 (GZ)'},
+      {code: 'SZ_SZ', name: '深圳积木数智软件技术有限公司 (SZ_SZ)'},
+      {code: 'LU', name: '积木易搭（卢森堡）有限公司 (LU)'},
+      {code: 'US', name: '积木易搭（美国）有限公司 (US)'}
+    ];
+    var entityHtml = entityOptions.map(function(e) {
+      return '<option value="' + e.code + '"' + (e.code === (data.entity_code || '') ? ' selected' : '') + '>' + e.name + '</option>';
+    }).join('');
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>' + (data.business_type_code ? '编辑映射' : '新增映射') + '</h3>' +
+      '<label><span>业务类型编码 (record_type)</span><input id="mcbt-code" value="' + (data.business_type_code || '') + '" ' + (data.business_type_code ? 'disabled' : '') + ' placeholder="例如: record_hnH91__c" /></label>' +
+      '<label><span>业务类型名称</span><input id="mcbt-name" value="' + (data.business_type_name || '') + '" placeholder="例如: 深圳积木易搭订单" /></label>' +
+      '<label><span>主体公司</span><select id="mcbt-ent">' + entityHtml + '</select></label>' +
+      '<label><span>是否启用</span><select id="mcbt-act"><option value="true" ' + (data.is_active !== false ? 'selected' : '') + '>启用</option><option value="false" ' + (data.is_active === false ? 'selected' : '') + '>禁用</option></select></label>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-crmBusinessType">保存</button></div></div></div>';
+  }
+  if (!html) return;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById(id).querySelector('[data-act]').addEventListener('click', function() {
+    var modal = this.closest('.modal-overlay');
+    var act = this.dataset.act;
+    if (act === 'save-price') {
+      var sku = document.getElementById('m-sku').value.trim();
+      var ent = document.getElementById('m-ent').value;
+      var pr = parseInt(document.getElementById('m-pr').value) || 0;
+      if (!sku) { toast('物料编码必填', true); return; }
+      apiPost('/api/config/product-prices', {sku_id:sku, entity_code:ent, unit_price:pr}).then(function() { modal.remove(); toast('保存成功'); loadPP(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
+    } else if (act === 'save-entitywh') {
+      var wh = document.getElementById('mew-wh').value;
+      var ent = document.getElementById('mew-ent').value;
+      if (!wh) { toast('仓库必填', true); return; }
+      apiPost('/api/config/warehouse-entity', {warehouse: wh, entity_code: ent}).then(function() { modal.remove(); toast('保存成功'); loadEW(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
+    } else if (act === 'save-materialEntity') {
+      var mc = document.getElementById('mme-code').value.trim();
+      var ent = document.getElementById('mme-ent').value;
+      if (!mc) { toast('物料编码必填', true); return; }
+      apiPost('/api/config/material-entity', {material_code: mc, entity_code: ent}).then(function() { modal.remove(); toast('保存成功'); loadME(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
+    } else if (act === 'save-receiver') {
+      var p = {scene: document.getElementById('m-scene').value, to: document.getElementById('m-to').value.split(/[,，\s]+/).filter(Boolean)};
+      if (!p.scene) { toast('场景必填', true); return; }
+      apiPost('/api/config/mail-receivers', p).then(function() { modal.remove(); toast('保存成功'); loadMR(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
+    } else if (act === 'save-crmBusinessType') {
+      var code = document.getElementById('mcbt-code').value.trim();
+      var name = document.getElementById('mcbt-name').value.trim();
+      var ent = document.getElementById('mcbt-ent').value;
+      var active = document.getElementById('mcbt-act').value === 'true';
+      if (!code) { toast('业务类型编码必填', true); return; }
+      if (!name) { toast('业务类型名称必填', true); return; }
+      apiPost('/api/config/crm-business-type-mappings', {
+        business_type_code: code,
+        business_type_name: name,
+        entity_code: ent,
+        is_active: active
+      }).then(function() {
+        modal.remove();
+        toast('保存成功');
+        loadCBT();
+      }).catch(function(e) {
+        toast('失败: ' + (e.message || ''), true);
+      });
+    }
+  });
+}
+
+// —— 库存管理 ——
+var _invInited = false;
+var _invPage = 1;
+function initInventoryPage() {
+  if (_invInited) return;
+  _invInited = true;
+  initTabs(document.querySelector('[data-page="inventory"]'));
+  loadInvWarehouses();
+  loadInv();
+  var btn = document.getElementById('inv-refresh');
+  if (btn) btn.addEventListener('click', function() { _invPage = 1; loadInv(); });
+  var search = document.getElementById('inv-search');
+  if (search) search.addEventListener('keydown', function(e) { if (e.key === 'Enter') { _invPage = 1; loadInv(); } });
+  var wh = document.getElementById('inv-wh-filter');
+  if (wh) wh.addEventListener('change', function() { _invPage = 1; loadInv(); });
+  var outOfStock = document.getElementById('inv-out-of-stock');
+  if (outOfStock) outOfStock.addEventListener('change', function() { _invPage = 1; loadInv(); });
+  var drop = document.getElementById('inv-drop-zone');
+  if (drop) drop.addEventListener('click', function() { var fi = document.getElementById('inv-file-input'); if (fi) fi.click(); });
+  var fi = document.getElementById('inv-file-input');
+  if (fi) fi.addEventListener('change', function(e) {
+    var f = e.target.files[0];
+    if (!f) return;
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      try {
+        var formData = new FormData();
+        formData.append('file', f);
+        fetch('/api/inventory/import', { method: 'POST', body: formData })
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (data.ok) {
+              toast('导入成功: ' + (data.total_rows || 0) + ' 行, 仓库: ' + (data.warehouses || []).join(', '));
+              loadInv();
+            } else {
+              toast('导入失败: ' + (data.error || '未知错误'), true);
+            }
+          })
+          .catch(function(ex) { toast('上传失败: ' + ex.message, true); });
+      } catch(ex) { toast('读取失败: ' + ex.message, true); }
+    };
+    reader.readAsArrayBuffer(f);
+  });
+}
+
+function loadInvWarehouses() {
+  api('/api/inventory/warehouses').then(function(data) {
+    var sel = document.getElementById('inv-wh-filter');
+    if (!sel) return;
+    var html = '<option value="">全部仓库</option>';
+    (data.warehouses || []).forEach(function(w) {
+      html += '<option value="' + w + '">' + w + '</option>';
+    });
+    sel.innerHTML = html;
+  }).catch(function() {});
+}
+
+function loadInv(opts) {
+  opts = opts || {};
+  var page = opts.page || _invPage || 1;
+  _invPage = page;
+  var wh = (document.getElementById('inv-wh-filter') || {}).value || '';
+  var q = (document.getElementById('inv-search') || {}).value || '';
+  var onlyOutOfStock = Boolean((document.getElementById('inv-out-of-stock') || {}).checked);
+  var url = '/api/inventory/snapshots?page=' + page + '&page_size=50';
+  if (wh) url += '&warehouse=' + encodeURIComponent(wh);
+  if (q) url += '&q=' + encodeURIComponent(q);
+  if (onlyOutOfStock) url += '&stock_status=out_of_stock';
+  api(url).then(function(data) {
+    var items = data.items || [];
+    var total = data.total || 0;
+    var tp = data.total_pages || 1;
+    var hasMore = Boolean(data.has_more);
+    var html = '<table class="data-table"><thead><tr><th>仓库</th><th>物料编码</th><th>物料名称</th><th>库存数量</th><th>同步时间</th></tr></thead><tbody>';
+    items.forEach(function(s) {
+      var qty = parseFloat(s.qty) || 0;
+      var style = qty <= 0 ? ' style="color:#dc2626;font-weight:600;"' : '';
+      html += '<tr' + style + '><td>' + s.warehouse_code + '</td><td>' + s.material_code + '</td><td>' + (s.material_name || '').slice(0, 40) + '</td><td>' + qty + '</td><td>' + (s.synced_at || '').slice(0, 10) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    var w = document.getElementById('inv-table-wrap');
+    if (w) w.innerHTML = html;
+    // pagination
+    var pg = document.getElementById('inv-pagination');
+    if (pg) {
+      var totalText = data.total_estimated ? '至少 ' + total + ' 条' : '共 ' + total + ' 条';
+      var displayPages = data.total_estimated ? (hasMore ? page + 1 : page) : tp;
+      var ph = '<span style="margin-right:12px;color:var(--muted);font-size:13px;">' + totalText + '</span>';
+      ph += '<button class="button ghost ' + (page <= 1 ? 'disabled' : '') + '" id="inv-prev"' + (page <= 1 ? ' disabled' : '') + '>‹ 上一页</button> ';
+      ph += '<span style="margin:0 8px;font-size:13px;">' + page + '/' + displayPages + '</span> ';
+      ph += '<button class="button ghost ' + (!hasMore ? 'disabled' : '') + '" id="inv-next"' + (!hasMore ? ' disabled' : '') + '>下一页 ›</button>';
+      pg.innerHTML = ph;
+      var prev = document.getElementById('inv-prev');
+      if (prev) prev.addEventListener('click', function() { if (page > 1) loadInv({page: page - 1}); });
+      var next = document.getElementById('inv-next');
+      if (next) next.addEventListener('click', function() { if (hasMore) loadInv({page: page + 1}); });
+    }
+  }).catch(function(e) { toast('加载库存失败: ' + (e.message || ''), true); });
+}
+
+// —— 库存导入历史 ——
+function loadInvRecords() {
+  api('/api/inventory/import-records').then(function(data) {
+    var items = data.items || [];
+    var html = '<table class="data-table"><thead><tr><th>时间</th><th>文件名</th><th>仓库</th><th>行数</th><th>操作人</th></tr></thead><tbody>';
+    items.forEach(function(r) {
+      html += '<tr><td>' + (r.created_at || '').slice(0, 16) + '</td><td>' + (r.file_name || '') + '</td><td>' + (r.warehouse || '') + '</td><td>' + r.row_count + '</td><td>' + (r.operated_by || '') + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    var w = document.getElementById('inv-records-table');
+    if (w) w.innerHTML = html;
+  }).catch(function(e) { toast('加载导入历史失败: ' + (e.message || ''), true); });
+}
+
+// Hook into inventory page init
+var _origInvInit = window._invInited ? null : initInventoryPage;
+var _origInvInit2 = initInventoryPage;
+initInventoryPage = function() {
+  _origInvInit2();
+  var btn = document.getElementById('inv-refresh-records');
+  if (btn) btn.addEventListener('click', loadInvRecords);
+  // Also init tabs for records
+  var tabsContainer = document.querySelector('[data-page="inventory"]');
+  if (tabsContainer) {
+    tabsContainer.querySelectorAll('.tab').forEach(function(tab) {
+      tab.addEventListener('click', function() {
+        if (this.dataset.tab === 'inv-records') loadInvRecords();
+      });
+    });
+  }
+};
+
+window.gotoReviewRule = function(code) {
+  // 1. Switch to review-rules page
+  setActivePage('review-rules');
+  // 2. Set search filter to this rule code
+  if (window.tableStates && window.tableStates.reviewRules) {
+    window.tableStates.reviewRules.q = code;
+    window.tableStates.reviewRules.page = 1;
+  }
+  // 3. Set input value in form
+  var form = document.getElementById('initial-review-rules-filter-form');
+  if (form) {
+    var input = form.querySelector('input[name="q"]');
+    if (input) {
+      input.value = code;
+    }
+  }
+  // 4. Refresh rules list
+  if (typeof refreshV2ReviewRules === 'function') {
+    refreshV2ReviewRules();
+  }
+};
+
+function orderDetailRowRaw(label, htmlValue) {
+  var val = htmlValue === undefined || htmlValue === null || htmlValue === "" ? "-" : htmlValue;
+  return '<div class="order-detail-row"><span class="order-detail-label">' + h(label) + '</span><span class="order-detail-value">' + val + '</span></div>';
+}

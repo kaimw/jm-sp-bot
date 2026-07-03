@@ -6,6 +6,7 @@ import binascii
 import contextlib
 import csv
 import hmac
+import json
 import logging
 import os
 import re
@@ -66,6 +67,12 @@ from backend.app.models import (
     WorkflowImportJob,
     WorkflowVersion,
     now_utc,
+    # V2 Phase 1 新增模型
+    EntityMapping, CustomerEntityMapping, ProductPrice,
+    MailReceiverConfig, OrderSequence, InterEntityTransfer,
+    InventoryImportRecord, InventorySnapshotHistory,
+    ProductInventorySnapshot, WarehouseEntityMapping,
+    MaterialEntityException,
 )
 from backend.app.schemas import (
     AdminPasswordRequest,
@@ -123,7 +130,7 @@ from backend.app.services.crm_sync import (
 from backend.app.services.e2e_mail import run_tencent_mail_e2e
 from backend.app.services.erp.business_queries import (
     inventory_classification_diagnostics,
-    list_inventory_warehouses,
+    list_inventory_warehouses as list_inventory_warehouse_options,
     list_inventory_snapshots,
     list_inventory_type_items,
     list_inventory_type_summary,
@@ -132,7 +139,7 @@ from backend.app.services.erp.business_queries import (
     search_materials,
     sync_inventory_snapshots,
 )
-from backend.app.services.erp.kingdee_client import execute_bill_query_from_config, normalize_kingdee_server_url, test_kingdee_connection_from_config
+from backend.app.services.erp.kingdee_client import execute_bill_query_from_config, normalize_kingdee_server_url, test_kingdee_connection_from_config, test_kingdee_write_permissions_from_config
 from backend.app.services.erp.material_sync import sync_erp_materials
 from backend.app.services.exception_diagnosis import diagnose_exception_case, enqueue_exception_diagnosis
 from backend.app.services.initial_review import (
@@ -157,12 +164,15 @@ from backend.app.services.order_middle_platform import (
     confirm_delivery_notice,
     enqueue_crm_order_parsed_event,
     enqueue_oms_push,
+    ensure_middle_order_business_fields,
     ExceptionType,
     list_middle_orders,
     OrderStatus,
     order_dashboard,
     poll_oms_status_updates,
     process_crm_order_parsed_event,
+    process_erp_billing,
+    retry_erp_billing,
     process_oms_status_update,
     serialize_middle_order,
 )
@@ -245,6 +255,8 @@ from backend.app.services.products import (
     update_promotion_rule,
     delete_promotion_rule,
     toggle_promotion_rule,
+    preview_alias_import_from_excel,
+    confirm_alias_import_from_excel,
 )
 from backend.app.services.skills.registry import registry
 from backend.app.services.skills.factory import SkillFactory
@@ -354,6 +366,10 @@ def get_session():
     session = SessionLocal()
     try:
         yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
 
@@ -1369,6 +1385,39 @@ def test_jackyun_connection(session: Session = Depends(get_session)) -> dict:
 @app.post("/api/erp/test-connection")
 def test_erp_connection(session: Session = Depends(get_session)) -> dict:
     return test_kingdee_connection_from_config(session)
+
+
+@app.post("/api/erp/test-write-permissions")
+def test_erp_write_permissions(session: Session = Depends(get_session)) -> dict:
+    """一站式测试金蝶写入权限（Save→Submit→Audit→UnAudit→Cancel→Delete）"""
+    return test_kingdee_write_permissions_from_config(session)
+
+
+@app.get("/api/erp/billing-status/{order_id}")
+def erp_billing_status(order_id: str, session: Session = Depends(get_session)) -> dict:
+    """查询订单的 ERP 制单状态和失败原因"""
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    return {
+        "order_id": order.id,
+        "order_no": order.order_no,
+        "status": order.status,
+        "erp_bill_no": order.erp_bill_no,
+        "entity_code": order.entity_code,
+        "order_type": order.order_type,
+    }
+
+
+@app.post("/api/erp/billing-retry/{order_id}")
+def erp_billing_retry(order_id: str, session: Session = Depends(get_session)) -> dict:
+    """重试失败的金蝶制单"""
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if order.status != OrderStatus.ERP_FAILED.value:
+        raise HTTPException(status_code=400, detail=f"当前状态不允许重试：{order.status}")
+    return retry_erp_billing(session, order, trace_id=f"manual-retry-{order.id}")
 
 
 @app.post("/api/erp/query")
@@ -6106,6 +6155,117 @@ def api_confirm_product_import(data: dict, session: Session = Depends(get_sessio
     return {"message": "导入成功", "counts": counts}
 
 
+# ═════════════════════════════════
+# 预审别名导入（CRM 产品模板）
+# ═════════════════════════════════
+
+@app.post("/api/review-aliases/import/preview")
+def api_review_alias_import_preview(file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+    """上传 CRM 产品导入模板 Excel，预览别名导入结果。"""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        contents = file.file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+    try:
+        return preview_alias_import_from_excel(tmp_path, session)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/review-aliases/import/confirm")
+def api_review_alias_import_confirm(payload: dict, session: Session = Depends(get_session)) -> dict:
+    """确认导入预审别名（客户端需回传预览结果的 items）。"""
+    items = payload.get("items") or payload.get("preview", {}).get("items")
+    if not items:
+        raise HTTPException(status_code=400, detail="缺少预览数据，请先上传文件预览")
+    preview_data = {"items": items}
+    result = confirm_alias_import_from_excel(preview_data, session)
+    session.commit()
+    return {"message": f"已更新 {result['updated']} 个成品的预审别名", **result}
+
+
+def _apply_db_query_timeout(session: Session, timeout_seconds: int = 10) -> None:
+    """为当前数据库会话设置查询超时保护（仅 PostgreSQL）。
+    SQLite 由 PRAGMA busy_timeout 保护，无需额外设置。
+    """
+    if session.bind and session.bind.dialect.name == "postgresql":
+        session.execute(text(f"SET LOCAL statement_timeout = '{timeout_seconds * 1000}'"))
+
+
+# ── CRM 面包屑错误辅助 ──
+
+CRM_CRUMB_STEPS = {
+    "db_query": "CRM 数据库查询",
+    "db_count": "订单总数统计",
+    "db_aggregate": "金额聚合计算",
+    "db_status_options": "状态取值去重",
+    "sync_enabled_check": "同步开关检查",
+    "sync_lock_acquire": "同步锁获取",
+    "sync_browser_check": "CDP 浏览器连通性检查",
+    "sync_browser_start": "CDP 浏览器启动",
+    "sync_browser_cleanup": "CDP 浏览器多余页签清理",
+    "sync_script_exec": "Node.js 脚本执行",
+    "sync_script_timeout": "脚本执行超时",
+    "sync_data_parse": "同步数据解析",
+    "sync_upsert": "订单 upsert 入库",
+    "sync_detail_fetch": "订单详情同步",
+    "sync_detail_lock": "详情同步锁获取",
+    "sync_attachment_cache": "附件缓存写入",
+    "sync_contact_extract": "LLM 联系人提取",
+    "sync_event_enqueue": "中台事件入队",
+    "sync_run_save": "同步记录保存",
+    "browser_cdp_connect": "CDP 调试端口连接",
+    "browser_page_navigate": "浏览器页面导航",
+    "browser_login_check": "登录态检查",
+    "browser_login_auto": "自动登录尝试",
+    "browser_login_cooldown": "登录风控冷却等待",
+}
+
+
+def _crm_exception_breadcrumbs(
+    exc: Exception,
+    *,
+    steps: list[dict[str, str]],
+    detail: str = "",
+    resolution: str = "",
+) -> dict:
+    """生成 CRM 面包屑错误结构，用于前端展示故障链路。
+
+    steps: [
+        {"step": "step_key", "status": "ok"},
+        {"step": "step_key", "status": "fail", "error": "失败原因"},
+    ]
+    """
+    return {
+        "error_type": exc.__class__.__name__,
+        "detail": detail or str(exc),
+        "resolution": resolution or "请确认相关配置或联系 IT 运维",
+        "breadcrumbs": [
+            {
+                "label": CRM_CRUMB_STEPS.get(s["step"], s["step"]),
+                "status": s.get("status", "unknown"),
+                "error": s.get("error", ""),
+            }
+            for s in steps
+        ],
+    }
+
+
+def _crm_http_error(
+    status_code: int,
+    breadcrumb_data: dict,
+) -> HTTPException:
+    """带面包屑的 HTTPException 快捷构造。"""
+    return HTTPException(
+        status_code=status_code,
+        detail=dumps(breadcrumb_data, ensure_ascii=False),
+    )
+
+
 @app.get("/api/crm/orders")
 def list_crm_orders(
     q: str = "",
@@ -6116,87 +6276,117 @@ def list_crm_orders(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    query = session.query(CrmSalesOrder).filter(or_(CrmSalesOrder.scope_status.is_(None), CrmSalesOrder.scope_status != "Ignored"))
-    
-    # Enforce data visibility scope for sales/business operators
-    if hasattr(current_user, "role") and current_user.role == "business_operator":
-        filter_expr = (CrmSalesOrder.sales_user_name == current_user.username)
-        if current_user.department:
-            filter_expr = filter_expr | (CrmSalesOrder.owner_department.ilike(current_user.department))
-        query = query.filter(filter_expr)
-        
-    if q.strip():
-        pattern = f"%{q.strip()}%"
-        query = query.filter(
-            or_(
-                CrmSalesOrder.crm_order_no.ilike(pattern),
-                CrmSalesOrder.customer_name.ilike(pattern),
-                CrmSalesOrder.opportunity_name.ilike(pattern),
-                CrmSalesOrder.sales_user_name.ilike(pattern),
+    _apply_db_query_timeout(session, timeout_seconds=15)
+
+    try:
+        query = session.query(CrmSalesOrder).filter(or_(CrmSalesOrder.scope_status.is_(None), CrmSalesOrder.scope_status != "Ignored"))
+
+        # Enforce data visibility scope for sales/business operators
+        if hasattr(current_user, "role") and current_user.role == "business_operator":
+            filter_expr = (CrmSalesOrder.sales_user_name == current_user.username)
+            if current_user.department:
+                filter_expr = filter_expr | (CrmSalesOrder.owner_department.ilike(current_user.department))
+            query = query.filter(filter_expr)
+
+        if q.strip():
+            pattern = f"%{q.strip()}%"
+            query = query.filter(
+                or_(
+                    CrmSalesOrder.crm_order_no.ilike(pattern),
+                    CrmSalesOrder.customer_name.ilike(pattern),
+                    CrmSalesOrder.opportunity_name.ilike(pattern),
+                    CrmSalesOrder.sales_user_name.ilike(pattern),
+                )
             )
+        if status.strip():
+            query = query.filter(CrmSalesOrder.life_status == status.strip())
+        if customer.strip():
+            query = query.filter(CrmSalesOrder.customer_name.ilike(f"%{customer.strip()}%"))
+        total = query.count()
+        rows = (
+            query.order_by(CrmSalesOrder.order_date.desc(), CrmSalesOrder.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
         )
-    if status.strip():
-        query = query.filter(CrmSalesOrder.life_status == status.strip())
-    if customer.strip():
-        query = query.filter(CrmSalesOrder.customer_name.ilike(f"%{customer.strip()}%"))
-    total = query.count()
-    rows = (
-        query.order_by(CrmSalesOrder.order_date.desc(), CrmSalesOrder.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-    return {
-        "items": [serialize_crm_order(row, current_user=current_user) for row in rows],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": max(1, (total + page_size - 1) // page_size),
-        "summary": crm_order_summary(session),
-        "status_options": [row[0] for row in session.query(CrmSalesOrder.life_status).distinct().all() if row[0]],
-    }
+        return {
+            "items": [serialize_crm_order(row, current_user=current_user) for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "summary": crm_order_summary(session),
+            "status_options": [row[0] for row in session.query(CrmSalesOrder.life_status).distinct().all() if row[0]],
+        }
+    except Exception as exc:
+        raise _crm_http_error(500, _crm_exception_breadcrumbs(
+            exc,
+            steps=[{"step": "db_query", "status": "fail", "error": str(exc)[:120]}],
+            detail=f"CRM 订单列表查询失败: {exc}",
+            resolution="检查数据库连接或联系 IT 运维",
+        ))
 
 
 @app.get("/api/crm/orders/{order_id}")
 def get_crm_order(order_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)) -> dict:
-    row = session.get(CrmSalesOrder, order_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="CRM 订单不存在")
-        
-    # Enforce data visibility scope for sales/business operators
-    if hasattr(current_user, "role") and current_user.role == "business_operator":
-        is_owner = (row.sales_user_name == current_user.username)
-        is_same_dept = bool(current_user.department and row.owner_department and row.owner_department.lower() == current_user.department.lower())
-        if not is_owner and not is_same_dept:
-            raise HTTPException(status_code=403, detail="没有权限访问此订单")
-            
-    return serialize_crm_order_with_flow(session, row, current_user=current_user)
+    try:
+        row = session.get(CrmSalesOrder, order_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="CRM 订单不存在")
+
+        # Enforce data visibility scope for sales/business operators
+        if hasattr(current_user, "role") and current_user.role == "business_operator":
+            is_owner = (row.sales_user_name == current_user.username)
+            is_same_dept = bool(current_user.department and row.owner_department and row.owner_department.lower() == current_user.department.lower())
+            if not is_owner and not is_same_dept:
+                raise HTTPException(status_code=403, detail="没有权限访问此订单")
+
+        return serialize_crm_order_with_flow(session, row, current_user=current_user)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _crm_http_error(500, _crm_exception_breadcrumbs(
+            exc,
+            steps=[{"step": "db_query", "status": "fail", "error": str(exc)[:120]}],
+            detail=f"CRM 订单详情查询失败: {exc}",
+            resolution="检查数据库连接或联系 IT 运维",
+        ))
 
 
 @app.post("/api/crm/orders/{order_id}/retry-detail-sync")
 def retry_crm_order_detail(order_id: str, session: Session = Depends(get_session), current_user: User = Depends(get_current_user)) -> dict:
-    row = session.get(CrmSalesOrder, order_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="CRM 订单不存在")
-        
-    # Enforce data visibility scope for sales/business operators
-    if hasattr(current_user, "role") and current_user.role == "business_operator":
-        is_owner = (row.sales_user_name == current_user.username)
-        is_same_dept = bool(current_user.department and row.owner_department and row.owner_department.lower() == current_user.department.lower())
-        if not is_owner and not is_same_dept:
-            raise HTTPException(status_code=403, detail="没有权限操作此订单")
-            
     try:
+        row = session.get(CrmSalesOrder, order_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="CRM 订单不存在")
+
+        # Enforce data visibility scope for sales/business operators
+        if hasattr(current_user, "role") and current_user.role == "business_operator":
+            is_owner = (row.sales_user_name == current_user.username)
+            is_same_dept = bool(current_user.department and row.owner_department and row.owner_department.lower() == current_user.department.lower())
+            if not is_owner and not is_same_dept:
+                raise HTTPException(status_code=403, detail="没有权限操作此订单")
+
         result = retry_crm_order_detail_sync(session, row)
         session.commit()
         refreshed = session.get(CrmSalesOrder, order_id) or row
         return {"retry": result, "order": serialize_crm_order_with_flow(session, refreshed, current_user=current_user)}
+    except HTTPException:
+        raise
     except CrmSyncBusyError as exc:
         session.rollback()
         return {"ok": False, "busy": True, "message": str(exc)}
     except Exception as exc:
         session.commit()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _crm_http_error(400, _crm_exception_breadcrumbs(
+            exc,
+            steps=[
+                {"step": "sync_detail_lock", "status": "ok"},
+                {"step": "sync_detail_fetch", "status": "fail", "error": str(exc)[:200]},
+            ],
+            detail=f"CRM 订单详情同步失败: {exc}",
+            resolution="确认该订单在 CRM 中存在完整详情数据",
+        ))
 
 
 @app.delete("/api/crm/orders/{order_id}")
@@ -6241,8 +6431,17 @@ def download_crm_order_attachment(attachment_id: str, session: Session = Depends
 
 @app.get("/api/crm/sync/summary")
 def get_crm_sync_summary(session: Session = Depends(get_session)) -> dict:
-    runs = session.query(CrmSyncRun).order_by(CrmSyncRun.started_at.desc()).limit(10).all()
-    return {**crm_order_summary(session), "runs": [serialize_sync_run(row) for row in runs]}
+    _apply_db_query_timeout(session, timeout_seconds=15)
+    try:
+        runs = session.query(CrmSyncRun).order_by(CrmSyncRun.started_at.desc()).limit(10).all()
+        return {**crm_order_summary(session), "runs": [serialize_sync_run(row) for row in runs]}
+    except Exception as exc:
+        raise _crm_http_error(500, _crm_exception_breadcrumbs(
+            exc,
+            steps=[{"step": "db_query", "status": "fail", "error": str(exc)[:120]}],
+            detail=f"CRM 同步摘要查询失败: {exc}",
+            resolution="刷新重试，如持续失败联系 IT 运维",
+        ))
 
 
 @app.get("/api/crm/browser/status")
@@ -6267,7 +6466,15 @@ def stop_crm_browser(current_user: User = Depends(require_role(["admin", "it_ops
 
 @app.post("/api/crm/sync/queue")
 def queue_crm_sync(session: Session = Depends(get_session)) -> dict:
-    return queue_crm_order_sync(session, source="manual")
+    try:
+        return queue_crm_order_sync(session, source="manual")
+    except Exception as exc:
+        raise _crm_http_error(400, _crm_exception_breadcrumbs(
+            exc,
+            steps=[{"step": "sync_enabled_check", "status": "fail", "error": str(exc)[:120]}],
+            detail=f"CRM 同步投递失败: {exc}",
+            resolution="检查「系统接入」页 CRM 同步开关是否开启",
+        ))
 
 
 @app.post("/api/crm/sync/run")
@@ -6278,7 +6485,16 @@ def run_crm_sync_now(session: Session = Depends(get_session)) -> dict:
         session.rollback()
         return {"ok": False, "busy": True, "message": str(exc)}
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _crm_http_error(400, _crm_exception_breadcrumbs(
+            exc,
+            steps=[
+                {"step": "sync_lock_acquire", "status": "ok"},
+                {"step": "sync_browser_check", "status": "ok"},
+                {"step": "sync_script_exec", "status": "fail", "error": str(exc)[:200]},
+            ],
+            detail=f"CRM 同步执行失败: {exc}",
+            resolution="检查 CDP 浏览器状态和 CRM 账号登录态",
+        ))
 
 
 @app.post("/api/crm/sync/orders/{crm_order_no}/force")
@@ -6292,7 +6508,15 @@ def force_sync_crm_order(crm_order_no: str, session: Session = Depends(get_sessi
         return {"ok": False, "busy": True, "message": str(exc)}
     except Exception as exc:
         session.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _crm_http_error(400, _crm_exception_breadcrumbs(
+            exc,
+            steps=[
+                {"step": "sync_lock_acquire", "status": "ok"},
+                {"step": "sync_detail_fetch", "status": "fail", "error": f"订单 {crm_order_no} 强制同步失败: {str(exc)[:200]}"},
+            ],
+            detail=f"强制同步 CRM 订单 {crm_order_no} 失败: {exc}",
+            resolution="确认该订单号在 CRM 中存在且 CDP 浏览器正常运行",
+        ))
 
 
 @app.post("/api/crm/sync/test-connection")
@@ -6300,7 +6524,14 @@ def test_crm_sync_connection(session: Session = Depends(get_session)) -> dict:
     try:
         return run_crm_integration_test(session)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _crm_http_error(400, _crm_exception_breadcrumbs(
+            exc,
+            steps=[
+                {"step": "sync_browser_check", "status": "fail", "error": str(exc)[:200]},
+            ],
+            detail=f"CRM 连接测试失败: {exc}",
+            resolution="确认 CDP 浏览器已启动，CRM 账号密码配置正确",
+        ))
 
 
 @app.get("/api/v2/order-dashboard")
@@ -6333,6 +6564,7 @@ def v2_get_order(order_id: str, session: Session = Depends(get_session), current
         if not is_owner and not is_same_dept:
             raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
             
+    ensure_middle_order_business_fields(session, row)
     return serialize_middle_order(row, include_detail=True, current_user=current_user)
 
 
@@ -6619,19 +6851,28 @@ def list_product_inventory(
     page_size: int = Query(20, ge=1, le=100),
     session: Session = Depends(get_session),
 ) -> dict:
-    return list_inventory_snapshots(
-        session,
-        q=q,
-        material_code=material_code,
-        warehouse_code=warehouse_code,
-        low_stock_only=low_stock_only,
-        countable_only=countable_only,
-        measure_type=measure_type,
-        inventory_scope=inventory_scope,
-        threshold=threshold,
-        page=page,
-        page_size=page_size,
-    )
+    try:
+        _apply_db_query_timeout(session, timeout_seconds=30)
+        return list_inventory_snapshots(
+            session,
+            q=q,
+            material_code=material_code,
+            warehouse_code=warehouse_code,
+            low_stock_only=low_stock_only,
+            countable_only=countable_only,
+            measure_type=measure_type,
+            inventory_scope=inventory_scope,
+            threshold=threshold,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as exc:
+        raise _crm_http_error(500, _crm_exception_breadcrumbs(
+            exc,
+            steps=[{"step": "db_query", "status": "fail", "error": str(exc)[:120]}],
+            detail=f"库存数据查询失败: {exc}",
+            resolution="确认 ERP 物料同步是否完成，或联系 IT 运维检查数据库",
+        ))
 
 
 @app.get("/api/products/inventory/warehouses")
@@ -6640,7 +6881,7 @@ def list_product_inventory_warehouses(
     limit: int = Query(30, ge=1, le=100),
     session: Session = Depends(get_session),
 ) -> dict:
-    return list_inventory_warehouses(session, q=q, limit=limit)
+    return list_inventory_warehouse_options(session, q=q, limit=limit)
 
 
 @app.get("/api/products/inventory/types")
@@ -6727,20 +6968,71 @@ def api_import_inventory_excel(file: UploadFile = File(...), session: Session = 
         contents = file.file.read()
         tmp.write(contents)
         tmp_path = tmp.name
-    
+
     try:
-        from backend.app.services.excel_import import import_inventory_excel
-        result = import_inventory_excel(tmp_path, session)
-        session.commit()
-    except Exception as exc:
-        session.rollback()
-        raise HTTPException(status_code=400, detail=str(exc))
+        from backend.app.services.inventory_import_service import import_inventory_excel
+        result = import_inventory_excel(session, tmp_path, operated_by="admin")
+        return result
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-            
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.post("/api/inventory/import")
+def api_inventory_import_upload(file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+    """新版库存Excel导入（支持海外库存总表格式）"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        contents = file.file.read()
+        tmp.write(contents)
+        tmp_path = tmp.name
+    try:
+        from backend.app.services.inventory_import_service import import_inventory_excel
+        result = import_inventory_excel(session, tmp_path, operated_by="admin")
+        return result
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.get("/api/inventory/import-records")
+def api_inventory_import_records(session: Session = Depends(get_session)) -> dict:
+    """获取库存导入历史记录"""
+    from backend.app.services.inventory_import_service import list_import_records
+    return {"items": list_import_records(session)}
+
+
+@app.get("/api/inventory/trends")
+def api_inventory_trends(material_code: str = "", warehouse: str = "", days: int = 90, session: Session = Depends(get_session)) -> dict:
+    """查询库存变化走势"""
+    from backend.app.services.inventory_import_service import get_inventory_trends
+    return {"items": get_inventory_trends(session, material_code=material_code, warehouse=warehouse, days=days)}
+
+
+@app.get("/api/inventory/parse-preview")
+def api_inventory_parse_preview(session: Session = Depends(get_session)) -> dict:
+    """预览最近一次导入的库存数据（调试用）"""
+    from backend.app.services.inventory_import_service import parse_inventory_excel
+    import glob
+    archives = sorted(glob.glob("data/inventory_archives/*.xlsx"), reverse=True)
+    if not archives:
+        return {"ok": False, "error": "暂无归档文件"}
+    result = parse_inventory_excel(archives[0])
     return result
 
+
+@app.get("/api/inventory/template")
+def api_inventory_download_template():
+    """下载库存导入模板（海外库存总表格式）"""
+    import os.path
+    template_path = "data/库存导入模板.xlsx"
+    if not os.path.exists(template_path):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"error": "模板文件不存在"})
+    return FileResponse(template_path, filename="库存导入模板.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.get("/api/products/sku")
@@ -7027,3 +7319,344 @@ def toggle_promotion_api(rule_id: str, is_active: bool = Query(...), session: Se
         session.rollback()
         logger.exception("Error in toggle_promotion_api")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════
+# V2 Phase 1 — 管理台 CRUD API
+# ═══════════════════════════════════════
+
+# ── 主体-仓库映射 ──
+
+@app.get("/api/config/entity-mappings")
+def list_entity_mappings(session: Session = Depends(get_session)) -> dict:
+    items = session.query(EntityMapping).order_by(EntityMapping.entity_code).all()
+    return {"items": [{"id": m.id, "entity_code": m.entity_code, "entity_name": m.entity_name,
+                       "erp_org_id": m.erp_org_id, "warehouses": json.loads(m.warehouses_json) if m.warehouses_json else [],
+                       "finance_notify": json.loads(m.finance_notify_json) if m.finance_notify_json else [],
+                       "is_active": m.is_active} for m in items]}
+
+
+@app.post("/api/config/entity-mappings")
+def upsert_entity_mapping(payload: dict, session: Session = Depends(get_session)) -> dict:
+    code = payload.get("entity_code", "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="entity_code 必填")
+    m = session.query(EntityMapping).filter(EntityMapping.entity_code == code).first()
+    if m is None:
+        m = EntityMapping(entity_code=code)
+        session.add(m)
+    m.entity_name = payload.get("entity_name", m.entity_name)
+    m.erp_org_id = payload.get("erp_org_id", m.erp_org_id)
+    m.warehouses_json = json.dumps(payload.get("warehouses", []), ensure_ascii=False)
+    m.finance_notify_json = json.dumps(payload.get("finance_notify", []), ensure_ascii=False)
+    m.is_active = payload.get("is_active", m.is_active)
+    m.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "entity_code": code}
+
+
+@app.delete("/api/config/entity-mappings/{code}")
+def delete_entity_mapping(code: str, session: Session = Depends(get_session)) -> dict:
+    m = session.query(EntityMapping).filter(EntityMapping.entity_code == code).first()
+    if m is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    session.delete(m)
+    session.commit()
+    return {"ok": True}
+
+
+# ── 客户-主体映射 ──
+
+@app.get("/api/config/customer-entity-mappings")
+def list_customer_entity_mappings(session: Session = Depends(get_session)) -> dict:
+    items = session.query(CustomerEntityMapping).order_by(CustomerEntityMapping.customer_name).all()
+    return {"items": [{"id": m.id, "customer_name": m.customer_name, "entity_code": m.entity_code,
+                       "warehouse": m.warehouse, "remark": m.remark, "is_active": m.is_active} for m in items]}
+
+
+@app.post("/api/config/customer-entity-mappings")
+def upsert_customer_entity_mapping(payload: dict, session: Session = Depends(get_session)) -> dict:
+    name = payload.get("customer_name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="customer_name 必填")
+    m = session.query(CustomerEntityMapping).filter(CustomerEntityMapping.customer_name == name).first()
+    if m is None:
+        m = CustomerEntityMapping(customer_name=name)
+        session.add(m)
+    m.entity_code = payload.get("entity_code", m.entity_code)
+    m.warehouse = payload.get("warehouse", m.warehouse)
+    m.remark = payload.get("remark", "")
+    m.is_active = payload.get("is_active", m.is_active)
+    m.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "customer_name": name}
+
+
+@app.delete("/api/config/customer-entity-mappings/{name}")
+def delete_customer_entity_mapping(name: str, session: Session = Depends(get_session)) -> dict:
+    m = session.query(CustomerEntityMapping).filter(CustomerEntityMapping.customer_name == name).first()
+    if m is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    session.delete(m)
+    session.commit()
+    return {"ok": True}
+
+
+# ── CRM 业务类型-主体映射 ──
+@app.get("/api/config/crm-business-type-mappings")
+def list_crm_business_type_mappings(session: Session = Depends(get_session)) -> dict:
+    from backend.app.models import CrmBusinessTypeMapping
+    items = session.query(CrmBusinessTypeMapping).order_by(CrmBusinessTypeMapping.business_type_code).all()
+    return {"items": [{"id": m.id, "business_type_code": m.business_type_code, "business_type_name": m.business_type_name,
+                       "entity_code": m.entity_code, "is_active": m.is_active} for m in items]}
+
+
+@app.post("/api/config/crm-business-type-mappings")
+def upsert_crm_business_type_mapping(payload: dict, session: Session = Depends(get_session)) -> dict:
+    from backend.app.models import CrmBusinessTypeMapping
+    code = payload.get("business_type_code", "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="business_type_code 必填")
+    m = session.query(CrmBusinessTypeMapping).filter(CrmBusinessTypeMapping.business_type_code == code).first()
+    if m is None:
+        m = CrmBusinessTypeMapping(business_type_code=code)
+        session.add(m)
+    m.business_type_name = payload.get("business_type_name", m.business_type_name or "")
+    m.entity_code = payload.get("entity_code", m.entity_code or "")
+    m.is_active = payload.get("is_active", m.is_active)
+    m.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "business_type_code": code}
+
+
+@app.delete("/api/config/crm-business-type-mappings/{code}")
+def delete_crm_business_type_mapping(code: str, session: Session = Depends(get_session)) -> dict:
+    from backend.app.models import CrmBusinessTypeMapping
+    m = session.query(CrmBusinessTypeMapping).filter(CrmBusinessTypeMapping.business_type_code == code).first()
+    if m is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    session.delete(m)
+    session.commit()
+    return {"ok": True}
+
+
+# ── 产品价格（按主体维度） ──
+
+@app.get("/api/config/product-prices")
+def list_product_prices(entity_code: str = "", sku_id: str = "", page: int = 1, page_size: int = 100, session: Session = Depends(get_session)) -> dict:
+    q = session.query(ProductPrice)
+    if entity_code:
+        q = q.filter(ProductPrice.entity_code == entity_code)
+    if sku_id:
+        q = q.filter(ProductPrice.sku_id.like(f"%{sku_id}%"))
+    total = q.count()
+    items = q.order_by(ProductPrice.sku_id, ProductPrice.entity_code).offset((page - 1) * page_size).limit(page_size).all()
+    return {"items": [{"id": p.id, "sku_id": p.sku_id, "entity_code": p.entity_code,
+                       "unit_price": p.unit_price, "currency": p.currency, "is_active": p.is_active} for p in items],
+            "total": total}
+
+
+@app.post("/api/config/product-prices")
+def upsert_product_price(payload: dict, session: Session = Depends(get_session)) -> dict:
+    sku_id = payload.get("sku_id", "").strip()
+    entity = payload.get("entity_code", "").strip()
+    if not sku_id or not entity:
+        raise HTTPException(status_code=400, detail="sku_id 和 entity_code 必填")
+    p = session.query(ProductPrice).filter(ProductPrice.sku_id == sku_id, ProductPrice.entity_code == entity).first()
+    if p is None:
+        p = ProductPrice(sku_id=sku_id, entity_code=entity)
+        session.add(p)
+    p.unit_price = int(payload.get("unit_price", p.unit_price or 0))
+    p.currency = payload.get("currency", p.currency or "CNY")
+    p.is_active = payload.get("is_active", p.is_active)
+    p.updated_at = now_utc()
+    session.commit()
+    return {"ok": True}
+
+
+# ── 收件人配置 ──
+
+@app.get("/api/config/mail-receivers")
+def list_mail_receivers(session: Session = Depends(get_session)) -> dict:
+    items = session.query(MailReceiverConfig).order_by(MailReceiverConfig.scene).all()
+    return {"items": [{"id": r.id, "scene": r.scene, "to": json.loads(r.to_json) if r.to_json else [],
+                       "cc": json.loads(r.cc_json) if r.cc_json else [], "is_active": r.is_active} for r in items]}
+
+
+@app.post("/api/config/mail-receivers")
+def upsert_mail_receiver(payload: dict, session: Session = Depends(get_session)) -> dict:
+    scene = payload.get("scene", "").strip()
+    if not scene:
+        raise HTTPException(status_code=400, detail="scene 必填")
+    r = session.query(MailReceiverConfig).filter(MailReceiverConfig.scene == scene).first()
+    if r is None:
+        r = MailReceiverConfig(scene=scene)
+        session.add(r)
+    r.to_json = json.dumps(payload.get("to", []), ensure_ascii=False)
+    r.cc_json = json.dumps(payload.get("cc", []), ensure_ascii=False)
+    r.is_active = payload.get("is_active", r.is_active)
+    r.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "scene": scene}
+
+
+# ── 仓库-主体映射 ──
+
+@app.get("/api/config/warehouse-entity")
+def list_warehouse_entity(session: Session = Depends(get_session)) -> dict:
+    items = session.query(WarehouseEntityMapping).order_by(WarehouseEntityMapping.warehouse).all()
+    return {"items": [{"id": m.id, "warehouse": m.warehouse, "entity_code": m.entity_code, "is_active": m.is_active} for m in items]}
+
+
+@app.post("/api/config/warehouse-entity")
+def upsert_warehouse_entity(payload: dict, session: Session = Depends(get_session)) -> dict:
+    wh = payload.get("warehouse", "").strip()
+    if not wh:
+        raise HTTPException(status_code=400, detail="warehouse 必填")
+    m = session.query(WarehouseEntityMapping).filter(WarehouseEntityMapping.warehouse == wh).first()
+    if m is None:
+        m = WarehouseEntityMapping(warehouse=wh)
+        session.add(m)
+    m.entity_code = payload.get("entity_code", m.entity_code)
+    m.is_active = payload.get("is_active", m.is_active)
+    m.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "warehouse": wh}
+
+
+# ── 物料例外表 ──
+
+@app.get("/api/config/material-entity")
+def list_material_entity(session: Session = Depends(get_session)) -> dict:
+    items = session.query(MaterialEntityException).order_by(MaterialEntityException.material_code).all()
+    return {"items": [{"id": m.id, "material_code": m.material_code, "entity_code": m.entity_code, "is_active": m.is_active} for m in items]}
+
+
+@app.post("/api/config/material-entity")
+def upsert_material_entity(payload: dict, session: Session = Depends(get_session)) -> dict:
+    mc = payload.get("material_code", "").strip()
+    if not mc:
+        raise HTTPException(status_code=400, detail="material_code 必填")
+    m = session.query(MaterialEntityException).filter(MaterialEntityException.material_code == mc).first()
+    if m is None:
+        m = MaterialEntityException(material_code=mc)
+        session.add(m)
+    m.entity_code = payload.get("entity_code", m.entity_code)
+    m.is_active = payload.get("is_active", m.is_active)
+    m.updated_at = now_utc()
+    session.commit()
+    return {"ok": True, "material_code": mc}
+
+
+# ── 库存 Excel 导入 ──
+
+@app.post("/api/inventory/import-excel")
+def import_inventory_excel(data: dict, session: Session = Depends(get_session)) -> dict:
+    """导入库存数据（由前端上传解析后的 JSON 数据）"""
+    rows = data.get("rows", [])
+    warehouse = data.get("warehouse", "").strip()
+    if not rows or not warehouse:
+        raise HTTPException(status_code=400, detail="rows 和 warehouse 必填")
+    created = updated = 0
+    ts = now_utc()
+    for row in rows:
+        mat_code = str(row.get("material_code") or row.get("物料编码") or "").strip()
+        mat_name = str(row.get("material_name") or row.get("物料名称") or "").strip()
+        qty = float(row.get("quantity") or row.get("库存数量") or 0)
+        if not mat_code:
+            continue
+        snap = session.query(ProductInventorySnapshot).filter(
+            ProductInventorySnapshot.material_code == mat_code,
+            ProductInventorySnapshot.warehouse_code == warehouse,
+        ).first()
+        if snap is None:
+            snap = ProductInventorySnapshot(material_code=mat_code, warehouse_code=warehouse)
+            session.add(snap)
+            created += 1
+        else:
+            updated += 1
+        snap.material_name = mat_name or snap.material_name
+        snap.warehouse_name = warehouse
+        snap.qty = qty
+        snap.base_qty = qty
+        snap.synced_at = ts
+        snap.status = "Active"
+        snap.updated_at = ts
+    session.commit()
+    return {"ok": True, "warehouse": warehouse, "created": created, "updated": updated, "total": len(rows)}
+
+
+@app.get("/api/inventory/snapshots")
+def list_raw_inventory_snapshots(
+    warehouse: str = "",
+    q: str = "",
+    stock_status: str = "",
+    page: int = 1,
+    page_size: int = 50,
+    include_total: bool = False,
+    session: Session = Depends(get_session),
+) -> dict:
+    try:
+        page = max(1, page)
+        page_size = max(1, min(page_size, 200))
+        q_obj = session.query(ProductInventorySnapshot)
+        if warehouse:
+            q_obj = q_obj.filter(ProductInventorySnapshot.warehouse_code == warehouse)
+        if stock_status == "out_of_stock":
+            q_obj = q_obj.filter(ProductInventorySnapshot.qty <= 0)
+        if q.strip():
+            pattern = f"%{q.strip()}%"
+            from sqlalchemy import or_
+            q_obj = q_obj.filter(
+                or_(
+                    ProductInventorySnapshot.material_code.like(pattern),
+                    ProductInventorySnapshot.material_name.like(pattern),
+                    ProductInventorySnapshot.warehouse_code.like(pattern),
+                )
+            )
+        rows = (
+            q_obj.with_entities(
+                ProductInventorySnapshot.id,
+                ProductInventorySnapshot.material_code,
+                ProductInventorySnapshot.material_name,
+                ProductInventorySnapshot.warehouse_code,
+                ProductInventorySnapshot.qty,
+                ProductInventorySnapshot.synced_at,
+            )
+            .order_by(ProductInventorySnapshot.warehouse_code, ProductInventorySnapshot.material_code)
+            .offset((page - 1) * page_size)
+            .limit(page_size + 1)
+            .all()
+        )
+        has_more = len(rows) > page_size
+        items = rows[:page_size]
+        if include_total:
+            total = q_obj.order_by(None).count()
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            total_estimated = False
+        else:
+            total = (page - 1) * page_size + len(items) + (1 if has_more else 0)
+            total_pages = page + (1 if has_more else 0)
+            total_estimated = has_more
+        return {
+            "items": [{"id": s.id, "material_code": s.material_code, "material_name": s.material_name or "",
+                       "warehouse_code": s.warehouse_code, "qty": s.qty, "synced_at": s.synced_at.isoformat() if s.synced_at else None} for s in items],
+            "total": total,
+            "total_estimated": total_estimated,
+            "has_more": has_more,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    except Exception as e:
+        logger.exception("库存快照查询失败")
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0, "error": str(e)}
+
+
+@app.get("/api/inventory/warehouses")
+def list_inventory_warehouses(session: Session = Depends(get_session)) -> dict:
+    try:
+        rows = session.query(ProductInventorySnapshot.warehouse_code).distinct().order_by(ProductInventorySnapshot.warehouse_code).all()
+        return {"warehouses": [r[0] for r in rows if r[0]]}
+    except Exception as e:
+        return {"warehouses": []}

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -38,6 +42,10 @@ from backend.app.services.crm_attachment_extraction import enrich_order_from_reg
 from backend.app.services.exception_diagnosis import enqueue_exception_diagnosis
 from backend.app.services.address_quality import is_detailed_receipt_address
 from backend.app.services.oms.jackyun_client import JackyunConfigError, jackyun_client_from_session
+from backend.app.services.erp.kingdee_client import KingdeeClient, kingdee_config_from_session, KingdeeConfigError, normalize_query_rows
+from backend.app.services.erp.sales_order_mapper import build_sales_order_model, should_skip_erp_billing
+from backend.app.services.order_no_generator import generate_middle_order_no
+from backend.app.services.mail_template_service import enqueue_delivery_notice_mail
 from backend.app.services.products import match_sku_by_product_name
 from backend.app.services.jsonutil import dumps, loads
 from backend.app.services.storage import save_attachment
@@ -58,6 +66,7 @@ from backend.app.models import (
     ProcessingJob,
     ProductSKU,
     SystemConfig,
+    User,
     now_utc,
 )
 
@@ -125,6 +134,11 @@ class OrderStatus(str, Enum):
     VALIDATING = "VALIDATING"
     VALIDATION_BLOCKED = "VALIDATION_BLOCKED"
     VALIDATED = "VALIDATED"
+    # ERP 制单状态（一期新增）
+    ERP_PENDING = "ERP_PENDING"
+    ERP_SAVING = "ERP_SAVING"
+    ERP_SAVED = "ERP_SAVED"
+    ERP_FAILED = "ERP_FAILED"
     DELIVERY_NOTICE_READY = "DELIVERY_NOTICE_READY"
     OMS_PENDING = "OMS_PENDING"
     OMS_RETRYING = "OMS_RETRYING"
@@ -148,6 +162,13 @@ class OrderEvent(str, Enum):
     RULES_PASSED = "RulesPassed"
     RULES_FAILED_CRITICAL = "RulesFailedCritical"
     EXCEPTION_RESOLVED_AND_REVALIDATE = "ExceptionResolvedAndRevalidate"
+    # ERP 制单事件（一期新增）
+    ERP_SAVE_STARTED = "ErpSaveStarted"
+    ERP_SAVE_SUCCESS = "ErpSaveSuccess"
+    ERP_SAVE_FAILED = "ErpSaveFailed"
+    ERP_SUBMIT_FAILED = "ErpSubmitFailed"
+    ERP_AUDIT_FAILED = "ErpAuditFailed"
+    EXCEPTION_RESOLVED_AND_RE_ERP = "ExceptionResolvedAndReErp"
     DELIVERY_NOTICE_CREATED = "DeliveryNoticeCreated"
     ENQUEUE_OMS_PUSH = "EnqueueOmsPush"
     OMS_PUSH_SUCCESS = "OmsPushSuccess"
@@ -210,6 +231,10 @@ STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
     (OrderStatus.IMPORTED, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
     (OrderStatus.VALIDATION_BLOCKED, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
     (OrderStatus.VALIDATED, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
+    (OrderStatus.ERP_PENDING, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
+    (OrderStatus.ERP_SAVING, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
+    (OrderStatus.ERP_SAVED, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
+    (OrderStatus.ERP_FAILED, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.IMPORTED,
     (OrderStatus.DELIVERY_NOTICE_READY, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.VALIDATION_BLOCKED,
     (OrderStatus.OMS_PENDING, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.VALIDATION_BLOCKED,
     (OrderStatus.OMS_RETRYING, OrderEvent.CRM_SNAPSHOT_CHANGED): OrderStatus.VALIDATION_BLOCKED,
@@ -218,6 +243,15 @@ STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
     (OrderStatus.VALIDATING, OrderEvent.RULES_PASSED): OrderStatus.VALIDATED,
     (OrderStatus.VALIDATING, OrderEvent.RULES_FAILED_CRITICAL): OrderStatus.VALIDATION_BLOCKED,
     (OrderStatus.VALIDATION_BLOCKED, OrderEvent.EXCEPTION_RESOLVED_AND_REVALIDATE): OrderStatus.VALIDATING,
+    # ERP 制单跃迁（一期新增）
+    (OrderStatus.VALIDATED, OrderEvent.ERP_SAVE_STARTED): OrderStatus.ERP_PENDING,
+    (OrderStatus.ERP_PENDING, OrderEvent.ERP_SAVE_STARTED): OrderStatus.ERP_SAVING,
+    (OrderStatus.ERP_SAVING, OrderEvent.ERP_SAVE_SUCCESS): OrderStatus.ERP_SAVED,
+    (OrderStatus.ERP_SAVING, OrderEvent.ERP_SAVE_FAILED): OrderStatus.ERP_FAILED,
+    (OrderStatus.ERP_SAVING, OrderEvent.ERP_SUBMIT_FAILED): OrderStatus.ERP_FAILED,
+    (OrderStatus.ERP_SAVING, OrderEvent.ERP_AUDIT_FAILED): OrderStatus.ERP_FAILED,
+    (OrderStatus.ERP_FAILED, OrderEvent.EXCEPTION_RESOLVED_AND_RE_ERP): OrderStatus.ERP_PENDING,
+    (OrderStatus.ERP_SAVED, OrderEvent.DELIVERY_NOTICE_CREATED): OrderStatus.DELIVERY_NOTICE_READY,
     (OrderStatus.VALIDATED, OrderEvent.DELIVERY_NOTICE_CREATED): OrderStatus.DELIVERY_NOTICE_READY,
     (OrderStatus.DELIVERY_NOTICE_READY, OrderEvent.ENQUEUE_OMS_PUSH): OrderStatus.OMS_PENDING,
     (OrderStatus.OMS_PENDING, OrderEvent.OMS_PUSH_SUCCESS): OrderStatus.OMS_ACCEPTED,
@@ -282,6 +316,143 @@ def transition_order(
             ),
         )
     )
+
+
+# ══════════════════════════════════════════════
+# ERP 制单处理（一期新增）
+# ══════════════════════════════════════════════
+
+def _erp_config_ready(session: Session) -> bool:
+    """检查金蝶写入配置是否就绪"""
+    enabled = session.get(SystemConfig, "erp_write_enabled")
+    if not enabled or enabled.value != "true":
+        return False
+    try:
+        kingdee_config_from_session(session)
+        return True
+    except KingdeeConfigError:
+        return False
+
+
+def process_erp_billing(session: Session, order: MiddlePlatformOrder, *, trace_id: str = "") -> dict[str, Any]:
+    """执行 ERP 制单全流程：Save → Submit → Audit
+
+    预审通过后调用。备货→武汉仓跳过此流程。
+    """
+    if should_skip_erp_billing(order):
+        transition_order(session, order, OrderEvent.DELIVERY_NOTICE_CREATED, trace_id=trace_id)
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_skipped": True}
+
+    if not _erp_config_ready(session):
+        transition_order(session, order, OrderEvent.ERP_SAVE_FAILED, trace_id=trace_id,
+                         detail={"reason": "金蝶写入未配置", "error_type": "KingdeeConfigError"})
+        create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
+                              "ERP 制单失败：金蝶写入未配置", [], trace_id=trace_id)
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": "金蝶写入未配置"}
+
+    # 预审通过后分配订单号
+    order.order_no = generate_middle_order_no(session)
+    transition_order(session, order, OrderEvent.ERP_SAVE_STARTED, trace_id=trace_id)
+    session.flush()
+
+    try:
+        config = kingdee_config_from_session(session)
+        client = KingdeeClient(config)
+
+        # Step 1: Save
+        bill_model = build_sales_order_model(session, order, order.items)
+        save_result = client.save_bill(
+            form_id="SAL_SaleOrder",
+            model=bill_model,
+            need_return_fields=["FBillNo", "FDate"],
+        )
+        if not save_result.get("ok"):
+            error_msg = save_result.get("message") or "金蝶 Save 失败"
+            result = save_result.get("result")
+            if isinstance(result, dict):
+                rs = result.get("ResponseStatus")
+                if isinstance(rs, dict):
+                    errors = rs.get("Errors", [])
+                    if isinstance(errors, list):
+                        details = [str(e.get("Message", "") or e.get("FieldName", "") or e) for e in errors if isinstance(e, dict)]
+                        if details:
+                            error_msg = f"{error_msg} | {'; '.join(details)}"
+            transition_order(session, order, OrderEvent.ERP_SAVE_FAILED, trace_id=trace_id,
+                             detail={"step": "save", "error": error_msg})
+            create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
+                                  f"ERP 制单失败(Save)：{error_msg}", [], trace_id=trace_id)
+            return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
+        # 提取金蝶 FBillNo
+        erp_bill_no = None
+        rd = save_result.get("result")
+        if isinstance(rd, dict):
+            erp_bill_no = rd.get("Number")
+        if erp_bill_no:
+            order.erp_bill_no = erp_bill_no
+
+        # Step 2: Submit
+        bill_id = rd.get("Id") if isinstance(rd, dict) else None
+        if bill_id:
+            sub_result = client.submit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_id])
+            if not sub_result.get("ok"):
+                error_msg = sub_result.get("message") or "金蝶 Submit 失败"
+                transition_order(session, order, OrderEvent.ERP_SUBMIT_FAILED, trace_id=trace_id,
+                                 detail={"step": "submit", "error": error_msg, "bill_id": bill_id})
+                create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
+                                      f"ERP 制单失败(Submit)：{error_msg}", [], trace_id=trace_id)
+                return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
+            # Step 3: Audit
+            aud_result = client.audit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_id])
+            if not aud_result.get("ok"):
+                error_msg = aud_result.get("message") or "金蝶 Audit 失败（可能是审批流阻塞）"
+                transition_order(session, order, OrderEvent.ERP_AUDIT_FAILED, trace_id=trace_id,
+                                 detail={"step": "audit", "error": error_msg, "bill_id": bill_id})
+                create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
+                                      f"ERP 制单失败(Audit)：{error_msg}", [], trace_id=trace_id)
+                return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
+        # 全部成功
+        transition_order(session, order, OrderEvent.ERP_SAVE_SUCCESS, trace_id=trace_id,
+                         detail={"erp_bill_no": erp_bill_no})
+
+        # 触发发货通知邮件（一期核心：ERP 制单成功后自动通知物流）
+        try:
+            warehouse_code = ""
+            notice = latest_delivery_notice(session, order)
+            if notice and notice.warehouse_code:
+                warehouse_code = notice.warehouse_code
+            enqueue_delivery_notice_mail(
+                session, order, order.items,
+                warehouse=warehouse_code,
+                special_requirements=None,
+            )
+        except Exception as mail_exc:
+            logger.warning("发送发货通知邮件失败（不影响主流程）: %s", mail_exc)
+
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": True, "erp_bill_no": erp_bill_no}
+
+    except KingdeeConfigError as exc:
+        error_msg = f"金蝶配置错误：{exc}"
+        transition_order(session, order, OrderEvent.ERP_SAVE_FAILED, trace_id=trace_id,
+                         detail={"step": "config", "error": error_msg})
+        create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High", error_msg, [], trace_id=trace_id)
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+    except Exception as exc:
+        error_msg = f"ERP 制单异常：{exc}"
+        transition_order(session, order, OrderEvent.ERP_SAVE_FAILED, trace_id=trace_id,
+                         detail={"step": "exception", "error": error_msg})
+        create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High", error_msg, [], trace_id=trace_id)
+        return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
+
+def retry_erp_billing(session: Session, order: MiddlePlatformOrder, *, trace_id: str = "") -> dict[str, Any]:
+    """重试 ERP 制单（从 ERP_FAILED → ERP_PENDING → 重新制单）"""
+    if order.status != OrderStatus.ERP_FAILED.value:
+        return {"order_id": order.id, "error": f"当前状态不允许重试：{order.status}"}
+    transition_order(session, order, OrderEvent.EXCEPTION_RESOLVED_AND_RE_ERP, trace_id=trace_id)
+    return process_erp_billing(session, order, trace_id=trace_id)
 
 
 def crm_order_parsed_event(crm_order: CrmSalesOrder, *, trace_id: str | None = None) -> dict[str, Any]:
@@ -413,8 +584,18 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
             return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "validation_passed": False}
         transition_order(session, order, OrderEvent.RULES_PASSED, trace_id=trace_id)
 
+    # ── ERP 制单（预审通过后自动执行）──
     notice = None
-    if order.status == OrderStatus.VALIDATED.value:
+    if order.status == OrderStatus.VALIDATED.value and config_bool(session, "erp_write_enabled", False):
+        erp_result = process_erp_billing(session, order, trace_id=trace_id)
+        if erp_result.get("erp_skipped"):
+            pass  # 备货→武汉仓跳过制单，直接到发货通知
+        elif not erp_result.get("erp_success"):
+            return {"order_id": order.id, "order_no": order.order_no, "status": order.status,
+                    "validation_passed": True, "erp_success": False, "erp_error": erp_result.get("error")}
+
+    # ── 发货通知（ERP_SAVED 后或跳过制单时）──
+    if order.status in {OrderStatus.ERP_SAVED.value, OrderStatus.VALIDATED.value}:
         if is_platform_fulfilled_order(order, crm_order):
             archive_platform_fulfilled_order(session, order, crm_order, trace_id=trace_id)
         else:
@@ -493,6 +674,41 @@ def handle_crm_snapshot_changed(
         expire_delivery_notices(session, order, reason="crm_snapshot_changed")
         transition_order(session, order, OrderEvent.CRM_SNAPSHOT_CHANGED, trace_id=trace_id, detail=detail)
         return {"continue_processing": True}
+
+    # ERP_SAVED + CRM 变更 → Q6：先物理冲销金蝶单据，再退回预审
+    if status == OrderStatus.ERP_SAVED:
+        if order.erp_bill_no:
+            try:
+                config = kingdee_config_from_session(session)
+                client = KingdeeClient(config)
+                # 通过 FBillNo 查询单据内码
+                query_result = client.execute_bill_query(
+                    form_id="SAL_SaleOrder",
+                    field_keys="FID,FBillNo",
+                    filter_string=f"FBillNo = '{order.erp_bill_no}'",
+                    limit=1,
+                )
+                bill_internal_id = None
+                items = normalize_query_rows(query_result.get("raw"))
+                if items and isinstance(items, list) and len(items) > 0:
+                    row = items[0]
+                    if isinstance(row, list) and len(row) > 0:
+                        bill_internal_id = row[0]
+                if bill_internal_id:
+                    unaudit_r = client.un_audit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_internal_id])
+                    if not unaudit_r.get("ok"):
+                        logger.warning("Q6 UnAudit 失败: %s", unaudit_r.get("message"))
+                    cancel_r = client.cancel_bill(form_id="SAL_SaleOrder", bill_ids=[bill_internal_id])
+                    if not cancel_r.get("ok"):
+                        logger.warning("Q6 Cancel 失败: %s", cancel_r.get("message"))
+                else:
+                    logger.warning("Q6 未找到金蝶单据: %s", order.erp_bill_no)
+            except Exception as exc:
+                logger.warning("Q6 ERP 冲销异常（不影响流程继续）: %s", exc)
+
+        expire_delivery_notices(session, order, reason="crm_snapshot_changed_after_erp_saved")
+        transition_order(session, order, OrderEvent.CRM_SNAPSHOT_CHANGED, trace_id=trace_id, detail=detail | {"q6_erp_reverted": True})
+        return {"continue_processing": True, "q6_erp_reverted": True}
 
     if status == OrderStatus.DELIVERY_NOTICE_READY:
         expire_delivery_notices(session, order, reason="crm_snapshot_changed_before_oms_push")
@@ -733,7 +949,7 @@ def upsert_middle_platform_order(session: Session, crm_order: CrmSalesOrder) -> 
     )
     if order is None:
         order = MiddlePlatformOrder(
-            order_no=generate_middle_order_no(crm_order),
+            order_no=_generate_temp_order_no(crm_order),
             source_system=crm_order.source_system,
             crm_sales_order_id=crm_order.id,
             crm_order_id=crm_order.crm_order_id,
@@ -755,6 +971,11 @@ def upsert_middle_platform_order(session: Session, crm_order: CrmSalesOrder) -> 
     order.sales_user_name = crm_order.sales_user_name
     order.currency = crm_order.currency or "CNY"
     order.order_amount = parse_decimal(crm_order.order_amount)
+    # 订单类型自动识别（FR-003）：优先取 CRM 原始类型，否则金额>0+有附件=销售，其余=备货
+    order.order_type = infer_order_type(crm_order)
+    # 主体编码：从 CRM 结算方式/客户渠道推断
+    order.entity_code = _infer_entity_code(crm_order)
+    order.fulfillment_entity = infer_fulfillment_entity(crm_order, order.entity_code)
     order.updated_at = now_utc()
     sync_middle_order_items(session, order, crm_order)
     session.flush()
@@ -762,7 +983,121 @@ def upsert_middle_platform_order(session: Session, crm_order: CrmSalesOrder) -> 
     return order
 
 
-def generate_middle_order_no(crm_order: CrmSalesOrder) -> str:
+def _infer_entity_code(crm_order: CrmSalesOrder) -> str:
+    """从 CRM 订单数据推断主体编码
+
+    优先通过 CRM 业务类型 (record_type) 进行精确映射；
+    如果没有匹配，则通过归属部门、结算方式和币种进行推断兜底。
+    """
+    raw = loads(crm_order.raw_json, {})
+    record_type = None
+    if isinstance(raw, dict):
+        if "detail_raw" in raw and isinstance(raw["detail_raw"], dict):
+            val = raw["detail_raw"].get("Value", {})
+            if isinstance(val, dict):
+                data = val.get("data", {})
+                if isinstance(data, dict):
+                    record_type = data.get("record_type")
+        if not record_type:
+            record_type = raw.get("record_type")
+
+    from sqlalchemy.orm import object_session
+    from backend.app.models import CrmBusinessTypeMapping
+    session = object_session(crm_order)
+    if session and record_type:
+        mapping = session.query(CrmBusinessTypeMapping).filter(
+            CrmBusinessTypeMapping.business_type_code == record_type,
+            CrmBusinessTypeMapping.is_active == True
+        ).first()
+        if mapping:
+            return mapping.entity_code
+
+    # CRM 业务类型 (record_type) -> 主体编码
+    record_type_mapping = {
+        "record_hnH91__c": "SZ",     # 深圳积木易搭科技技术有限公司
+        "default__c": "SZ",          # 家e搭软件订单
+        "record_s417r__c": "HK",     # 香港积木易搭订单
+        "record_ltF03__c": "US",     # 美国积木易搭订单
+        "record_a60d1__c": "WH_RX",  # 武汉睿数订单
+        "record_3fYB1__c": "WH",     # 武汉尺子订单
+        "record_UqY5M__c": "SZ_3D",  # 积木三维订单
+        "record_ib3Iw__c": "GZ",     # 广州积木易搭订单
+    }
+
+    if record_type in record_type_mapping:
+        return record_type_mapping[record_type]
+
+    # 兜底规则 1: 部门名称包含睿数
+    dept = (crm_order.owner_department or "").strip()
+    if "睿数" in dept or "ruishu" in dept.lower():
+        return "WH_RX"
+
+    # 兜底规则 2: 海外币种/结算方式推断
+    settlement = (crm_order.settlement_method or "").strip()
+    currency = (crm_order.currency or "").strip()
+    oversea_keywords = ("海外", "境外", "香港", "美元", "USD", "HKD", "欧元", "EUR", "export", "oversea", "international")
+    if any(kw in settlement.lower() for kw in oversea_keywords if kw.isascii()) or \
+       any(kw in settlement for kw in oversea_keywords if not kw.isascii()):
+        return "HK"
+    if currency in ("USD", "HKD", "EUR"):
+        return "HK"
+    return "SZ"
+
+
+def infer_order_type(crm_order: CrmSalesOrder) -> str:
+    raw = loads(crm_order.raw_json, {})
+    raw_type = raw_text_from_keys(raw, ["order_type", "orderType", "business_type", "businessType", "订单类型", "业务类型"])
+    if raw_type:
+        normalized = raw_type.strip().lower()
+        if normalized in {"sales_order", "sale", "sales", "销售订单"} or "销售" in raw_type:
+            return "SALES_ORDER"
+        if normalized in {"stock_replenishment", "stock", "replenishment", "备货订单"} or any(token in raw_type for token in ("备货", "补货")):
+            return "STOCK_REPLENISHMENT"
+
+    has_attachments = bool(crm_order.attachment_files_json and crm_order.attachment_files_json != "[]")
+    amount = parse_decimal(crm_order.order_amount) or 0
+    return "SALES_ORDER" if amount > 0 and has_attachments else "STOCK_REPLENISHMENT"
+
+
+def infer_fulfillment_entity(crm_order: CrmSalesOrder, entity_code: str | None) -> str | None:
+    raw = loads(crm_order.raw_json, {})
+    return raw_text_from_keys(
+        raw,
+        [
+            "fulfillment_entity",
+            "fulfillmentEntity",
+            "shipping_entity",
+            "shippingEntity",
+            "warehouse_entity",
+            "warehouseEntity",
+            "出货主体",
+            "发货主体",
+        ],
+    ) or entity_code
+
+
+def ensure_middle_order_business_fields(session: Session, order: MiddlePlatformOrder) -> bool:
+    crm_order = order.crm_order or session.get(CrmSalesOrder, order.crm_sales_order_id)
+    if crm_order is None:
+        return False
+
+    changed = False
+    if not order.order_type:
+        order.order_type = infer_order_type(crm_order)
+        changed = True
+    if not order.entity_code:
+        order.entity_code = _infer_entity_code(crm_order)
+        changed = True
+    if not order.fulfillment_entity:
+        order.fulfillment_entity = infer_fulfillment_entity(crm_order, order.entity_code)
+        changed = True
+    if changed:
+        order.updated_at = now_utc()
+        session.flush()
+    return changed
+
+
+def _generate_temp_order_no(crm_order: CrmSalesOrder) -> str:
     base = re.sub(r"[^A-Za-z0-9_-]+", "-", crm_order.crm_order_no or crm_order.crm_order_id).strip("-")[:42]
     if not base:
         base = hashlib.sha1(crm_order.id.encode("utf-8")).hexdigest()[:10]
@@ -2855,7 +3190,15 @@ def suggested_actions(exception_type: ExceptionType, failed: list[dict[str, Any]
     return ["核对 CRM 订单头字段与附件证据", "处理完成后重新触发订单预审"]
 
 
+# order_dashboard 结果缓存（TTL 30秒），避免每次列表刷新都重复计算全表聚合
+_dashboard_cache: dict[str, Any] = {"result": None, "expires_at": 0.0}
+
+
 def order_dashboard(session: Session) -> dict[str, Any]:
+    now = time.time()
+    if _dashboard_cache["result"] is not None and now < _dashboard_cache["expires_at"]:
+        return _dashboard_cache["result"]
+
     status_counts = {
         status: count
         for status, count in session.query(MiddlePlatformOrder.status, func.count(MiddlePlatformOrder.id)).group_by(MiddlePlatformOrder.status).all()
@@ -2867,7 +3210,7 @@ def order_dashboard(session: Session) -> dict[str, Any]:
     )
     total = sum(status_counts.values())
     passed = sum(status_counts.get(status, 0) for status in [OrderStatus.VALIDATED.value, OrderStatus.DELIVERY_NOTICE_READY.value, OrderStatus.OMS_PENDING.value, OrderStatus.OMS_RETRYING.value, OrderStatus.OMS_ACCEPTED.value, OrderStatus.PICKING.value, OrderStatus.SHIPPED.value, OrderStatus.FULFILLMENT_ARCHIVED.value])
-    return {
+    result = {
         "total_orders": total,
         "status_counts": status_counts,
         "stp_rate": round((passed / total) * 100, 2) if total else 0,
@@ -2875,6 +3218,9 @@ def order_dashboard(session: Session) -> dict[str, Any]:
         "oms_retrying": status_counts.get(OrderStatus.OMS_RETRYING.value, 0),
         "oms_blocked": status_counts.get(OrderStatus.OMS_BLOCKED.value, 0),
     }
+    _dashboard_cache["result"] = result
+    _dashboard_cache["expires_at"] = now + 30.0  # 30 秒 TTL
+    return result
 
 
 def list_middle_orders(session: Session, *, q: str = "", status: str = "", page: int = 1, page_size: int = 20, current_user: User | None = None) -> dict[str, Any]:
@@ -2900,6 +3246,8 @@ def list_middle_orders(session: Session, *, q: str = "", status: str = "", page:
         query = query.filter(MiddlePlatformOrder.status == status.strip())
     total = query.count()
     rows = query.order_by(MiddlePlatformOrder.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    for row in rows:
+        ensure_middle_order_business_fields(session, row)
     return {
         "items": [serialize_middle_order(row, current_user=current_user) for row in rows],
         "total": total,
@@ -2931,6 +3279,10 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "sales_user_name": order.sales_user_name,
         "currency": order.currency,
         "order_amount": "***" if mask else (str(order.order_amount) if order.order_amount is not None else None),
+        "order_type": order.order_type,
+        "entity_code": order.entity_code,
+        "fulfillment_entity": order.fulfillment_entity,
+        "erp_bill_no": order.erp_bill_no,
         "status": order.status,
         "validation_summary": loads(order.validation_summary_json, {}),
         "version": order.version,
@@ -2938,19 +3290,52 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "updated_at": order.updated_at.isoformat() if order.updated_at else None,
     }
     if include_detail:
-        data["items"] = [
-            {
+        crm_order = order.crm_order
+        data["receipt"] = {
+            "contact": crm_order.receipt_contact if crm_order else "",
+            "phone": crm_order.receipt_phone if crm_order else "",
+            "address": crm_order.receipt_address if crm_order else "",
+            "delivery_date": crm_order.delivery_date if crm_order else "",
+            "logistics_status": crm_order.logistics_status if crm_order else "",
+            "shipment_status": crm_order.shipment_status if crm_order else "",
+        }
+        data["flow"] = {
+            "source_policy": order.source_policy,
+            "status": order.status,
+            "imported_at": order.imported_at.isoformat() if order.imported_at else None,
+            "validated_at": order.validated_at.isoformat() if order.validated_at else None,
+            "created_at": order.created_at.isoformat() if order.created_at else None,
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "version": order.version,
+            "erp_bill_no": order.erp_bill_no,
+            "validation_summary": loads(order.validation_summary_json, {}),
+        }
+        from sqlalchemy.orm import object_session
+        from backend.app.models import ProductSPU, ProductSKU
+        session = object_session(order)
+        data["items"] = []
+        for item in order.items:
+            official_name = None
+            if session and item.sku_code:
+                sku_record = session.query(ProductSKU).filter(ProductSKU.sku_id == item.sku_code).first()
+                if sku_record:
+                    spu_record = session.query(ProductSPU).filter(ProductSPU.id == sku_record.spu_uuid).first()
+                    if spu_record:
+                        official_name = spu_record.name
+                        if sku_record.model:
+                            official_name += f"({sku_record.model})"
+            data["items"].append({
                 "id": item.id,
                 "sku_code": item.sku_code,
                 "shop_sku_code": item.shop_sku_code,
                 "channel_code": item.channel_code,
                 "product_name": item.product_name,
+                "official_product_name": official_name,
                 "quantity": str(item.quantity) if item.quantity is not None else None,
                 "unit_price": "***" if mask else (str(item.unit_price) if item.unit_price is not None else None),
                 "line_amount": "***" if mask else (str(item.line_amount) if item.line_amount is not None else None),
-            }
-            for item in order.items
-        ]
+                "logistics": item_logistics_summary(loads(item.raw_json, {})),
+            })
         data["delivery_notices"] = [
             {
                 "id": notice.id,
@@ -2983,6 +3368,17 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
                 "pushed_at": notice.pushed_at.isoformat() if notice.pushed_at else None,
                 "version": notice.version,
             }
-            for notice in order.delivery_notices
+            for notice in sorted(order.delivery_notices, key=lambda row: row.created_at, reverse=True)
         ]
     return data
+
+
+def item_logistics_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "contact": raw_text_from_keys(raw, ["receipt_contact", "receiver_name", "receiverName", "recipient_name", "recipientName", "收货人", "联系人"]),
+        "phone": raw_text_from_keys(raw, ["receipt_phone", "receiver_phone", "receiverPhone", "recipient_phone", "recipientPhone", "收货电话", "联系电话"]),
+        "address": raw_text_from_keys(raw, ["receipt_address", "receiver_address", "receiverAddress", "recipient_address", "recipientAddress", "收货地址", "地址"]),
+        "delivery_date": raw_text_from_keys(raw, ["delivery_date", "deliveryDate", "expected_delivery_date", "expectedDeliveryDate", "期望交期", "交期"]),
+        "shipping_method": raw_text_from_keys(raw, ["shipping_method", "shippingMethod", "delivery_method", "deliveryMethod", "logistics_mode", "logisticsMode", "物流方式", "配送方式"]),
+        "warehouse_code": raw_text_from_keys(raw, ["warehouse_code", "warehouseCode", "warehouse", "仓库"]),
+    }
