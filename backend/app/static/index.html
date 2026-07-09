@@ -497,20 +497,43 @@
         </div>
         <!-- 预审别名 -->
         <div class="tab-content" data-tab-content="review-aliases">
-          <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap;">
-            <input id="ra-upload" type="file" accept=".xlsx" style="width:280px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
-            <button id="ra-preview-btn" class="button">预览导入</button>
-            <button id="ra-confirm-btn" class="button" disabled style="opacity:0.5;">确认导入</button>
-            <span id="ra-status" style="font-size:12px;color:var(--muted);"></span>
+          <!-- 已有别名列表 -->
+          <div style="margin-bottom:16px;">
+            <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap;">
+              <h3 style="margin:0;font-size:14px;">已有别名物料</h3>
+              <input id="ra-search" type="search" placeholder="搜索 SPU 编码/名称..." style="width:220px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
+              <button id="ra-search-btn" class="button ghost">搜索</button>
+              <span id="ra-list-info" style="font-size:12px;color:var(--muted);"></span>
+              <span style="flex:1;"></span>
+              <span id="ra-page-info" style="font-size:12px;color:var(--muted);margin-right:4px;"></span>
+              <button id="ra-prev-btn" class="button ghost" disabled style="padding:4px 10px;">上一页</button>
+              <button id="ra-next-btn" class="button ghost" disabled style="padding:4px 10px;">下一页</button>
+            </div>
+            <div id="ra-list-wrap" style="overflow-x:auto;max-height:420px;overflow-y:auto;"></div>
           </div>
-          <div id="ra-preview-area" style="margin-top:6px;">
-            <div id="ra-summary" style="margin-bottom:10px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);display:none;"></div>
-            <div id="ra-table-wrap" style="overflow-x:auto;"></div>
-          </div>
-          <div style="margin-top:12px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);font-size:12px;color:var(--muted);">
-            <strong>导入说明：</strong>支持上传纷享销客导出的「产品对象新建导入模板」Excel 文件。
-            系统会自动将「产品名称」和「规格型号」作为预审别名导入到对应产品编码的成品 SPU 中，已存在的别名不会重复添加。
-          </div>
+
+          <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;" />
+
+          <!-- 批量导入 -->
+          <details style="margin-bottom:12px;">
+            <summary style="cursor:pointer;font-size:13px;color:var(--accent);font-weight:500;">批量导入别名</summary>
+            <div style="margin-top:12px;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input id="ra-upload" type="file" accept=".xlsx" style="width:280px; padding:6px 10px; border:1px solid var(--line); border-radius:6px;" />
+                <button id="ra-preview-btn" class="button">预览导入</button>
+                <button id="ra-confirm-btn" class="button" disabled style="opacity:0.5;">确认导入</button>
+                <span id="ra-status" style="font-size:12px;color:var(--muted);"></span>
+              </div>
+              <div id="ra-preview-area" style="margin-top:6px;">
+                <div id="ra-summary" style="margin-bottom:10px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);display:none;"></div>
+                <div id="ra-table-wrap" style="overflow-x:auto;"></div>
+              </div>
+              <div style="margin-top:12px;padding:10px 14px;border-radius:6px;background:var(--surface-soft);font-size:12px;color:var(--muted);">
+                <strong>导入说明：</strong>支持上传纷享销客导出的「产品对象新建导入模板」Excel 文件。
+                系统会自动将「产品名称」和「规格型号」作为预审别名导入到对应产品编码的成品 SPU 中，已存在的别名不会重复添加。
+              </div>
+            </div>
+          </details>
         </div>
 
         <!-- CRM 业务类型-主体映射 -->

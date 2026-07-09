@@ -6188,6 +6188,48 @@ def api_review_alias_import_confirm(payload: dict, session: Session = Depends(ge
     return {"message": f"已更新 {result['updated']} 个成品的预审别名", **result}
 
 
+@app.get("/api/review-aliases/list")
+def api_review_alias_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    q: str = Query(""),
+    session: Session = Depends(get_session)
+) -> dict:
+    """分页列出已有预审别名的物料。"""
+    from backend.app.models import ProductSPU
+
+    skip = (page - 1) * page_size
+    query = session.query(ProductSPU).filter(
+        func.coalesce(func.json_array_length(ProductSPU.extended_info_json, '$.review_aliases'), 0) > 0
+    )
+
+    if q.strip():
+        pattern = f"%{q.strip()}%"
+        query = query.filter(
+            or_(ProductSPU.spu_id.ilike(pattern), ProductSPU.name.ilike(pattern))
+        )
+
+    total = query.count()
+    items = query.order_by(ProductSPU.updated_at.desc()).offset(skip).limit(page_size).all()
+
+    return {
+        "items": [
+            {
+                "spu_id": spu.spu_id,
+                "name": spu.name,
+                "aliases": spu_review_aliases(spu),
+                "alias_count": len(spu_review_aliases(spu)),
+                "updated_at": spu.updated_at.isoformat(),
+            }
+            for spu in items
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+    }
+
+
 def _apply_db_query_timeout(session: Session, timeout_seconds: int = 10) -> None:
     """为当前数据库会话设置查询超时保护（仅 PostgreSQL）。
     SQLite 由 PRAGMA busy_timeout 保护，无需额外设置。

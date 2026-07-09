@@ -7627,7 +7627,9 @@ function initMasterDataPage() {
   if (mdTabs) {
     mdTabs.querySelectorAll('.tab').forEach(function(tab) {
       tab.addEventListener('click', function() {
-        if (this.dataset.tab === 'crm-business-type') loadCBT();
+        var tabName = this.dataset.tab;
+        if (tabName === 'crm-business-type') loadCBT();
+        if (tabName === 'review-aliases') loadAliasesList();
       });
     });
   }
@@ -7637,6 +7639,16 @@ function initMasterDataPage() {
   if (raPreview) raPreview.addEventListener('click', loadAliasesPreview);
   var raConfirm = document.getElementById('ra-confirm-btn');
   if (raConfirm) raConfirm.addEventListener('click', confirmAliasesImport);
+  // 预审别名列表
+  var raSearchBtn = document.getElementById('ra-search-btn');
+  if (raSearchBtn) raSearchBtn.addEventListener('click', function() { _aliasesListState.page = 1; loadAliasesList(); });
+  var raSearch = document.getElementById('ra-search');
+  if (raSearch) raSearch.addEventListener('keydown', function(e) { if (e.key === 'Enter') { _aliasesListState.page = 1; loadAliasesList(); } });
+  var raPrev = document.getElementById('ra-prev-btn');
+  if (raPrev) raPrev.addEventListener('click', function() { if (_aliasesListState.page > 1) { _aliasesListState.page--; loadAliasesList(); } });
+  var raNext = document.getElementById('ra-next-btn');
+  if (raNext) raNext.addEventListener('click', function() { if (_aliasesListState.page < _aliasesListState.totalPages) { _aliasesListState.page++; loadAliasesList(); } });
+  loadAliasesList();
 }
 
 var _aliasesPreviewData = null;
@@ -7714,6 +7726,56 @@ function confirmAliasesImport() {
   });
 }
 
+var _aliasesListState = { page: 1, pageSize: 20, q: '', totalPages: 1, total: 0 };
+
+function loadAliasesList() {
+  var wrap = document.getElementById('ra-list-wrap');
+  var info = document.getElementById('ra-list-info');
+  var pageInfo = document.getElementById('ra-page-info');
+  var prevBtn = document.getElementById('ra-prev-btn');
+  var nextBtn = document.getElementById('ra-next-btn');
+  var searchInput = document.getElementById('ra-search');
+  if (!wrap) return;
+
+  _aliasesListState.q = (searchInput ? searchInput.value : '').trim();
+
+  wrap.innerHTML = '<div style="text-align:center;padding:24px;color:var(--muted);">加载中...</div>';
+
+  var url = '/api/review-aliases/list?page=' + _aliasesListState.page + '&page_size=' + _aliasesListState.pageSize;
+  if (_aliasesListState.q) url += '&q=' + encodeURIComponent(_aliasesListState.q);
+
+  fetch(url, { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      _aliasesListState.totalPages = data.total_pages || 1;
+      _aliasesListState.total = data.total || 0;
+
+      if (info) info.textContent = '共 ' + _aliasesListState.total + ' 个物料';
+      if (pageInfo) pageInfo.textContent = '第 ' + data.page + '/' + data.total_pages + ' 页';
+
+      if (prevBtn) { prevBtn.disabled = _aliasesListState.page <= 1; prevBtn.style.opacity = prevBtn.disabled ? '0.4' : '1'; }
+      if (nextBtn) { nextBtn.disabled = _aliasesListState.page >= _aliasesListState.totalPages; nextBtn.style.opacity = nextBtn.disabled ? '0.4' : '1'; }
+
+      var items = data.items || [];
+      if (!items.length) {
+        wrap.innerHTML = '<div class="empty-note">暂无预审别名数据</div>';
+        return;
+      }
+
+      var html = '<table class="data-table"><thead><tr><th style="width:140px;">产品编码</th><th>SPU 名称</th><th>预审别名</th><th style="width:80px;">数量</th></tr></thead><tbody>';
+      items.forEach(function(item) {
+        var aliasText = (item.aliases || []).join('、') || '-';
+        html += '<tr><td>' + h(item.spu_id) + '</td><td>' + h(item.name) + '</td><td style="max-width:400px;word-break:break-all;"><small>' + h(aliasText) + '</small></td><td style="text-align:center;">' + (item.alias_count || 0) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      wrap.innerHTML = html;
+    })
+    .catch(function(err) {
+      notifyError(err, ['主数据', '加载别名列表失败']);
+      wrap.innerHTML = '<div class="empty-note">加载失败</div>';
+    });
+}
+
 function loadPP() {
   api('/api/config/product-prices?page_size=200').then(function(data) {
     var items = data.items || [];
@@ -7732,42 +7794,53 @@ function loadPP() {
 }
 
 function loadEW() {
-  api('/api/config/warehouse-entity').then(function(data) {
+  api('/api/config/entity-mappings').then(function(data) {
     var items = data.items || [];
-    // 填充主体筛选下拉
     var filter = document.getElementById('ew-entity-filter');
     if (filter) {
-      var entities = {};
-      items.forEach(function(m) { entities[m.entity_code] = 1; });
       var fhtml = '<option value="">全部主体</option>';
-      Object.keys(entities).sort().forEach(function(e) { fhtml += '<option value="' + e + '">' + e + '</option>'; });
+      items.forEach(function(m) { fhtml += '<option value="' + m.entity_code + '">' + m.entity_code + ' - ' + m.entity_name + '</option>'; });
       filter.innerHTML = fhtml;
       filter.onchange = function() { loadEWFilter(); };
     }
     renderEWTable(items);
-  }).catch(function() {});
+  }).catch(function(e) { notifyError(e, ['主数据', '加载主体-仓库映射失败']); });
 }
 
 function loadEWFilter() {
   var entity = (document.getElementById('ew-entity-filter') || {}).value || '';
-  api('/api/config/warehouse-entity').then(function(data) {
+  api('/api/config/entity-mappings').then(function(data) {
     var items = data.items || [];
     if (entity) items = items.filter(function(m) { return m.entity_code === entity; });
     renderEWTable(items);
-  }).catch(function() {});
+  }).catch(function(e) { notifyError(e, ['主数据', '加载主体-仓库映射失败']); });
 }
 
 function renderEWTable(items) {
-  var html = '<table class="data-table"><thead><tr><th>仓库</th><th>出货主体</th><th>操作</th></tr></thead><tbody>';
+  var html = '<table class="data-table"><thead><tr><th>主体编码</th><th>主体名称</th><th>ERP 组织ID</th><th>关联仓库</th><th>状态</th><th>操作</th></tr></thead><tbody>';
   items.forEach(function(m) {
-    html += '<tr><td>' + m.warehouse + '</td><td>' + m.entity_code + '</td>' +
-      '<td><a href="#" class="ew-edit" data-wh="' + m.warehouse + '" data-ent="' + m.entity_code + '">编辑</a></td></tr>';
+    var whs = (m.warehouses || []).map(function(w) { return w.warehouse_name || w.warehouse_code || w; }).join('、') || '-';
+    var statusHtml = m.is_active !== false ? '<span class="status-tag success">启用</span>' : '<span class="status-tag muted">禁用</span>';
+    html += '<tr><td>' + h(m.entity_code) + '</td><td>' + h(m.entity_name) + '</td><td>' + h(m.erp_org_id || '-') + '</td>' +
+      '<td><small>' + h(whs) + '</small></td><td>' + statusHtml + '</td>' +
+      '<td><a href="#" class="ew-edit" data-code="' + m.entity_code + '">编辑</a> <a href="#" class="ew-del" data-code="' + h(m.entity_code) + '" style="color:#dc2626;">删除</a></td></tr>';
   });
+  if (!items.length) html += '<tr><td colspan="6" style="text-align:center;color:var(--muted);">暂无主体-仓库映射，请先新增</td></tr>';
   html += '</tbody></table>';
   var w = document.getElementById('ew-table-wrap');
   if (w) w.innerHTML = html;
   document.querySelectorAll('.ew-edit').forEach(function(a) {
-    a.addEventListener('click', function(e) { e.preventDefault(); showModal('entitywh', {wh:this.dataset.wh, ent:this.dataset.ent}); });
+    a.addEventListener('click', function(e) { e.preventDefault(); showModal('entitywh', {entity_code: this.dataset.code}); });
+  });
+  document.querySelectorAll('.ew-del').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      var code = this.dataset.code;
+      if (!confirm('确认删除主体 ' + code + ' 的映射？')) return;
+      api('/api/config/entity-mappings/' + encodeURIComponent(code), { method: 'DELETE' })
+        .then(function() { toast('已删除 ' + code); loadEW(); })
+        .catch(function(e) { notifyError(e, ['主数据', '删除主体映射失败']); });
+    });
   });
 }
 
@@ -7902,21 +7975,28 @@ function showModal(type, data) {
       '<label><span>价格（分）</span><input id="m-pr" type="number" value="' + (data.pr || '') + '" /></label>' +
       '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-price">保存</button></div></div></div>';
   } else if (type === 'entitywh') {
-    var entityOptions = ['SZ','HK','LU','US','WH','GZ'];
-    var entityHtml = entityOptions.map(function(e) { return '<option value="' + e + '"' + (e === (data.ent||'') ? ' selected' : '') + '>' + e + '</option>'; }).join('');
-    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>' + (data.wh ? '编辑映射' : '新增映射') + '</h3>' +
-      '<label><span>仓库</span><select id="mew-wh">' +
-        '<option value="武汉仓"' + (data.wh === '武汉仓' ? ' selected' : '') + '>武汉仓</option>' +
-        '<option value="美西仓库"' + (data.wh === '美西仓库' ? ' selected' : '') + '>美西仓库</option>' +
-        '<option value="欧洲仓"' + (data.wh === '欧洲仓' ? ' selected' : '') + '>欧洲仓</option>' +
-        '<option value="美国仓"' + (data.wh === '美国仓' ? ' selected' : '') + '>美国仓</option>' +
-        '<option value="德国仓库"' + (data.wh === '德国仓库' ? ' selected' : '') + '>德国仓库</option>' +
-        '<option value="Amazon US"' + (data.wh === 'Amazon US' ? ' selected' : '') + '>Amazon US</option>' +
-        '<option value="Amazon DE"' + (data.wh === 'Amazon DE' ? ' selected' : '') + '>Amazon DE</option>' +
-        '<option value="Amazon UK"' + (data.wh === 'Amazon UK' ? ' selected' : '') + '>Amazon UK</option>' +
-        '<option value="Amazon JP"' + (data.wh === 'Amazon JP' ? ' selected' : '') + '>Amazon JP</option>' +
-      '</select></label>' +
-      '<label><span>出货主体</span><select id="mew-ent">' + entityHtml + '</select></label>' +
+    var isEdit = Boolean(data.entity_code);
+    var whRows = (data.warehouses || []).map(function(w, i) {
+      var whCode = w.warehouse_code || w.code || w;
+      var whName = w.warehouse_name || w.name || '';
+      return '<div class="ew-wh-row" style="display:flex;gap:6px;margin-bottom:4px;">' +
+        '<input class="ew-wh-code" list="wh-suggestions" placeholder="仓库编码（可选）" value="' + h(whCode) + '" style="flex:1;min-width:0;" />' +
+        '<input class="ew-wh-name" placeholder="仓库名称" value="' + h(whName) + '" style="flex:2;min-width:0;" />' +
+        '<button type="button" class="icon-button ew-wh-remove" style="color:#dc2626;">×</button></div>';
+    }).join('');
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box" style="min-width:520px;"><h3>' + (isEdit ? '编辑主体' : '新增主体') + '</h3>' +
+      '<datalist id="wh-suggestions"></datalist>' +
+      '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
+        '<span>主体编码</span><input id="mew-code" value="' + h(data.entity_code || '') + '" ' + (isEdit ? 'readonly style="background:#f3f4f6;"' : '') + ' placeholder="如 SZ / HK / LU" /></label>' +
+      '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
+        '<span>主体名称</span><input id="mew-name" value="' + h(data.entity_name || '') + '" placeholder="如 深圳积木易搭科技技术有限公司" /></label>' +
+      '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
+        '<span>ERP 组织ID</span><input id="mew-org" value="' + h(data.erp_org_id || '') + '" placeholder="如 100" /></label>' +
+      '<div style="margin-bottom:8px;"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">' +
+        '<strong style="font-size:13px;">关联仓库</strong><button type="button" class="button ghost mini" id="mew-wh-add">+ 添加</button></div>' +
+        '<div id="mew-wh-list">' + (whRows || '<div style="color:var(--muted);font-size:12px;">暂无仓库，点击"添加"新增，输入时可从已有仓库下拉选择</div>') + '</div></div>' +
+      '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
+        '<span>状态</span><select id="mew-active"><option value="true"' + (data.is_active !== false ? ' selected' : '') + '>启用</option><option value="false"' + (data.is_active === false ? ' selected' : '') + '>禁用</option></select></label>' +
       '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-entitywh">保存</button></div></div></div>';
     } else if (type === 'materialEntity') {
     var entityOpts = ['SZ','HK','LU','US','WH','GZ'].map(function(e) { return '<option value="' + e + '"' + (e === (data.ent||'') ? ' selected' : '') + '>' + e + '</option>'; }).join('');
@@ -7955,6 +8035,53 @@ function showModal(type, data) {
   }
   if (!html) return;
   document.body.insertAdjacentHTML('beforeend', html);
+  var modalEl = document.getElementById(id);
+
+  // 主体-仓库动态行添加
+  if (type === 'entitywh') {
+    // 加载已有仓库列表供自动填充
+    var _warehouseMap = {};
+    api('/api/products/inventory/warehouses?limit=100').then(function(whData) {
+      var items = whData.items || [];
+      var dl = modalEl.querySelector('#wh-suggestions');
+      if (dl) {
+        items.forEach(function(w) {
+          var opt = document.createElement('option');
+          opt.value = w.warehouse_code;
+          opt.label = w.warehouse_code + ' - ' + (w.warehouse_name || '');
+          dl.appendChild(opt);
+        });
+      }
+      items.forEach(function(w) { _warehouseMap[w.warehouse_code] = w.warehouse_name || w.warehouse_code; });
+    }).catch(function() {});
+    // 仓库编码输入时自动填充名称
+    modalEl.addEventListener('input', function(e) {
+      var codeInput = e.target.closest('.ew-wh-code');
+      if (!codeInput || !codeInput.value) return;
+      var row = codeInput.closest('.ew-wh-row');
+      if (!row) return;
+      var nameInput = row.querySelector('.ew-wh-name');
+      if (!nameInput || nameInput.dataset.autofilled) return;
+      var matched = _warehouseMap[codeInput.value];
+      if (matched) { nameInput.value = matched; nameInput.dataset.autofilled = '1'; }
+    });
+    modalEl.querySelector('#mew-wh-add')?.addEventListener('click', function() {
+      var list = modalEl.querySelector('#mew-wh-list');
+      var row = document.createElement('div');
+      row.className = 'ew-wh-row';
+      row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;';
+      row.innerHTML = '<input class="ew-wh-code" list="wh-suggestions" placeholder="仓库编码（可选）" style="flex:1;min-width:0;" />' +
+        '<input class="ew-wh-name" placeholder="仓库名称" style="flex:2;min-width:0;" />' +
+        '<button type="button" class="icon-button" style="color:#dc2626;">×</button>';
+      row.querySelector('.icon-button').addEventListener('click', function() { row.remove(); });
+      list.querySelector('div:first-child')?.remove(); // remove placeholder
+      list.appendChild(row);
+    });
+    modalEl.querySelectorAll('.ew-wh-remove').forEach(function(btn) {
+      btn.addEventListener('click', function() { btn.closest('.ew-wh-row').remove(); });
+    });
+  }
+
   document.getElementById(id).querySelector('[data-act]').addEventListener('click', function() {
     var modal = this.closest('.modal-overlay');
     var act = this.dataset.act;
@@ -7965,10 +8092,22 @@ function showModal(type, data) {
       if (!sku) { toast('物料编码必填', true); return; }
       apiPost('/api/config/product-prices', {sku_id:sku, entity_code:ent, unit_price:pr}).then(function() { modal.remove(); toast('保存成功'); loadPP(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
     } else if (act === 'save-entitywh') {
-      var wh = document.getElementById('mew-wh').value;
-      var ent = document.getElementById('mew-ent').value;
-      if (!wh) { toast('仓库必填', true); return; }
-      apiPost('/api/config/warehouse-entity', {warehouse: wh, entity_code: ent}).then(function() { modal.remove(); toast('保存成功'); loadEW(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
+      var ecode = document.getElementById('mew-code').value.trim();
+      var ename = document.getElementById('mew-name').value.trim();
+      var eorg = document.getElementById('mew-org').value.trim();
+      var eactive = document.getElementById('mew-active').value === 'true';
+      if (!ecode) { toast('主体编码必填', true); return; }
+      if (!ename) { toast('主体名称必填', true); return; }
+      var warehouses = [];
+      document.querySelectorAll('#' + modal.id + ' .ew-wh-row').forEach(function(row) {
+        var wc = (row.querySelector('.ew-wh-code') || {}).value || '';
+        var wn = (row.querySelector('.ew-wh-name') || {}).value || '';
+        if (wc) warehouses.push({warehouse_code: wc, warehouse_name: wn || wc});
+      });
+      apiPost('/api/config/entity-mappings', {
+        entity_code: ecode, entity_name: ename, erp_org_id: eorg,
+        warehouses: warehouses, is_active: eactive
+      }).then(function() { modal.remove(); toast('保存成功'); loadEW(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
     } else if (act === 'save-materialEntity') {
       var mc = document.getElementById('mme-code').value.trim();
       var ent = document.getElementById('mme-ent').value;
