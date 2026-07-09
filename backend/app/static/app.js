@@ -7349,12 +7349,12 @@ function openKingdeePreviewModal(detail) {
 
     var skuHtml = isItemSkuErr
       ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
-      : h(item.sku_code);
+      : h(item.official_sku_code || item.sku_code);
 
-    var nameHtml = item.official_product_name 
-      ? h(item.official_product_name) 
-      : '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>';
-    var modelHtml = h(item.product_model || item.model_name || '-');
+    var nameHtml = item.official_product_name
+    var nameHtml = item.official_product_name
+      ? h(item.official_product_name)
+      : h(item.product_name || '-');
     var qty = Number(item.quantity || 0);
     var qtyHtml = h(qty);
 

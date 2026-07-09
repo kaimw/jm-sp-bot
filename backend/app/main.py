@@ -6304,7 +6304,7 @@ def _crm_http_error(
     """带面包屑的 HTTPException 快捷构造。"""
     return HTTPException(
         status_code=status_code,
-        detail=dumps(breadcrumb_data, ensure_ascii=False),
+        detail=dumps(breadcrumb_data),
     )
 
 

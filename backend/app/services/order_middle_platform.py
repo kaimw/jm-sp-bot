@@ -3316,17 +3316,31 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         data["items"] = []
         for item in order.items:
             official_name = None
+            official_spu_id = None
+            sku_record = None
             if session and item.sku_code:
                 sku_record = session.query(ProductSKU).filter(ProductSKU.sku_id == item.sku_code).first()
                 if sku_record:
                     spu_record = session.query(ProductSPU).filter(ProductSPU.id == sku_record.spu_uuid).first()
                     if spu_record:
                         official_name = spu_record.name
+                        official_spu_id = spu_record.spu_id
                         if sku_record.model:
                             official_name += f"({sku_record.model})"
+            # Fallback: sku_code 不是标准物料编码时，按产品名称匹配 SPU
+            if official_name is None and session and item.product_name:
+                name_clean = item.product_name.strip()
+                if name_clean:
+                    spu_by_name = session.query(ProductSPU).filter(
+                        ProductSPU.name == name_clean
+                    ).first()
+                    if spu_by_name:
+                        official_name = spu_by_name.name
+                        official_spu_id = spu_by_name.spu_id
             data["items"].append({
                 "id": item.id,
                 "sku_code": item.sku_code,
+                "official_sku_code": official_spu_id or item.sku_code,
                 "shop_sku_code": item.shop_sku_code,
                 "channel_code": item.channel_code,
                 "product_name": item.product_name,
