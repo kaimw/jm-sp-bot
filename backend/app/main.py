@@ -6215,6 +6215,7 @@ def api_review_alias_list(
     return {
         "items": [
             {
+                "spu_uuid": spu.id,
                 "spu_id": spu.spu_id,
                 "name": spu.name,
                 "aliases": spu_review_aliases(spu),
@@ -7842,6 +7843,17 @@ def list_entity_mappings(session: Session = Depends(get_session)) -> dict:
                        "erp_org_id": m.erp_org_id, "warehouses": json.loads(m.warehouses_json) if m.warehouses_json else [],
                        "finance_notify": json.loads(m.finance_notify_json) if m.finance_notify_json else [],
                        "is_active": m.is_active} for m in items]}
+
+
+@app.get("/api/config/entity-mappings/{code}")
+def get_entity_mapping(code: str, session: Session = Depends(get_session)) -> dict:
+    m = session.query(EntityMapping).filter(EntityMapping.entity_code == code).first()
+    if m is None:
+        raise HTTPException(status_code=404, detail="主体映射不存在")
+    return {"id": m.id, "entity_code": m.entity_code, "entity_name": m.entity_name,
+            "erp_org_id": m.erp_org_id, "warehouses": json.loads(m.warehouses_json) if m.warehouses_json else [],
+            "finance_notify": json.loads(m.finance_notify_json) if m.finance_notify_json else [],
+            "is_active": m.is_active}
 
 
 @app.post("/api/config/entity-mappings")

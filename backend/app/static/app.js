@@ -2692,12 +2692,6 @@ function middleOrderStatusLabel(status) {
     CLOSED: "已关闭",
     CANCELLED: "已取消",
 
-function orderStatusLabel(status, erpBillNo) {
-  var isErpClosed = erpBillNo && erpBillNo.length > 0 && erpBillNo.indexOf("【暂无") === -1;
-  var CLOSED_LOOP = ["OMS_PENDING","OMS_RETRYING","OMS_BLOCKED","OMS_SHIPPED","PICKING","SHIPPED","FULFILLMENT_ARCHIVED","SIGNED","FINANCE_CHECKING","FINANCE_EXCEPTION","CLOSED","CANCELLED"];
-  if (CLOSED_LOOP.indexOf(status) \!== -1 || (status === "DELIVERY_NOTICE_READY" && isErpClosed)) return "已闭环";
-  return middleOrderStatusLabel(status);
-}
     OUT_OF_SCOPE: "不在处理范围",
   }[status] || status || "未进入中台";
 }
@@ -2720,6 +2714,12 @@ function deliveryNoticeStatusLabel(status) {
   }[status] || status || "-";
 }
 
+function orderStatusLabel(status, erpBillNo) {
+  var isErpClosed = erpBillNo && erpBillNo.length > 0 && erpBillNo.indexOf("【暂无") === -1;
+  var CLOSED_LOOP = ["OMS_PENDING","OMS_RETRYING","OMS_BLOCKED","OMS_SHIPPED","PICKING","SHIPPED","FULFILLMENT_ARCHIVED","SIGNED","FINANCE_CHECKING","FINANCE_EXCEPTION","CLOSED","CANCELLED"];
+  if (CLOSED_LOOP.indexOf(status) !== -1 || (status === "DELIVERY_NOTICE_READY" && isErpClosed)) return "已闭环";
+  return middleOrderStatusLabel(status);
+}
 function flowBadgeClass(status) {
   if (status === "CANCELLED") return "status-pill is-muted";
   if (["VALIDATION_BLOCKED", "OMS_BLOCKED", "FINANCE_EXCEPTION"].includes(status)) return "status-pill is-danger";
@@ -8475,18 +8475,92 @@ function loadAliasesList() {
         return;
       }
 
-      var html = '<table class="data-table"><thead><tr><th style="width:140px;">产品编码</th><th>SPU 名称</th><th>预审别名</th><th style="width:80px;">数量</th></tr></thead><tbody>';
-      items.forEach(function(item) {
+      var html = '<table class="data-table"><thead><tr><th style="width:140px;">产品编码</th><th>SPU 名称</th><th>预审别名</th><th style="width:80px;">数量</th><th>操作</th></tr></thead><tbody>';
+      items.forEach(function(item, idx) {
         var aliasText = (item.aliases || []).join('、') || '-';
-        html += '<tr><td>' + h(item.spu_id) + '</td><td>' + h(item.name) + '</td><td style="max-width:400px;word-break:break-all;"><small>' + h(aliasText) + '</small></td><td style="text-align:center;">' + (item.alias_count || 0) + '</td></tr>';
+        html += '<tr><td>' + h(item.spu_id) + '</td><td>' + h(item.name) + '</td><td style="max-width:400px;word-break:break-all;"><small>' + h(aliasText) + '</small></td><td style="text-align:center;">' + (item.alias_count || 0) + '</td>' +
+          '<td><a href="#" class="ra-edit-alias" data-idx="' + idx + '">编辑</a></td></tr>';
       });
       html += '</tbody></table>';
       wrap.innerHTML = html;
+
+      _aliasesListState.items = items;
+      wrap.querySelectorAll('.ra-edit-alias').forEach(function(a) {
+        a.addEventListener('click', function(e) {
+          e.preventDefault();
+          var idx = parseInt(this.dataset.idx);
+          var item = (_aliasesListState.items || [])[idx];
+          if (!item) return;
+          openAliasEditor(item.spu_uuid, item.spu_id, item.name, item.aliases || []);
+        });
+      });
     })
     .catch(function(err) {
       notifyError(err, ['主数据', '加载别名列表失败']);
       wrap.innerHTML = '<div class="empty-note">加载失败</div>';
     });
+}
+
+function openAliasEditor(spuUuid, spuId, name, aliases) {
+  var overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML =
+    '<div class="modal-box" style="min-width:420px;max-width:520px;">' +
+      '<h3>编辑预审别名 · ' + h(spuId) + '</h3>' +
+      '<p style="font-size:12px;color:var(--muted);margin-bottom:12px;">' + h(name) + '</p>' +
+      '<div id="ae-alias-list" style="margin-bottom:10px;">' +
+        (aliases.length ? aliases.map(function(a) {
+          return '<div class="ae-alias-row" style="display:flex;gap:6px;align-items:center;margin-bottom:4px;padding:4px 6px;background:var(--surface);border-radius:4px;">' +
+            '<span style="flex:1;font-size:13px;">' + h(a) + '</span>' +
+            '<button type="button" class="icon-button ae-remove-btn" style="color:#dc2626;font-size:14px;">删除</button></div>';
+        }).join('') : '<div style="color:var(--muted);font-size:12px;padding:8px;">暂无别名</div>')
+      '</div>' +
+      '<div style="display:flex;gap:6px;margin-bottom:10px;">' +
+        '<input id="ae-new-input" type="text" placeholder="输入新别名..." style="flex:1;padding:6px 10px;border:1px solid var(--line);border-radius:4px;font-size:13px;" />' +
+        '<button type="button" class="button ghost" id="ae-add-btn" style="white-space:nowrap;">添加</button></div>' +
+      '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button>' +
+        '<button class="button" id="ae-save-btn">保存</button></div></div>';
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#ae-add-btn').addEventListener('click', function() {
+    var input = overlay.querySelector('#ae-new-input');
+    var val = (input.value || '').trim();
+    if (!val) { toast('别名不能为空'); return; }
+    var list = overlay.querySelector('#ae-alias-list');
+    var firstChild = list.querySelector('div:first-child');
+    if (firstChild && firstChild.style && firstChild.style.color) { list.innerHTML = ''; }
+    var row = document.createElement('div');
+    row.className = 'ae-alias-row';
+    row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:4px;padding:4px 6px;background:var(--surface);border-radius:4px;';
+    row.innerHTML = '<span style="flex:1;font-size:13px;">' + h(val) + '</span>' +
+      '<button type="button" class="icon-button ae-remove-btn" style="color:#dc2626;font-size:14px;">删除</button>';
+    row.querySelector('.ae-remove-btn').addEventListener('click', function() { row.remove(); });
+    list.appendChild(row);
+    input.value = '';
+    input.focus();
+  });
+
+  overlay.querySelectorAll('.ae-remove-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { btn.closest('.ae-alias-row').remove(); });
+  });
+
+  overlay.querySelector('#ae-save-btn').addEventListener('click', function() {
+    var newAliases = [];
+    overlay.querySelectorAll('#ae-alias-list .ae-alias-row span').forEach(function(s) {
+      newAliases.push(s.textContent.trim());
+    });
+    api('/api/products/spu/' + spuUuid + '/review-aliases', {
+      method: 'PUT',
+      body: JSON.stringify({ aliases: newAliases }),
+    }).then(function(result) {
+      toast('别名已保存');
+      overlay.remove();
+      loadAliasesList();
+    }).catch(function(err) {
+      notifyError(err, ['主数据', '保存别名失败']);
+      overlay.remove();
+    });
+  });
 }
 
 function loadPP() {
@@ -8536,14 +8610,29 @@ function renderEWTable(items) {
     var statusHtml = m.is_active !== false ? '<span class="status-tag success">启用</span>' : '<span class="status-tag muted">禁用</span>';
     html += '<tr><td>' + h(m.entity_code) + '</td><td>' + h(m.entity_name) + '</td><td>' + h(m.erp_org_id || '-') + '</td>' +
       '<td><small>' + h(whs) + '</small></td><td>' + statusHtml + '</td>' +
-      '<td><a href="#" class="ew-edit" data-code="' + m.entity_code + '">编辑</a> <a href="#" class="ew-del" data-code="' + h(m.entity_code) + '" style="color:#dc2626;">删除</a></td></tr>';
+      '<td><a href="#" class="ew-edit" data-code="' + m.entity_code + '">编辑</a></td></tr>';
   });
   if (!items.length) html += '<tr><td colspan="6" style="text-align:center;color:var(--muted);">暂无主体-仓库映射，请先新增</td></tr>';
   html += '</tbody></table>';
   var w = document.getElementById('ew-table-wrap');
   if (w) w.innerHTML = html;
   document.querySelectorAll('.ew-edit').forEach(function(a) {
-    a.addEventListener('click', function(e) { e.preventDefault(); showModal('entitywh', {entity_code: this.dataset.code}); });
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      var code = this.dataset.code;
+      api('/api/config/entity-mappings/' + encodeURIComponent(code)).then(function(full) {
+        if (!full) { toast('未找到该主体'); return; }
+        showModal('entitywh', {
+          entity_code: full.entity_code,
+          entity_name: full.entity_name,
+          erp_org_id: full.erp_org_id,
+          warehouses: full.warehouses || [],
+          is_active: full.is_active !== false,
+        });
+      }).catch(function(err) {
+        notifyError(err, ['主数据', '加载主体信息失败']);
+      });
+    });
   });
   document.querySelectorAll('.ew-del').forEach(function(a) {
     a.addEventListener('click', function(e) {
@@ -8697,14 +8786,18 @@ function showModal(type, data) {
         '<input class="ew-wh-name" placeholder="仓库名称" value="' + h(whName) + '" style="flex:2;min-width:0;" />' +
         '<button type="button" class="icon-button ew-wh-remove" style="color:#dc2626;">×</button></div>';
     }).join('');
-    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box" style="min-width:520px;"><h3>' + (isEdit ? '编辑主体' : '新增主体') + '</h3>' +
+    html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box" style="min-width:520px;"><h3>' + (isEdit ? '编辑主体-仓库关联' : '新增主体') + '</h3>' +
       '<datalist id="wh-suggestions"></datalist>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
         '<span>主体编码</span><input id="mew-code" value="' + h(data.entity_code || '') + '" ' + (isEdit ? 'readonly style="background:#f3f4f6;"' : '') + ' placeholder="如 SZ / HK / LU" /></label>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>主体名称</span><input id="mew-name" value="' + h(data.entity_name || '') + '" placeholder="如 深圳积木易搭科技技术有限公司" /></label>' +
+        '<span>主体名称</span>' + (isEdit
+          ? '<span style="padding:6px 10px;background:#f3f4f6;border-radius:4px;color:#666;">' + h(data.entity_name || '') + '</span>'
+          : '<input id="mew-name" value="' + h(data.entity_name || '') + '" placeholder="如 深圳积木易搭科技技术有限公司" />') + '</label>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>ERP 组织ID</span><input id="mew-org" value="' + h(data.erp_org_id || '') + '" placeholder="如 100" /></label>' +
+        '<span>ERP 组织ID</span>' + (isEdit
+          ? '<span style="padding:6px 10px;background:#f3f4f6;border-radius:4px;color:#666;">' + h(data.erp_org_id || '') + '</span>'
+          : '<input id="mew-org" value="' + h(data.erp_org_id || '') + '" placeholder="如 100" />') + '</label>' +
       '<div style="margin-bottom:8px;"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">' +
         '<strong style="font-size:13px;">关联仓库</strong><button type="button" class="button ghost mini" id="mew-wh-add">+ 添加</button></div>' +
         '<div id="mew-wh-list">' + (whRows || '<div style="color:var(--muted);font-size:12px;">暂无仓库，点击"添加"新增，输入时可从已有仓库下拉选择</div>') + '</div></div>' +
@@ -8785,11 +8878,17 @@ function showModal(type, data) {
       row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;';
       row.innerHTML = '<input class="ew-wh-code" list="wh-suggestions" placeholder="仓库编码（可选）" style="flex:1;min-width:0;" />' +
         '<input class="ew-wh-name" placeholder="仓库名称" style="flex:2;min-width:0;" />' +
-        '<button type="button" class="icon-button" style="color:#dc2626;">×</button>';
-      row.querySelector('.icon-button').addEventListener('click', function() { row.remove(); });
+        '<button type="button" class="icon-button ew-wh-remove" style="color:#dc2626;">×</button>';
       list.querySelector('div:first-child')?.remove(); // remove placeholder
       list.appendChild(row);
+      // 新加行的移除按钮
+      var removeBtn = row.querySelector('.icon-button');
+      if (removeBtn) {
+        removeBtn.className = 'icon-button ew-wh-remove';
+        removeBtn.addEventListener('click', function() { row.remove(); });
+      }
     });
+    // 移除已有关联仓库行
     modalEl.querySelectorAll('.ew-wh-remove').forEach(function(btn) {
       btn.addEventListener('click', function() { btn.closest('.ew-wh-row').remove(); });
     });
