@@ -303,11 +303,15 @@ def sync_inventory_snapshots(session: Session, *, batch_size: int = 500, max_bat
     synced_at = now_utc()
     aggregated: dict[tuple[str, str], dict[str, Any]] = {}
 
+    # 仅同步国内仓库存（排除 106 开头的海外仓）
+    filter_string = "FStockId.FNumber NOT LIKE '106%'"
+
     for _ in range(max_batches):
         result = execute_bill_query_with_config(
             config,
             form_id=ERP_INVENTORY_FORM_ID,
             field_keys=ERP_INVENTORY_FIELD_KEYS,
+            filter_string=filter_string,
             limit=batch_size,
             start_row=start_row,
         )

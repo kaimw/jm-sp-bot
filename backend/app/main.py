@@ -7468,7 +7468,10 @@ def update_inventory_classification_rules(payload: dict, session: Session = Depe
 
 @app.post("/api/products/inventory/erp-sync")
 def sync_inventory_from_erp(session: Session = Depends(get_session)) -> dict:
-    raise HTTPException(status_code=400, detail="同步 ERP 库存功能暂时不可用")
+    from backend.app.services.erp.business_queries import sync_inventory_snapshots
+    result = sync_inventory_snapshots(session)
+    session.commit()
+    return {"ok": True, **result}
 
 
 @app.post("/api/products/inventory/import-excel")
