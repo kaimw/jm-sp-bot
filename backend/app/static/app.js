@@ -7231,7 +7231,8 @@ function loadOrders() {
     orders.forEach(function(o) {
       var sc = 'pending';
       var outOfScope = o.status === 'OUT_OF_SCOPE';
-      var isClosed = CLOSED_LOOP_STATUSES.indexOf(o.status) !== -1;
+      var erpDone = o.erp_bill_no && o.erp_bill_no.length > 0 && o.erp_bill_no.indexOf('【暂无') === -1;
+      var isClosed = CLOSED_LOOP_STATUSES.indexOf(o.status) !== -1 || (o.status === 'DELIVERY_NOTICE_READY' && erpDone);
       if (o.status === 'ERP_SAVED' || o.status === 'DELIVERY_NOTICE_READY') sc = 'success';
       else if (o.status === 'ERP_FAILED' || o.status === 'VALIDATION_BLOCKED') sc = 'failed';
       else if (o.status === 'ERP_SAVING' || o.status === 'ERP_PENDING') sc = 'running';
