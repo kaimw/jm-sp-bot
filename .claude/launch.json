@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jm-sp-bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8082", "--reload"],
+      "port": 8082
+    }
+  ]
+}
