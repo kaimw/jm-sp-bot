@@ -2691,6 +2691,13 @@ function middleOrderStatusLabel(status) {
     FINANCE_EXCEPTION: "财务异常",
     CLOSED: "已关闭",
     CANCELLED: "已取消",
+
+function orderStatusLabel(status, erpBillNo) {
+  var isErpClosed = erpBillNo && erpBillNo.length > 0 && erpBillNo.indexOf("【暂无") === -1;
+  var CLOSED_LOOP = ["OMS_PENDING","OMS_RETRYING","OMS_BLOCKED","OMS_SHIPPED","PICKING","SHIPPED","FULFILLMENT_ARCHIVED","SIGNED","FINANCE_CHECKING","FINANCE_EXCEPTION","CLOSED","CANCELLED"];
+  if (CLOSED_LOOP.indexOf(status) \!== -1 || (status === "DELIVERY_NOTICE_READY" && isErpClosed)) return "已闭环";
+  return middleOrderStatusLabel(status);
+}
     OUT_OF_SCOPE: "不在处理范围",
   }[status] || status || "未进入中台";
 }
@@ -6951,7 +6958,7 @@ function renderOrderBasicCard(detail) {
     orderDetailRow('客户', detail.customer_name) +
     orderDetailRow('销售', detail.sales_user_name) +
     orderDetailRow('类型', orderTypeLabel(detail.order_type)) +
-    orderDetailRow('状态', middleOrderStatusLabel(detail.status)) +
+    orderDetailRow('状态', orderStatusLabel(detail.status, detail.erp_bill_no)) +
     orderDetailRow('下单主体', detail.entity_code) +
     orderDetailRow('出货主体', detail.fulfillment_entity || detail.entity_code) +
     orderDetailRow('渠道', detail.channel_code) +
@@ -7131,7 +7138,7 @@ function renderOrderFlowCard(detail) {
     '<h3>流程信息</h3>' +
     '<div class="order-detail-grid">' +
     orderDetailRow('来源策略', flow.source_policy || detail.source_policy) +
-    orderDetailRow('当前状态', middleOrderStatusLabel(flow.status || detail.status)) +
+    orderDetailRow('当前状态', orderStatusLabel(flow.status || detail.status, detail.erp_bill_no)) +
     orderDetailRow('导入时间', formatTime(flow.imported_at || detail.created_at)) +
     orderDetailRow('预审时间', formatTime(flow.validated_at)) +
     orderDetailRow('更新时间', formatTime(flow.updated_at || detail.updated_at)) +

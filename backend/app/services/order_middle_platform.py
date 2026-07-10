@@ -3377,29 +3377,6 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "date_out_of_scope": _date_out_of_scope(order),
     }
 
-    return data
-
-def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
-    """检查订单下单日期是否在最早同步日期之前"""
-    if not order.crm_order or not order.crm_order.order_date:
-        return False
-    from sqlalchemy.orm import object_session
-    session = object_session(order)
-    if session is None:
-        return False
-    from backend.app.models import SystemConfig
-    from datetime import date
-    cfg = session.get(SystemConfig, "crm_sync_min_order_date")
-    if not cfg or not cfg.value:
-        return False
-    try:
-        min_date = date.fromisoformat(cfg.value.strip())
-        order_date = order.crm_order.order_date
-        if isinstance(order_date, str):
-            order_date = date.fromisoformat(order_date[:10])
-        return order_date < min_date
-    except (ValueError, TypeError):
-        return False
 
     if include_detail:
         crm_order = order.crm_order
@@ -3498,6 +3475,27 @@ def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
         ]
     return data
 
+def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
+    """检查订单下单日期是否在最早同步日期之前"""
+    if not order.crm_order or not order.crm_order.order_date:
+        return False
+    from sqlalchemy.orm import object_session
+    session = object_session(order)
+    if session is None:
+        return False
+    from backend.app.models import SystemConfig
+    from datetime import date
+    cfg = session.get(SystemConfig, "crm_sync_min_order_date")
+    if not cfg or not cfg.value:
+        return False
+    try:
+        min_date = date.fromisoformat(cfg.value.strip())
+        order_date = order.crm_order.order_date
+        if isinstance(order_date, str):
+            order_date = date.fromisoformat(order_date[:10])
+        return order_date < min_date
+    except (ValueError, TypeError):
+        return False
 
 def item_logistics_summary(raw: dict[str, Any]) -> dict[str, Any]:
     return {
