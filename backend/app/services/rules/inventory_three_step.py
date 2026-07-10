@@ -1,11 +1,12 @@
 """库存三步判断规则（替代 LocalInventoryAvailableRule）
 
-根据设计文档 §16.2（Q5 决策）：
-  Step 1：查主体关联仓库库存 → 够→通过；不够→Step 2
-  Step 2：查其他主体仓库库存 → 有其他→非阻断+调货通知；全缺→Step 3
-  Step 3：全缺→阻断，通知销售重新提交
-
-该规则作为预审规则链的最后一步。
+根据业务策略（2026-07 商务反馈）：
+  销售订单永不因缺货阻断。库存检查为信息级，不阻挡订单继续流转。
+  Step 1：查主体关联仓库库存 -> 够->通过；不够->Step 2
+  Step 2：查其他主体仓库库存 -> 有其他->非阻断+调货通知；全缺->Step 3
+  Step 3：全缺->非阻断，passed=True，仅携带缺货信息。
+    国内主体：文案"仓库将备货发货"
+    海外主体：文案"请确认调仓/调整物料/取消"
 """
 
 from decimal import Decimal
@@ -53,11 +54,23 @@ class InventoryThreeStepRule:
         step2_failures = _check_inventory(session, context.items, other_warehouses)
 
         if step2_failures:
-            # Step 3：全缺 → 阻断
+            # Step 3：全缺 -> 非阻断，仅携带缺货信息（销售订单永不因缺货阻断）
+            is_overseas = entity_code in {"HK", "US", "LU"}
+            if is_overseas:
+                reason = (
+                    f"缺货：{entity_code} 指定仓库无库存\n"
+                    f"缺货物料：{'；'.join(step2_failures)}\n"
+                    f"处理建议：请与销售确认「调仓 / 调整物料 / 取消」"
+                )
+            else:
+                reason = (
+                    f"缺货：{entity_code} 无库存\n"
+                    f"缺货物料：{'；'.join(step2_failures)}\n"
+                    f"处理说明：仓库已收到需求将备货发货"
+                )
             return ValidationResult(
-                self.get_rule_code(), False, BlockerLevel.CRITICAL,
-                f"Step3 阻断：所有仓库均缺货\n"
-                f"缺货物料：{'；'.join(step2_failures)}",
+                self.get_rule_code(), True, BlockerLevel.LOW,
+                reason,
                 step2_failures,
             )
 

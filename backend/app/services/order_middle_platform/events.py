@@ -52,6 +52,7 @@ from backend.app.services.order_middle_platform.enums import OrderStatus
 from backend.app.services.order_middle_platform.enums import transition_order
 from backend.app.services.order_middle_platform.erp_billing import process_erp_billing
 from backend.app.services.order_middle_platform.notifications import create_exception_case
+from backend.app.services.order_middle_platform.notifications import enqueue_inventory_shortage_notification
 from backend.app.services.order_middle_platform.notifications import enqueue_validation_failure_notification
 from backend.app.services.order_middle_platform.platform_fulfillment import archive_platform_fulfilled_order
 from backend.app.services.order_middle_platform.platform_fulfillment import is_platform_fulfilled_order
@@ -194,6 +195,27 @@ def process_crm_order_parsed_event(session: Session, payload: dict[str, Any]) ->
             enqueue_validation_failure_notification(session, order, validation_results, exception_case, trace_id=trace_id)
             return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "validation_passed": False}
         transition_order(session, order, OrderEvent.RULES_PASSED, trace_id=trace_id)
+
+        # 预审通过后处理库存信息：缺货不阻断，但需创建通知
+        inventory_result = next((r for r in validation_results if r.rule_code == "INVENTORY_THREE_STEP"), None)
+        if inventory_result and not inventory_result.passed:
+            # passed=False 的情况在阻断分支已处理，不会走到这里
+            pass
+        elif inventory_result and inventory_result.passed and inventory_result.blocker_level not in (BlockerLevel.NONE, None):
+            # passed=True 但 blocker_level=LOW => 有缺货信息
+            is_overseas = order.entity_code in {"HK", "US", "LU"}
+            exc = create_exception_case(
+                session, order,
+                ExceptionType.INVENTORY_SHORTAGE,
+                "Medium" if is_overseas else "Low",
+                inventory_result.reason,
+                [inventory_result],
+                trace_id=trace_id,
+            )
+            enqueue_inventory_shortage_notification(session, order, inventory_result, is_overseas, exc, trace_id=trace_id)
+    else:
+        # 非 IMPORTED/VALIDATION_BLOCKED 状态，不运行预审
+        pass
 
     # ── ERP 制单（预审通过后自动执行）──
     notice = None

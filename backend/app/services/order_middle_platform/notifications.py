@@ -732,6 +732,7 @@ def exception_policy(exception_type: ExceptionType, severity: str) -> dict[str, 
         ExceptionType.CRM_CHANGED_AFTER_SHIPPED: {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
         ExceptionType.CRM_CANCELLED_AFTER_SHIPPED: {"source_system": "CRM", "responsible_role": "商务主管/财务/物流", "can_auto_retry": False, "freeze_order_flow": False},
         ExceptionType.MANUAL_REPLAY_WITHOUT_FIX: {"source_system": "Manual", "responsible_role": "商务/IT", "can_auto_retry": False, "freeze_order_flow": True},
+        ExceptionType.INVENTORY_SHORTAGE: {"source_system": "System", "responsible_role": "销售", "can_auto_retry": False, "freeze_order_flow": False},
     }
     default_source = "System" if severity in {"Low", "Medium"} else "CRM"
     return policies.get(
@@ -837,3 +838,88 @@ def _mail_table_cell(value: str) -> str:
 
 
 
+
+
+
+def enqueue_inventory_shortage_notification(
+    session: Session,
+    order: MiddlePlatformOrder,
+    inventory_result: Any,
+    is_overseas: bool,
+    exception_case: ExceptionCase,
+    *,
+    trace_id: str = "",
+) -> OutboundMailJob | None:
+    # 创建库存短缺通知邮件（非阻断，仅为信息告知）
+    # 国内：仓库将备货发货，通知给销售+抄送物流
+    # 海外：销售指定仓无库存需确认，通知给销售
+    to_addresses: list[str] = []
+    cc_addresses: list[str] = []
+
+    if order.crm_order and order.crm_order.sales_user_email:
+        to_addresses.append(order.crm_order.sales_user_email)
+
+    if not to_addresses:
+        to_addresses = validation_failure_recipients(session)[0]
+
+    if not is_overseas:
+        cc_addresses = validation_failure_recipients(session)[1]
+
+    if not to_addresses:
+        return None
+
+    lines_body = []
+    if is_overseas:
+        lines_body.append("海外订单库存不足通知")
+    else:
+        lines_body.append("国内订单库存不足通知")
+    lines_body.append("")
+    lines_body.append("订单编号：" + str(order.order_no))
+    lines_body.append("CRM 单号：" + str(order.crm_order_no or ""))
+    lines_body.append("客户：" + str(order.customer_name or ""))
+    lines_body.append("销售：" + str(order.sales_user_name or ""))
+    lines_body.append("")
+    lines_body.append("--- 库存信息 ---")
+    lines_body.append(str(inventory_result.reason if inventory_result else ""))
+    if is_overseas:
+        lines_body.append("")
+        lines_body.append("处理说明：订单已继续流转至 ERP 制单，但销售指定仓库无库存，")
+        lines_body.append("请与销售确认是否【调仓 / 调整物料 / 取消订单】。")
+    else:
+        lines_body.append("")
+        lines_body.append("处理说明：订单已继续流转至 ERP 制单，仓库已收到需求将备货发货。")
+    lines_body.append("异常编号：" + str(exception_case.id))
+
+    body = chr(10).join(lines_body)
+
+    from backend.app.services.mail_template_service import _today_str
+
+    suffix = "海外" if is_overseas else "国内"
+    subject = "【库存通知】" + str(order.customer_name or "") + " " + suffix + "订单库存不足 - " + _today_str()
+
+    idempotency_key = "inventory-shortage-" + str(order.order_no) + "-" + str(order.version)
+    existing = session.query(OutboundMailJob).filter(OutboundMailJob.idempotency_key == idempotency_key).first()
+    if existing is not None:
+        return existing
+
+    job = OutboundMailJob(
+        mail_type="InventoryShortage",
+        to_json=dumps(to_addresses),
+        cc_json=dumps(cc_addresses),
+        subject=subject,
+        body=body,
+        idempotency_key=idempotency_key,
+        status="Pending",
+        priority=20,
+    )
+    session.add(job)
+    session.add(
+        AuditEvent(
+            event_type="InventoryShortageNotified",
+            related_object_type="MiddlePlatformOrder",
+            related_object_id=order.id,
+            detail=dumps({"to": to_addresses, "cc": cc_addresses, "exception_case_id": exception_case.id, "trace_id": trace_id}),
+        )
+    )
+    session.flush()
+    return job
