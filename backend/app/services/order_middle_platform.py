@@ -3375,6 +3375,8 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "date_out_of_scope": _date_out_of_scope(order),
     }
 
+    return data
+
 def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
     """检查订单下单日期是否在最早同步日期之前"""
     if not order.crm_order or not order.crm_order.order_date:
@@ -3385,11 +3387,11 @@ def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
         return False
     from backend.app.models import SystemConfig
     from datetime import date
-    min_date_text = (session.get(SystemConfig, "crm_sync_min_order_date") or "").value or ""
-    if not min_date_text:
+    cfg = session.get(SystemConfig, "crm_sync_min_order_date")
+    if not cfg or not cfg.value:
         return False
     try:
-        min_date = date.fromisoformat(min_date_text.strip())
+        min_date = date.fromisoformat(cfg.value.strip())
         order_date = order.crm_order.order_date
         if isinstance(order_date, str):
             order_date = date.fromisoformat(order_date[:10])
