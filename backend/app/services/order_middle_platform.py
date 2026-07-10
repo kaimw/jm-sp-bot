@@ -3327,7 +3327,9 @@ def list_middle_orders(session: Session, *, q: str = "", status: str = "", page:
     if status.strip():
         query = query.filter(MiddlePlatformOrder.status == status.strip())
     total = query.count()
-    rows = query.order_by(MiddlePlatformOrder.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    # 按下单日期降序排列
+    query = query.outerjoin(CrmSalesOrder, CrmSalesOrder.id == MiddlePlatformOrder.crm_sales_order_id)
+    rows = query.order_by(CrmSalesOrder.order_date.desc().nullslast()).offset((page - 1) * page_size).limit(page_size).all()
     for row in rows:
         ensure_middle_order_business_fields(session, row)
     return {

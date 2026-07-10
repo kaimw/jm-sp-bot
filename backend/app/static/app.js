@@ -7238,8 +7238,8 @@ function loadOrders() {
       else if (o.status === 'ERP_SAVING' || o.status === 'ERP_PENDING') sc = 'running';
       else if (isClosed) sc = 'closed';
       if (outOfScope) sc = 'muted';
-      var statusLabel = isClosed ? '已闭环' : middleOrderStatusLabel(o.status);
-      html += '<tr' + (outOfScope ? ' class="order-row-out-of-scope"' : '') + '><td>' + (o.order_no || '').slice(-12) + '</td><td>' + (o.customer_name || '').slice(0, 16) + '</td>' +
+      var statusLabel = outOfScope ? '不在处理范围' : (isClosed ? '已闭环' : middleOrderStatusLabel(o.status));
+      html += '<tr' + (outOfScope ? ' class="order-row-out-of-scope"' : '') + '><td>' + ((o.crm_order_no || o.order_no || '').slice(-12)) + '</td><td>' + (o.customer_name || '').slice(0, 16) + '</td>' +
         '<td>' + (o.order_type === 'STOCK_REPLENISHMENT' ? '备货' : '销售') + '</td>' +
         '<td><span class="status-tag ' + sc + '">' + h(statusLabel) + '</span></td>' +
         '<td style="white-space:nowrap;">' + h(o.order_date || '-') + '</td>' +
