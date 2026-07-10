@@ -7230,7 +7230,7 @@ function loadOrders() {
     var html = '<table class="data-table"><thead><tr><th>单号</th><th>客户</th><th>类型</th><th>状态</th><th>下单日期</th><th>入库时间</th><th>主体</th><th>操作</th></tr></thead><tbody>';
     orders.forEach(function(o) {
       var sc = 'pending';
-      var outOfScope = o.status === 'OUT_OF_SCOPE';
+      var outOfScope = o.status === 'OUT_OF_SCOPE' || o.date_out_of_scope === true;
       var erpDone = o.erp_bill_no && o.erp_bill_no.length > 0 && o.erp_bill_no.indexOf('【暂无') === -1;
       var isClosed = CLOSED_LOOP_STATUSES.indexOf(o.status) !== -1 || (o.status === 'DELIVERY_NOTICE_READY' && erpDone);
       if (o.status === 'ERP_SAVED' || o.status === 'DELIVERY_NOTICE_READY') sc = 'success';
@@ -7247,10 +7247,10 @@ function loadOrders() {
         '<td>' + (o.entity_code || '') + '</td>' +
         '<td>' + (outOfScope ? '<span class="muted-action">—</span>' :
           '<a href="#" class="order-view" data-id="' + (o.id || '') + '">详情</a>' +
-          (o.status === 'DELIVERY_NOTICE_READY' ?
-            ' | <a href="#" class="order-push-erp" data-id="' + (o.id || '') + '" data-no="' + h(o.order_no || '') + '">制单并推送</a>' :
-            (isClosed ?
-              ' | <a href="#" class="order-revoke" data-id="' + (o.id || '') + '">撤回</a>' :
+          (isClosed ?
+            ' | <a href="#" class="order-revoke" data-id="' + (o.id || '') + '">撤回</a>' :
+            (o.status === 'DELIVERY_NOTICE_READY' ?
+              ' | <a href="#" class="order-push-erp" data-id="' + (o.id || '') + '" data-no="' + h(o.order_no || '') + '">制单并推送</a>' :
               ' | <a href="#" class="order-kingdee-preview" data-id="' + (o.id || '') + '">金蝶</a>'
             )
           )

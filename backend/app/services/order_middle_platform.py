@@ -3372,7 +3372,31 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "order_date": order.crm_order.order_date if order.crm_order else None,
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+        "date_out_of_scope": _date_out_of_scope(order),
     }
+
+def _date_out_of_scope(order: MiddlePlatformOrder) -> bool:
+    """检查订单下单日期是否在最早同步日期之前"""
+    if not order.crm_order or not order.crm_order.order_date:
+        return False
+    from sqlalchemy.orm import object_session
+    session = object_session(order)
+    if session is None:
+        return False
+    from backend.app.models import SystemConfig
+    from datetime import date
+    min_date_text = (session.get(SystemConfig, "crm_sync_min_order_date") or "").value or ""
+    if not min_date_text:
+        return False
+    try:
+        min_date = date.fromisoformat(min_date_text.strip())
+        order_date = order.crm_order.order_date
+        if isinstance(order_date, str):
+            order_date = date.fromisoformat(order_date[:10])
+        return order_date < min_date
+    except (ValueError, TypeError):
+        return False
+
     if include_detail:
         crm_order = order.crm_order
         data["receipt"] = {
