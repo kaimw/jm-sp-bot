@@ -5890,13 +5890,45 @@ async function refreshProductsInventory() {
     }
   }
 
+  // 只看成品切换
+  var finishedCheckbox = document.getElementById('inv-finished-only');
+  if (finishedCheckbox) {
+    finishedCheckbox.addEventListener('change', function() {
+      loadProductsInventory();
+    });
+  }
+
+  // 同步国内库存按钮
+  var syncBtn = document.getElementById('sync-erp-inventory');
+  if (syncBtn) {
+    syncBtn.addEventListener('click', function() {
+      var btn = this;
+      btn.textContent = '同步中...';
+      btn.disabled = true;
+      fetch('/api/products/inventory/erp-sync', { method: 'POST', credentials: 'same-origin' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          toast('国内库存同步完成: ' + (data.total || 0) + ' 条');
+          btn.textContent = '同步国内库存';
+          btn.disabled = false;
+          loadProductsInventory();
+        })
+        .catch(function(err) {
+          notifyError(err, ['物料中心', '同步国内库存失败']);
+          btn.textContent = '同步国内库存';
+          btn.disabled = false;
+        });
+    });
+  }
+
   // 2. Fetch inventory list
   const state = tableStates.productsInventory;
+  const finishedOnly = document.getElementById('inv-finished-only')?.checked !== false;
   const params = new URLSearchParams({
     q: state.q || "",
     warehouse_code: state.warehouse_code || "",
     countable_only: "false",
-    inventory_scope: "",
+    inventory_scope: finishedOnly ? "finished" : "",
     page: state.page || 1,
     page_size: state.page_size || 20
   });
@@ -5928,11 +5960,12 @@ async function refreshProductsInventory() {
     const listNode = $("#products-inventory-list");
     if (listNode) {
       listNode.innerHTML = rows.map(row => `
-        <div class="row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); padding: 8px 0;">
+        <div class="row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 0.8fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); padding: 8px 0;">
           <div style="word-break: break-all;"><strong>${h(row.material_code)}</strong></div>
           <div style="word-break: break-word;">${h(row.material_name)}</div>
           <div style="word-break: break-word;">${h(row.english_name || "-")}</div>
           <div>${h(row.model || "-")}</div>
+          <div>${h(row.warehouse_code)}</div>
           <div>${h(row.warehouse_name)}</div>
           <div style="font-weight: 600;">${h(row.base_qty)}</div>
           <div style="color: var(--muted);">${h(row.in_transit_qty)}</div>
@@ -8905,11 +8938,11 @@ function showModal(type, data) {
       apiPost('/api/config/product-prices', {sku_id:sku, entity_code:ent, unit_price:pr}).then(function() { modal.remove(); toast('保存成功'); loadPP(); }).catch(function(e) { toast('失败: ' + (e.message||''), true); });
     } else if (act === 'save-entitywh') {
       var ecode = document.getElementById('mew-code').value.trim();
-      var ename = document.getElementById('mew-name').value.trim();
-      var eorg = document.getElementById('mew-org').value.trim();
+      var enameEl = document.getElementById('mew-name');
+      var ename = enameEl ? (enameEl.value || enameEl.textContent || '').trim() : '';
+      var eorgEl = document.getElementById('mew-org');
+      var eorg = eorgEl ? (eorgEl.value || eorgEl.textContent || '').trim() : '';
       var eactive = document.getElementById('mew-active').value === 'true';
-      if (!ecode) { toast('主体编码必填', true); return; }
-      if (!ename) { toast('主体名称必填', true); return; }
       var warehouses = [];
       document.querySelectorAll('#' + modal.id + ' .ew-wh-row').forEach(function(row) {
         var wc = (row.querySelector('.ew-wh-code') || {}).value || '';

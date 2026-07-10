@@ -250,16 +250,19 @@
           <div class="filter-bar inventory-filter-bar" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: nowrap; overflow: visible;">
             <form id="products-inventory-filter-form" class="inline-form" data-table-filter="productsInventory" style="display: flex; gap: 8px; align-items: center; flex-wrap: nowrap;">
               <input type="text" name="q" placeholder="搜索物料编码、中文品名..." style="width: 200px; height: 36px; min-height: 36px; padding: 6px 10px;" />
-              <select name="warehouse_code" id="inventory-warehouse-select" style="width: 160px; height: 36px; min-height: 36px; padding: 6px 10px;">
+              <select name="warehouse_code" id="inventory-warehouse-select" style="width: 180px; height: 36px; min-height: 36px; padding: 6px 10px;">
                 <option value="">全部仓库</option>
               </select>
+              <label style="display:flex;align-items:center;gap:4px;font-size:13px;white-space:nowrap;cursor:pointer;">
+                <input type="checkbox" id="inv-finished-only" checked /> 只看成品
+              </label>
               <button type="submit" class="button" style="height: 36px; padding: 0 16px; display: flex; align-items: center; justify-content: center;">查询</button>
               <button type="button" class="button ghost" data-filter-reset style="height: 36px; padding: 0 16px; display: flex; align-items: center; justify-content: center;">重置</button>
             </form>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: nowrap;">
               <input type="file" id="inventory-excel-file" accept=".xlsx,.xls" style="display: none;" />
               <button id="btn-trigger-import-excel" class="button" type="button" style="background-color: var(--accent); border-color: var(--accent); height: 36px; padding: 0 16px; white-space: nowrap; display: flex; align-items: center; justify-content: center;">导入海外库存 Excel</button>
-              <button id="sync-erp-inventory" class="button" type="button" disabled style="background-color: var(--line); border-color: var(--line); color: var(--muted); cursor: not-allowed; opacity: 0.7; height: 36px; padding: 0 16px; white-space: nowrap; display: flex; align-items: center; justify-content: center;" title="同步 ERP 库存暂时不可用">同步 ERP 库存 (暂时不可用)</button>
+              <button id="sync-erp-inventory" class="button" type="button" style="height: 36px; padding: 0 16px; white-space: nowrap; display: flex; align-items: center; justify-content: center;">同步国内库存</button>
             </div>
           </div>
           
@@ -269,12 +272,13 @@
                 <!-- JS dynamic summary -->
               </div>
               <div class="data-table product-table product-inventory-table">
-                <div class="head row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; font-weight: 600; border-bottom: 2px solid var(--line); padding-bottom: 8px; font-size: 13px;">
+                <div class="head row product-row" style="display: grid; grid-template-columns: 1.2fr 1.8fr 1.8fr 1fr 0.8fr 1fr 1fr 1fr 1.2fr 1.5fr; gap: 8px; font-weight: 600; border-bottom: 2px solid var(--line); padding-bottom: 8px; font-size: 13px;">
                   <div>物料编码</div>
                   <div>中文品名</div>
                   <div>英文品名</div>
                   <div>型号</div>
-                  <div>仓库</div>
+                  <div>仓库编码</div>
+                  <div>仓库名称</div>
                   <div>库存数量</div>
                   <div>在途数量</div>
                   <div>库存预警</div>
