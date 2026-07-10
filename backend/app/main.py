@@ -6607,7 +6607,473 @@ def v2_get_order(order_id: str, session: Session = Depends(get_session), current
             raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
             
     ensure_middle_order_business_fields(session, row)
-    return serialize_middle_order(row, include_detail=True, current_user=current_user)
+
+    # ── 幂等性自愈检测：如果本地无单号，或单号是错误的中台单号格式 (MP-开头的单号)，尝试去金蝶重新查询真实的金蝶单号 ──
+    is_wrong_format = bool(row.erp_bill_no and row.erp_bill_no.startswith("MP-"))
+    if (not row.erp_bill_no or is_wrong_format) and row.order_no:
+        try:
+            from backend.app.services.erp.kingdee_client import KingdeeClient, kingdee_config_from_session, normalize_query_rows
+            config = kingdee_config_from_session(session)
+            client = KingdeeClient(config)
+            query_result = client.execute_bill_query(
+                form_id="SAL_SaleOrder",
+                field_keys="FID,FBillNo",
+                filter_string=f"FNote LIKE '%{row.order_no}%' AND FBillNo NOT LIKE 'MP-%'",
+                limit=1,
+            )
+            existing_items = normalize_query_rows(query_result.get("raw"))
+            if existing_items and len(existing_items) > 0 and len(existing_items[0]) > 0:
+                row.erp_bill_no = existing_items[0][1]
+                session.commit()
+        except Exception as check_exc:
+            logger.warning("获取订单详情时金蝶前置防重 Check 异常 (忽略): %s", check_exc)
+
+    data = serialize_middle_order(row, include_detail=True, current_user=current_user)
+    
+    # 注入金蝶登录账号作为制单执行人名称
+    erp_username = ""
+    row_cfg = session.get(SystemConfig, "erp_username")
+    if row_cfg and row_cfg.value:
+        erp_username = row_cfg.value.strip()
+    data["erp_username"] = erp_username
+    
+    # 注入金蝶制单提交的完成时间
+    erp_completed_at = ""
+    if row.erp_bill_no:
+        from backend.app.models import AuditEvent
+        from datetime import timedelta
+        # 优先从审计日志中查找 ErpSaveSuccess 或订单状态变更
+        ae = (
+            session.query(AuditEvent)
+            .filter(
+                AuditEvent.related_object_id == row.id,
+                AuditEvent.event_type == "OrderStatusChanged"
+            )
+            .order_by(AuditEvent.created_at.desc())
+            .first()
+        )
+        if ae:
+            local_time = ae.created_at + timedelta(hours=8)
+            erp_completed_at = local_time.strftime("%Y-%m-%d %H:%M:%S")
+        elif row.updated_at:
+            local_time = row.updated_at + timedelta(hours=8)
+            erp_completed_at = local_time.strftime("%Y-%m-%d %H:%M:%S")
+            
+    data["erp_completed_at"] = erp_completed_at
+    
+    return data
+
+
+@app.get("/api/v2/orders/{order_id}/mail-preview")
+def preview_order_delivery_mail(
+    order_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+        
+    from backend.app.services.order_middle_platform import latest_delivery_notice
+    notice = latest_delivery_notice(session, order)
+    if notice is None:
+        raise HTTPException(status_code=400, detail="未找到该订单的发货通知预览记录")
+        
+    # 确定发货仓库
+    warehouse_code = notice.warehouse_code or ""
+
+    from backend.app.services.mail_template_service import _today_str
+
+    # 为销售订单合并多源收件人
+    if order.order_type != "STOCK_REPLENISHMENT":
+        merged_to: list[str] = []
+        merged_cc: list[str] = []
+
+        # 物流通知部门的主送和抄送
+        logistics_depts = session.query(LogisticsDepartment).filter(LogisticsDepartment.status == "Active").all()
+        for dept in logistics_depts:
+            if dept.mail_to_json:
+                merged_to.extend(json.loads(dept.mail_to_json))
+            if dept.mail_cc_json:
+                merged_cc.extend(json.loads(dept.mail_cc_json))
+
+        # 生产通知部门的主送和抄送
+        prod_depts = session.query(ProductionDepartment).filter(ProductionDepartment.status == "Active").all()
+        for dept in prod_depts:
+            if dept.mail_to_json:
+                merged_to.extend(json.loads(dept.mail_to_json))
+            if dept.mail_cc_json:
+                merged_cc.extend(json.loads(dept.mail_cc_json))
+
+        # CRM 同步的销售邮箱
+        if order.crm_order and order.crm_order.sales_user_email:
+            merged_to.append(order.crm_order.sales_user_email)
+
+        # 商务抄送邮箱（来源于系统配置）
+        biz_cc = system_config_value(session, "ops_cc_email").strip()
+        if biz_cc:
+            merged_cc.append(biz_cc)
+
+        # 去重
+        seen_to: set[str] = set()
+        seen_cc: set[str] = set()
+        to_emails = [e for e in merged_to if e and e.strip() and not (e in seen_to or seen_to.add(e))]
+        cc_emails = [e for e in merged_cc if e and e.strip() and not (e in seen_cc or seen_cc.add(e))]
+    else:
+        # 备货订单保持原有 scene 逻辑
+        from backend.app.services.mail_template_service import _resolve_scene, _get_receivers
+        scene = _resolve_scene(order, warehouse_code)
+        to_emails, cc_emails = _get_receivers(session, scene)
+    
+    # Render mail
+    is_domestic = "武汉" in warehouse_code or "国内" in warehouse_code
+    erp_bill_no = order.erp_bill_no or "【暂无金蝶单号】"
+    customer = order.customer_name or ""
+    sales_name = order.sales_user_name or ""
+    date_str = _today_str()
+    
+    recipients = None
+    if order.crm_order:
+        recipients = [{
+            "contact": order.crm_order.receipt_contact or "",
+            "phone": order.crm_order.receipt_phone or "",
+            "address": order.crm_order.receipt_address or ""
+        }]
+        
+    from backend.app.services.mail.templates.sales_delivery import render_sales_delivery_mail
+    from backend.app.services.mail.templates.stock_replenishment import render_replenishment_mail
+    
+    if order.order_type == "STOCK_REPLENISHMENT":
+        mail_data = render_replenishment_mail(
+            order=order,
+            items=list(order.items),
+            to_emails=to_emails,
+            cc_emails=cc_emails,
+            warehouse=warehouse_code,
+            erp_bill_no="" if is_domestic and order.order_type == "STOCK_REPLENISHMENT" else erp_bill_no,
+            special_requirements=None,
+            demand_desc=customer,
+            order_date=date_str,
+        )
+    else:
+        mail_data = render_sales_delivery_mail(
+            order=order,
+            items=list(order.items),
+            to_emails=to_emails,
+            cc_emails=cc_emails,
+            warehouse=warehouse_code,
+            erp_bill_no=erp_bill_no,
+            special_requirements=None,
+            sales_name=sales_name,
+            customer_name=customer,
+            order_date=date_str,
+            recipients=recipients,
+        )
+        
+    return {
+        "to": mail_data["to"],
+        "cc": mail_data["cc"],
+        "subject": mail_data["subject"],
+        "body": mail_data["body"],
+    }
+
+
+@app.post("/api/v2/orders/{order_id}/push-erp-and-delivery")
+def push_erp_and_delivery(
+    order_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+        
+    # Enforce data visibility scope for sales/business operators
+    if current_user.role == "business_operator":
+        is_owner = (order.sales_user_name == current_user.username)
+        is_same_dept = bool(current_user.department and order.crm_order and order.crm_order.owner_department and order.crm_order.owner_department.lower() == current_user.department.lower())
+        if not is_owner and not is_same_dept:
+            raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
+            
+    from backend.app.services.order_middle_platform import should_skip_erp_billing, process_erp_billing, latest_delivery_notice, confirm_delivery_notice
+    
+    trace_id = f"manual-push-{uuid.uuid4()}"
+    
+    # 1. 如果没有金蝶单号且不是备货→武汉仓（应跳过制单），则调用金蝶制单
+    erp_success = True
+    erp_error = None
+    
+    if not order.erp_bill_no and not should_skip_erp_billing(order):
+        # 临时将 erp_write_enabled 开启，以便手动触发制单不受自动开关限制
+        orig_val = session.get(SystemConfig, "erp_write_enabled")
+        orig_str = orig_val.value if orig_val else "false"
+        
+        from backend.app.services.bootstrap import set_config
+        set_config(session, "erp_write_enabled", "true")
+        session.commit()
+        
+        try:
+            erp_result = process_erp_billing(session, order, trace_id=trace_id)
+            session.commit()
+            if not erp_result.get("erp_success") and not erp_result.get("erp_skipped"):
+                erp_success = False
+                erp_error = erp_result.get("error")
+        finally:
+            set_config(session, "erp_write_enabled", orig_str)
+            session.commit()
+            
+    if not erp_success:
+        raise HTTPException(status_code=400, detail=f"金蝶制单失败：{erp_error}")
+        
+    # 2. 获取发货通知并确认（下推 OMS）
+    notice = latest_delivery_notice(session, order)
+    if not notice:
+        raise HTTPException(status_code=400, detail="未找到该订单的发货通知预览记录")
+        
+    if notice.status in {"Previewed", "Blocked", "Retrying"}:
+        try:
+            confirm_delivery_notice(session, notice, confirmed_by=current_user.username or "operator", trace_id=trace_id)
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=f"确认并推送失败：{str(exc)}")
+            
+    # 3. 再次确保下推邮件已经 enqueued（以防万一）
+    from backend.app.services.mail_template_service import enqueue_delivery_notice_mail
+    try:
+        enqueue_delivery_notice_mail(
+            session, order, list(order.items),
+            warehouse=notice.warehouse_code or "",
+            special_requirements=None,
+        )
+        session.commit()
+    except Exception as mail_exc:
+        logger.warning("发送发货通知邮件失败: %s", mail_exc)
+        
+    return {"success": True, "order_no": order.order_no, "erp_bill_no": order.erp_bill_no}
+
+
+@app.post("/api/v2/orders/{order_id}/wizard-create-erp-bill")
+def wizard_create_erp_bill(
+    order_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+        
+    # Enforce visibility check
+    if current_user.role == "business_operator":
+        is_owner = (order.sales_user_name == current_user.username)
+        is_same_dept = bool(current_user.department and order.crm_order and order.crm_order.owner_department and order.crm_order.owner_department.lower() == current_user.department.lower())
+        if not is_owner and not is_same_dept:
+            raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
+            
+    from backend.app.services.order_middle_platform import should_skip_erp_billing, process_erp_billing
+    
+    if order.erp_bill_no:
+        return {"success": True, "erp_bill_no": order.erp_bill_no, "already_exists": True}
+        
+    if should_skip_erp_billing(order):
+        return {"success": True, "erp_bill_no": None, "skipped": True}
+        
+    # 临时将 erp_write_enabled 开启，以便手动触发制单不受自动开关限制
+    orig_val = session.get(SystemConfig, "erp_write_enabled")
+    orig_str = orig_val.value if orig_val else "false"
+    
+    from backend.app.services.bootstrap import set_config
+    set_config(session, "erp_write_enabled", "true")
+    session.commit()
+    
+    try:
+        trace_id = f"manual-wizard-erp-{uuid.uuid4()}"
+        erp_result = process_erp_billing(session, order, trace_id=trace_id)
+        
+        # 无论成功或失败，都在金蝶处理完毕后，将订单流转状态重置回 DELIVERY_NOTICE_READY 状态，以便用户在向导中重试或继续下一步
+        from backend.app.services.order_middle_platform import transition_order, OrderEvent
+        transition_order(session, order, OrderEvent.DELIVERY_NOTICE_CREATED, trace_id=trace_id)
+        session.commit()
+        
+        if erp_result.get("erp_success") or erp_result.get("erp_skipped"):
+            erp_username = ""
+            row_cfg = session.get(SystemConfig, "erp_username")
+            if row_cfg and row_cfg.value:
+                erp_username = row_cfg.value.strip()
+            
+            from datetime import datetime
+            erp_completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return {
+                "success": True, 
+                "erp_bill_no": order.erp_bill_no, 
+                "erp_username": erp_username,
+                "erp_completed_at": erp_completed_at
+            }
+        else:
+            raise HTTPException(status_code=400, detail=erp_result.get("error") or "金蝶制单失败")
+    finally:
+        set_config(session, "erp_write_enabled", orig_str)
+        session.commit()
+
+
+@app.post("/api/v2/orders/{order_id}/wizard-delete-erp-bill")
+def wizard_delete_erp_bill(
+    order_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+        
+    if current_user.role == "business_operator":
+        is_owner = (order.sales_user_name == current_user.username)
+        is_same_dept = bool(current_user.department and order.crm_order and order.crm_order.owner_department and order.crm_order.owner_department.lower() == current_user.department.lower())
+        if not is_owner and not is_same_dept:
+            raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
+            
+    if not order.erp_bill_no:
+        return {"success": True, "message": "该订单暂无关联的金蝶单号，无需删除"}
+        
+    from backend.app.services.erp.kingdee_client import KingdeeClient
+    from backend.app.services.order_middle_platform import kingdee_config_from_session, normalize_query_rows
+    
+    try:
+        config = kingdee_config_from_session(session)
+        client = KingdeeClient(config)
+        
+        # 1. 查询 FID
+        query_result = client.execute_bill_query(
+            form_id="SAL_SaleOrder",
+            field_keys="FID,FBillNo",
+            filter_string=f"FBillNo = '{order.erp_bill_no}'",
+            limit=1,
+        )
+        bill_internal_id = None
+        items = normalize_query_rows(query_result.get("raw"))
+        if items and isinstance(items, list) and len(items) > 0:
+            row = items[0]
+            if isinstance(row, list) and len(row) > 0:
+                bill_internal_id = row[0]
+                
+        if bill_internal_id:
+            # 2. 反审核
+            unaudit_r = client.un_audit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_internal_id])
+            # 不论反审核是否由于本来就没有审核而报错，都继续执行删除
+            
+            # 3. 删除
+            delete_r = client.delete_bill(form_id="SAL_SaleOrder", bill_ids=[bill_internal_id])
+            if not delete_r.get("ok"):
+                raise Exception(delete_r.get("message") or "金蝶删除 API 调用失败")
+        else:
+            logger.warning("删除金蝶订单时，未在金蝶中找到单号为 %s 的单据，直接从本地清理单号", order.erp_bill_no)
+            
+        # 4. 清理本地单号并提交
+        order.erp_bill_no = None
+        session.commit()
+        return {"success": True, "message": "金蝶订单删除成功"}
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=f"金蝶订单删除失败：{str(exc)}")
+
+
+
+@app.post("/api/v2/orders/{order_id}/wizard-confirm-delivery-and-email")
+def wizard_confirm_delivery_and_email(
+    order_id: str,
+    payload: dict | None = None,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    order = session.get(MiddlePlatformOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail="中台订单不存在")
+
+    if current_user.role == "business_operator":
+        is_owner = (order.sales_user_name == current_user.username)
+        is_same_dept = bool(current_user.department and order.crm_order and order.crm_order.owner_department and order.crm_order.owner_department.lower() == current_user.department.lower())
+        if not is_owner and not is_same_dept:
+            raise HTTPException(status_code=403, detail="没有权限访问此中台订单")
+
+    from backend.app.services.order_middle_platform import latest_delivery_notice, confirm_delivery_notice
+
+    notice = latest_delivery_notice(session, order)
+    if not notice:
+        raise HTTPException(status_code=400, detail="未找到该订单的发货通知记录")
+
+    trace_id = f"manual-wizard-confirm-{uuid.uuid4()}"
+
+    if notice.status in {"Previewed", "Blocked", "Retrying"}:
+        try:
+            confirm_delivery_notice(session, notice, confirmed_by=current_user.username or "operator", trace_id=trace_id)
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=f"确认并推送失败：{str(exc)}")
+
+    # 如果用户提供了自定义邮件内容，直接使用；否则走模板渲染
+    payload = payload or {}
+    custom_to = payload.get("to")
+    custom_cc = payload.get("cc")
+    custom_subject = payload.get("subject")
+    custom_body = payload.get("body")
+
+    import re
+    _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    from backend.app.services.mail_template_service import enqueue_delivery_notice_mail
+    try:
+        if custom_subject and custom_body:
+            # 校验收件人/抄送邮箱格式
+            if custom_to:
+                if isinstance(custom_to, list):
+                    for addr in custom_to:
+                        if not _EMAIL_RE.match(str(addr or "").strip()):
+                            raise HTTPException(status_code=400, detail=f"收件人邮箱格式不正确：{addr}")
+                elif isinstance(custom_to, str):
+                    custom_to = [a.strip() for a in custom_to.split(",") if a.strip()]
+                    for addr in custom_to:
+                        if not _EMAIL_RE.match(addr):
+                            raise HTTPException(status_code=400, detail=f"收件人邮箱格式不正确：{addr}")
+            if custom_cc:
+                if isinstance(custom_cc, list):
+                    for addr in custom_cc:
+                        if addr and not _EMAIL_RE.match(str(addr or "").strip()):
+                            raise HTTPException(status_code=400, detail=f"抄送邮箱格式不正确：{addr}")
+                elif isinstance(custom_cc, str):
+                    custom_cc = [a.strip() for a in custom_cc.split(",") if a.strip()]
+                    for addr in custom_cc:
+                        if addr and not _EMAIL_RE.match(addr):
+                            raise HTTPException(status_code=400, detail=f"抄送邮箱格式不正确：{addr}")
+
+            # 直接用用户编辑的内容创建发信任务
+            job = OutboundMailJob(
+                mail_type="sales_delivery",
+                to_json=dumps(custom_to or []),
+                cc_json=dumps(custom_cc or []),
+                subject=custom_subject,
+                body=custom_body,
+                idempotency_key=f"delivery-notice-{order.order_no}-{order.version}-custom",
+                status="Pending",
+                priority=20,
+            )
+            session.add(job)
+            session.commit()
+        else:
+            enqueue_delivery_notice_mail(
+                session, order, list(order.items),
+                warehouse=notice.warehouse_code or "",
+                special_requirements=None,
+            )
+            session.commit()
+    except HTTPException:
+        raise
+    except Exception as mail_exc:
+        logger.warning("发送发货通知邮件失败: %s", mail_exc)
+
+    return {"success": True}
+
+
 
 
 @app.post("/api/crm/orders/{order_id}/queue-v2")

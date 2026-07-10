@@ -5094,6 +5094,12 @@ input[type="checkbox"] {
   color: #9ca3af;
 }
 
+.status-tag.closed {
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #a5d6a7;
+}
+
 .order-row-out-of-scope,
 .order-row-out-of-scope td,
 .order-row-out-of-scope span,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import re
 import time
@@ -246,12 +247,14 @@ STATE_TRANSITIONS: dict[tuple[OrderStatus, OrderEvent], OrderStatus] = {
     # ERP 制单跃迁（一期新增）
     (OrderStatus.VALIDATED, OrderEvent.ERP_SAVE_STARTED): OrderStatus.ERP_PENDING,
     (OrderStatus.ERP_PENDING, OrderEvent.ERP_SAVE_STARTED): OrderStatus.ERP_SAVING,
+    (OrderStatus.DELIVERY_NOTICE_READY, OrderEvent.ERP_SAVE_STARTED): OrderStatus.ERP_SAVING,
     (OrderStatus.ERP_SAVING, OrderEvent.ERP_SAVE_SUCCESS): OrderStatus.ERP_SAVED,
     (OrderStatus.ERP_SAVING, OrderEvent.ERP_SAVE_FAILED): OrderStatus.ERP_FAILED,
     (OrderStatus.ERP_SAVING, OrderEvent.ERP_SUBMIT_FAILED): OrderStatus.ERP_FAILED,
     (OrderStatus.ERP_SAVING, OrderEvent.ERP_AUDIT_FAILED): OrderStatus.ERP_FAILED,
     (OrderStatus.ERP_FAILED, OrderEvent.EXCEPTION_RESOLVED_AND_RE_ERP): OrderStatus.ERP_PENDING,
     (OrderStatus.ERP_SAVED, OrderEvent.DELIVERY_NOTICE_CREATED): OrderStatus.DELIVERY_NOTICE_READY,
+    (OrderStatus.ERP_FAILED, OrderEvent.DELIVERY_NOTICE_CREATED): OrderStatus.DELIVERY_NOTICE_READY,
     (OrderStatus.VALIDATED, OrderEvent.DELIVERY_NOTICE_CREATED): OrderStatus.DELIVERY_NOTICE_READY,
     (OrderStatus.DELIVERY_NOTICE_READY, OrderEvent.ENQUEUE_OMS_PUSH): OrderStatus.OMS_PENDING,
     (OrderStatus.OMS_PENDING, OrderEvent.OMS_PUSH_SUCCESS): OrderStatus.OMS_ACCEPTED,
@@ -350,14 +353,37 @@ def process_erp_billing(session: Session, order: MiddlePlatformOrder, *, trace_i
                               "ERP 制单失败：金蝶写入未配置", [], trace_id=trace_id)
         return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": "金蝶写入未配置"}
 
-    # 预审通过后分配订单号
-    order.order_no = generate_middle_order_no(session)
+    # 预审通过后分配订单号 (若已分配则不再重新分配)
+    if not order.order_no:
+        order.order_no = generate_middle_order_no(session)
     transition_order(session, order, OrderEvent.ERP_SAVE_STARTED, trace_id=trace_id)
     session.flush()
 
     try:
         config = kingdee_config_from_session(session)
         client = KingdeeClient(config)
+
+        # ── 前置幂等性防重 Check ──
+        # 在真正向金蝶提交制单前，先通过当前中台订单号 (order_no) 查询金蝶备注中是否已生成过该订单
+        try:
+            query_result = client.execute_bill_query(
+                form_id="SAL_SaleOrder",
+                field_keys="FID,FBillNo",
+                filter_string=f"FNote LIKE '%{order.order_no}%' AND FBillNo NOT LIKE 'MP-%'",
+                limit=1,
+            )
+            existing_items = normalize_query_rows(query_result.get("raw"))
+            if existing_items and len(existing_items) > 0 and len(existing_items[0]) > 0:
+                bill_id = existing_items[0][0]
+                erp_bill_no = existing_items[0][1]
+                
+                # 更新本地订单信息并执行状态机跃迁
+                order.erp_bill_no = erp_bill_no
+                transition_order(session, order, OrderEvent.ERP_SAVE_SUCCESS, trace_id=trace_id,
+                                 detail={"erp_bill_no": erp_bill_no, "note": "金蝶已存在该订单，直接建立关联"})
+                return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": True, "erp_bill_no": erp_bill_no}
+        except Exception as check_exc:
+            logger.warning("金蝶制单前置幂等性 Check 异常（忽略并继续常规制单流程）: %s", check_exc)
 
         # Step 1: Save
         bill_model = build_sales_order_model(session, order, order.items)
@@ -383,16 +409,37 @@ def process_erp_billing(session: Session, order: MiddlePlatformOrder, *, trace_i
                                   f"ERP 制单失败(Save)：{error_msg}", [], trace_id=trace_id)
             return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
 
-        # 提取金蝶 FBillNo
+        # 提取金蝶 FBillNo 和 FID
         erp_bill_no = None
+        bill_id = None
         rd = save_result.get("result")
         if isinstance(rd, dict):
             erp_bill_no = rd.get("Number")
+            bill_id = rd.get("Id")
+            
+            # 标准金蝶 WebAPI Save 返回结构中，单号和内码保存在 SuccessEntitys
+            rs = rd.get("ResponseStatus")
+            if isinstance(rs, dict):
+                entities = rs.get("SuccessEntitys")
+                if isinstance(entities, list) and len(entities) > 0 and isinstance(entities[0], dict):
+                    entity = entities[0]
+                    if not erp_bill_no:
+                        erp_bill_no = entity.get("Number")
+                    if not bill_id:
+                        bill_id = entity.get("Id")
+                        
         if erp_bill_no:
             order.erp_bill_no = erp_bill_no
 
+        if not bill_id:
+            error_msg = "未能在金蝶制单返回数据中解析到单据内码 (FID)"
+            transition_order(session, order, OrderEvent.ERP_SAVE_FAILED, trace_id=trace_id,
+                             detail={"step": "save", "error": error_msg})
+            create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
+                                  f"ERP 制单失败(Save)：{error_msg}", [], trace_id=trace_id)
+            return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
         # Step 2: Submit
-        bill_id = rd.get("Id") if isinstance(rd, dict) else None
         if bill_id:
             sub_result = client.submit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_id])
             if not sub_result.get("ok"):
@@ -403,15 +450,7 @@ def process_erp_billing(session: Session, order: MiddlePlatformOrder, *, trace_i
                                       f"ERP 制单失败(Submit)：{error_msg}", [], trace_id=trace_id)
                 return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
 
-            # Step 3: Audit
-            aud_result = client.audit_bill(form_id="SAL_SaleOrder", bill_ids=[bill_id])
-            if not aud_result.get("ok"):
-                error_msg = aud_result.get("message") or "金蝶 Audit 失败（可能是审批流阻塞）"
-                transition_order(session, order, OrderEvent.ERP_AUDIT_FAILED, trace_id=trace_id,
-                                 detail={"step": "audit", "error": error_msg, "bill_id": bill_id})
-                create_exception_case(session, order, ExceptionType.OMS_BLOCKED, "High",
-                                      f"ERP 制单失败(Audit)：{error_msg}", [], trace_id=trace_id)
-                return {"order_id": order.id, "order_no": order.order_no, "status": order.status, "erp_success": False, "error": error_msg}
+
 
         # 全部成功
         transition_order(session, order, OrderEvent.ERP_SAVE_SUCCESS, trace_id=trace_id,
@@ -662,6 +701,43 @@ def handle_crm_snapshot_changed(
     new_payload_hash: str,
     trace_id: str = "",
 ) -> dict[str, Any]:
+    # 对比历史快照的 CRM 修改时间，如果 CRM 修改时间完全一致，说明不是 CRM 侧的主动修改，忽略本次变更事件
+    from backend.app.models import CrmOrderSnapshot
+    current_snapshot = (
+        session.query(CrmOrderSnapshot)
+        .filter(
+            CrmOrderSnapshot.source_system == crm_order.source_system,
+            CrmOrderSnapshot.crm_order_id == crm_order.crm_order_id,
+            CrmOrderSnapshot.payload_hash == order.payload_hash,
+        )
+        .first()
+    )
+    latest_snapshot = (
+        session.query(CrmOrderSnapshot)
+        .filter(
+            CrmOrderSnapshot.source_system == crm_order.source_system,
+            CrmOrderSnapshot.crm_order_id == crm_order.crm_order_id,
+            CrmOrderSnapshot.payload_hash == new_payload_hash,
+        )
+        .first()
+    )
+    if current_snapshot and latest_snapshot:
+        try:
+            curr_raw = loads(current_snapshot.raw_json, {})
+            late_raw = loads(latest_snapshot.raw_json, {})
+            curr_up = curr_raw.get("updated_at") or curr_raw.get("last_modified_time")
+            late_up = late_raw.get("updated_at") or late_raw.get("last_modified_time")
+            if curr_up and curr_up == late_up:
+                order.payload_hash = new_payload_hash
+                session.flush()
+                logger.info(
+                    "CRM order %s payload_hash changed due to non-CRM updates (e.g. OCR/enrichment/signatures). Skipping invalidation.",
+                    crm_order.crm_order_no
+                )
+                return {"continue_processing": True}
+        except Exception as e:
+            logger.warning("Compare CRM update time failed: %s", e)
+
     status = OrderStatus(order.status)
     detail = {
         "crm_order_id": crm_order.crm_order_id,
@@ -1217,7 +1293,13 @@ def normalized_fulfillment_type(raw: dict[str, Any]) -> str | None:
 def standard_sku_code_for_item(session: Session, order: MiddlePlatformOrder, item: dict[str, Any]) -> str | None:
     direct = str(item.get("sku_code") or item.get("sku_id") or "").strip()
     if direct:
-        return direct
+        # 如果 sku_code 是 CRM UUID（非标准物料编码），标记为潜在 CRM 编码
+        item["raw_sku_code"] = direct
+        # 检查本地 ProductSKU 是否能直接匹配（即标准物料编码）
+        sku = session.query(ProductSKU).filter(ProductSKU.sku_id == direct, ProductSKU.status == "Active").first()
+        if sku:
+            return direct
+        # 不是标准物料编码 → 不返回，继续尝试名称匹配
     shop_sku = raw_text_from_keys(item, ["shop_sku_code", "shopSkuCode", "platform_sku", "platformSku", "seller_sku", "sellerSku"])
     if shop_sku:
         channel_candidates = [order.channel_code, order.shop_code, "default", None]
@@ -3286,6 +3368,8 @@ def serialize_middle_order(order: MiddlePlatformOrder, *, include_detail: bool =
         "status": order.status,
         "validation_summary": loads(order.validation_summary_json, {}),
         "version": order.version,
+        "imported_at": order.imported_at.isoformat() if order.imported_at else None,
+        "order_date": order.crm_order.order_date if order.crm_order else None,
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "updated_at": order.updated_at.isoformat() if order.updated_at else None,
     }

@@ -7169,7 +7169,16 @@ function renderProductLogisticsCards(detail) {
       '<div class="order-detail-grid">' +
       orderDetailRow('数量', item.quantity) +
       orderDetailRow('平台SKU', item.shop_sku_code) +
-      orderDetailRow('仓库', firstPresent(itemLogistics.warehouse_code, group.warehouse_name, group.warehouse_code, latestNotice.warehouse_code)) +
+      orderDetailRowRaw('仓库', (function(){
+        var wh = firstPresent(itemLogistics.warehouse_code, group.warehouse_name, group.warehouse_code, latestNotice.warehouse_code);
+        if (wh === '未配置仓库' || !wh) {
+          if (['SZ','WH','GZ','WH_RX'].indexOf(detail.entity_code) !== -1) {
+            return '<strong style="color:#ef4444;">武汉仓（缺货）</strong>';
+          }
+          return '-';
+        }
+        return wh;
+      })()) +
       orderDetailRow('物流方式', firstPresent(itemLogistics.shipping_method, latestNotice.logistic_code, detail.fulfillment_type)) +
       orderDetailRow('收货人', firstPresent(itemLogistics.contact, receipt.contact)) +
       orderDetailRow('联系电话', firstPresent(itemLogistics.phone, receipt.phone)) +
@@ -7217,21 +7226,33 @@ function loadOrders() {
       list.innerHTML = '<div style="text-align:center;padding:48px;color:var(--muted);">暂无匹配订单</div>';
       return;
     }
-    var html = '<table class="data-table"><thead><tr><th>单号</th><th>客户</th><th>类型</th><th>状态</th><th>主体</th><th>操作</th></tr></thead><tbody>';
+    var CLOSED_LOOP_STATUSES = ['OMS_PENDING','OMS_RETRYING','OMS_BLOCKED','OMS_SHIPPED','PICKING','SHIPPED','FULFILLMENT_ARCHIVED','SIGNED','FINANCE_CHECKING','FINANCE_EXCEPTION','CLOSED','CANCELLED'];
+    var html = '<table class="data-table"><thead><tr><th>单号</th><th>客户</th><th>类型</th><th>状态</th><th>下单日期</th><th>入库时间</th><th>主体</th><th>操作</th></tr></thead><tbody>';
     orders.forEach(function(o) {
       var sc = 'pending';
       var outOfScope = o.status === 'OUT_OF_SCOPE';
+      var isClosed = CLOSED_LOOP_STATUSES.indexOf(o.status) !== -1;
       if (o.status === 'ERP_SAVED' || o.status === 'DELIVERY_NOTICE_READY') sc = 'success';
       else if (o.status === 'ERP_FAILED' || o.status === 'VALIDATION_BLOCKED') sc = 'failed';
       else if (o.status === 'ERP_SAVING' || o.status === 'ERP_PENDING') sc = 'running';
+      else if (isClosed) sc = 'closed';
       if (outOfScope) sc = 'muted';
+      var statusLabel = isClosed ? '已闭环' : middleOrderStatusLabel(o.status);
       html += '<tr' + (outOfScope ? ' class="order-row-out-of-scope"' : '') + '><td>' + (o.order_no || '').slice(-12) + '</td><td>' + (o.customer_name || '').slice(0, 16) + '</td>' +
         '<td>' + (o.order_type === 'STOCK_REPLENISHMENT' ? '备货' : '销售') + '</td>' +
-        '<td><span class="status-tag ' + sc + '">' + h(middleOrderStatusLabel(o.status)) + '</span></td>' +
+        '<td><span class="status-tag ' + sc + '">' + h(statusLabel) + '</span></td>' +
+        '<td style="white-space:nowrap;">' + h(o.order_date || '-') + '</td>' +
+        '<td style="white-space:nowrap;font-size:11px;">' + formatTime(o.imported_at) + '</td>' +
         '<td>' + (o.entity_code || '') + '</td>' +
-        '<td>' + (outOfScope ? '<span class="muted-action">—</span>' : 
-          '<a href="#" class="order-view" data-id="' + (o.id || '') + '">详情</a> | ' +
-          '<a href="#" class="order-kingdee-preview" data-id="' + (o.id || '') + '">金蝶预览</a>'
+        '<td>' + (outOfScope ? '<span class="muted-action">—</span>' :
+          '<a href="#" class="order-view" data-id="' + (o.id || '') + '">详情</a>' +
+          (o.status === 'DELIVERY_NOTICE_READY' ?
+            ' | <a href="#" class="order-push-erp" data-id="' + (o.id || '') + '" data-no="' + h(o.order_no || '') + '">制单并推送</a>' :
+            (isClosed ?
+              ' | <a href="#" class="order-revoke" data-id="' + (o.id || '') + '">撤回</a>' :
+              ' | <a href="#" class="order-kingdee-preview" data-id="' + (o.id || '') + '">金蝶</a>'
+            )
+          )
         ) + '</td></tr>';
     });
     html += '</tbody></table>';
@@ -7263,6 +7284,15 @@ function loadOrders() {
           if (!detail) return;
           openKingdeePreviewModal(detail);
         }).catch(function(err) { notifyError(err, ["订单处理", "加载金蝶预览失败"]); });
+      });
+    });
+    list.querySelectorAll('.order-push-erp').forEach(function(a) {
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        var id = this.dataset.id;
+        var orderNo = this.dataset.no || '';
+        if (!id) return;
+        openPushWizardModal(id, orderNo);
       });
     });
   }).catch(function(e) { notifyError(e, ["订单处理", "加载订单列表失败"]); });
@@ -7347,14 +7377,14 @@ function openKingdeePreviewModal(detail) {
     
     var isItemSkuErr = isSkuErr || itemRulesFailed.some(function(r) { return r.rule_code === "KNOWN_ACTIVE_SKU"; });
 
-    var skuHtml = isItemSkuErr
+    var skuHtml = isItemSkuErr && !item.official_sku_code
       ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
       : h(item.official_sku_code || item.sku_code);
 
     var nameHtml = item.official_product_name
-    var nameHtml = item.official_product_name
       ? h(item.official_product_name)
       : h(item.product_name || '-');
+    var modelHtml = h(item.product_model || item.model_name || '-');
     var qty = Number(item.quantity || 0);
     var qtyHtml = h(qty);
 
@@ -7596,6 +7626,681 @@ function openKingdeePreviewModal(detail) {
 
   if (closeBtn) closeBtn.addEventListener('click', closeModal);
   if (exitBtn) exitBtn.addEventListener('click', closeModal);
+}
+
+function openPushWizardModal(orderId, orderNo) {
+  var d = document.createElement('div');
+  d.className = 'modal-backdrop';
+  d.id = 'push-wizard-modal';
+  
+  // 注入动画 CSS（如果尚未注入）
+  if (!document.getElementById('wizard-spinner-styles')) {
+    var style = document.createElement('style');
+    style.id = 'wizard-spinner-styles';
+    style.innerHTML = '@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }';
+    document.head.appendChild(style);
+  }
+  
+  // 向导状态
+  var currentStep = 1;
+  var detailData = null;
+  var mailData = null;
+  var erpBillNo = null;
+  var erpUsername = null;
+  var erpCompletedAt = null;
+  var isProcessing = false;
+  
+  document.body.appendChild(d);
+  
+  // 加载数据
+  api('/api/v2/orders/' + orderId).then(function(detail) {
+    detailData = detail;
+    erpBillNo = detail.erp_bill_no;
+    erpUsername = detail.erp_username;
+    erpCompletedAt = detail.erp_completed_at;
+    renderStep();
+  }).catch(function(err) {
+    notifyError(err, ["制单并推送向导", "加载订单详情失败"]);
+    d.remove();
+  });
+  
+  function close() {
+    d.remove();
+    loadOrders(); // 刷新订单列表
+  }
+  
+  function renderStep() {
+    if (currentStep === 1) {
+      renderStep1();
+    } else if (currentStep === 2) {
+      renderStep2();
+    } else if (currentStep === 3) {
+      renderStep3();
+    } else if (currentStep === 4) {
+      renderStep4();
+    }
+  }
+  
+  // 第一步：金蝶预览
+  function renderStep1() {
+    var validation = detailData.flow?.validation_summary || detailData.validation_summary || {};
+    var failedRules = (validation.results || []).filter(function(r) { return r && r.passed === false; });
+    var failedCodes = failedRules.map(function(r) { return r.rule_code; });
+
+    var erpBillNoStr = erpBillNo || detailData.erp_bill_no;
+    var isBillNoErr = !erpBillNoStr; 
+    var billNoHtml = isBillNoErr 
+      ? '<span style="color:#ef4444;font-weight:bold;">暂无单号（将在第二步制单时生成）</span>' 
+      : h(erpBillNoStr);
+
+    var customerName = detailData.customer_name;
+    var isCustErr = failedCodes.indexOf("CUSTOMER_MAPPING") !== -1 || !customerName;
+    var customerHtml = isCustErr
+      ? '<span style="color:#ef4444;font-weight:bold;">未配置客户</span>'
+      : h(customerName);
+
+    var orgId = detailData.fulfillment_entity || detailData.entity_code || '';
+    var isOrgErr = failedCodes.indexOf("REQUIRED_HEAD_FIELDS") !== -1 && !orgId;
+    var orgName = getEntityName(orgId);
+    var orgHtml = isOrgErr || !orgName
+      ? '<span style="color:#ef4444;font-weight:bold;">未配置主体</span>'
+      : h(orgName);
+
+    var orderDate = detailData.created_at ? formatTime(detailData.created_at).split(' ')[0] : '';
+    var dateHtml = orderDate ? h(orderDate) : h(new Date().toISOString().split('T')[0].replace(/-/g, '/'));
+
+    var currency = detailData.currency || '人民币';
+    var currencyHtml = h(currency);
+
+    var deptName = detailData.dept_name || '国内营销中心教育事业部';
+    var salesperson = detailData.sales_user_name || '杜红刚';
+    var orderNoHtml = h(detailData.order_no);
+
+    var billStatus = erpBillNoStr ? '已审核' : '暂存';
+
+    var itemsHtml = '';
+    var items = detailData.items || [];
+    items.forEach(function(item, idx) {
+      var isSkuErr = failedCodes.indexOf("KNOWN_ACTIVE_SKU") !== -1 && (!item.sku_code || item.sku_code.length > 20);
+      var itemRulesFailed = failedRules.filter(function(r) {
+        return (r.rule_code === "KNOWN_ACTIVE_SKU" || r.rule_code === "LOCAL_INVENTORY_AVAILABLE") && 
+               (r.reason || '').indexOf(item.sku_code) !== -1;
+      });
+      
+      var isItemSkuErr = isSkuErr || itemRulesFailed.some(function(r) { return r.rule_code === "KNOWN_ACTIVE_SKU"; });
+
+      var skuHtml = isItemSkuErr && !item.official_sku_code
+        ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+        : h(item.official_sku_code || item.sku_code);
+
+      var nameHtml = item.official_product_name
+        ? h(item.official_product_name)
+        : h(item.product_name || '-');
+      var modelHtml = h(item.product_model || item.model_name || '-');
+      var qty = Number(item.quantity || 0);
+      var qtyHtml = h(qty);
+
+      var price = Number(item.price || 0);
+      var isPriceErr = failedCodes.indexOf("POSITIVE_ORDER_AMOUNT") !== -1 && price <= 0;
+      var priceHtml = isPriceErr
+        ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+        : (price ? '¥' + price.toFixed(2) : '-');
+
+      var isGift = price <= 0;
+      var taxRate = 13.00;
+      var totalAmount = qty * price;
+      var netAmount = totalAmount / 1.13;
+      var taxAmount = totalAmount - netAmount;
+
+      var totalHtml = isPriceErr
+        ? '<span style="color:#ef4444;font-weight:bold;">未获取/未通过预审</span>'
+        : '¥' + totalAmount.toFixed(2);
+
+      var netHtml = isPriceErr
+        ? '-'
+        : '¥' + netAmount.toFixed(2);
+
+      var taxAmountHtml = isPriceErr
+        ? '-'
+        : '¥' + taxAmount.toFixed(2);
+
+      itemsHtml += '<tr>' +
+        '<td>' + (idx + 1) + '</td>' +
+        '<td>标准产品</td>' +
+        '<td class="' + (isItemSkuErr ? 'error' : '') + '">' + skuHtml + '</td>' +
+        '<td>' + nameHtml + '</td>' +
+        '<td>' + modelHtml + '</td>' +
+        '<td>' + qtyHtml + '</td>' +
+        '<td>台</td>' +
+        '<td class="' + (isPriceErr ? 'error' : '') + '">' + priceHtml + '</td>' +
+        '<td class="' + (isPriceErr ? 'error' : '') + '">' + priceHtml + '</td>' +
+        '<td style="text-align:center;"><input type="checkbox" class="kd-checkbox" disabled ' + (isGift ? 'checked' : '') + ' /></td>' +
+        '<td>' + taxRate.toFixed(2) + '</td>' +
+        '<td>' + taxAmountHtml + '</td>' +
+        '<td>' + netHtml + '</td>' +
+        '<td class="' + (isPriceErr ? 'error' : '') + '">' + totalHtml + '</td>' +
+      '</tr>';
+    });
+
+    function kdField(label, valueHtml, isRequired, isDropdown, isDate, extraStyle, isError) {
+      var asterisk = isRequired ? '<span class="kd-field-required-marker">*</span>' : '';
+      var icon = isDropdown ? '<span class="kd-field-icon">▼</span>' : (isDate ? '<span class="kd-field-icon">📅</span>' : '');
+      var errorClass = isError ? ' error' : '';
+      var notesClass = label === '备注' ? ' notes-field' : '';
+      return '<div class="kd-field-row" style="' + (extraStyle || '') + '">' +
+        '<span class="kd-field-label">' + h(label) + '</span>' +
+        '<div class="kd-field-input-wrap">' +
+          '<div class="kd-input-field' + errorClass + notesClass + '">' + valueHtml + '</div>' +
+          icon +
+          asterisk +
+        '</div>' +
+      '</div>';
+    }
+
+    d.innerHTML = 
+      '<section class="modal-panel kd-modal-panel" role="dialog" aria-modal="true" style="max-width: 1200px; width: 95%; padding: 0; border-radius: 8px; overflow: hidden; background: #fff; box-shadow: 0 10px 25px rgba(0,0,0,0.15); display: flex; flex-direction: column; max-height: 90vh;">' +
+        // Steps Bar
+        '<div style="background: #f5f5f5; border-bottom: 1px solid #ddd; padding: 10px 20px; display: flex; justify-content: space-between; font-size: 12px;">' +
+          '<span style="font-weight: bold; color: #2b579a;">1. 金蝶预览 (当前)</span>' +
+          '<span style="color: #999;">2. 金蝶制单</span>' +
+          '<span style="color: #999;">3. 邮件预览</span>' +
+          '<span style="color: #999;">4. 发货推送</span>' +
+        '</div>' +
+        // Deep Blue Header Bar
+        '<div class="kd-header-bar">' +
+          '<div class="kd-logo-area">' +
+            '<span class="kd-logo-icon">K</span>' +
+            '<span class="kd-logo-text">金蝶云 星空 (制单推送向导)</span>' +
+            '<span class="kd-company-name">深圳积木易搭科技有限公司-2... | 100 深圳积木易搭科技有限公司</span>' +
+          '</div>' +
+          '<div class="kd-header-right">' +
+            '<span class="kd-header-menu-item">帮助</span>' +
+            '<span class="kd-header-menu-item">关于</span>' +
+            '<span class="kd-header-menu-item">👤 刘伟燕</span>' +
+            '<button type="button" class="close-btn" style="font-size: 16px; font-weight: bold; background: none; border: none; color: #fff; cursor: pointer;">✕</button>' +
+          '</div>' +
+        '</div>' +
+        // System Tabs
+        '<div class="kd-sys-tabs">' +
+          '<div class="kd-sys-tab">销售订单列表</div>' +
+          '<div class="kd-sys-tab active">销售订单 - 修改 ✕</div>' +
+        '</div>' +
+        // Button Toolbar
+        '<div class="kd-toolbar">' +
+          '<div class="kd-toolbar-buttons">' +
+            '<button class="kd-toolbar-btn primary" disabled>新增 ▼</button>' +
+            '<button class="kd-toolbar-btn" disabled>保存</button>' +
+            '<button class="kd-toolbar-btn" disabled>提交 ▼</button>' +
+            '<button class="kd-toolbar-btn" disabled>审核 ▼</button>' +
+            '<button class="kd-toolbar-btn" disabled>下推 ▼</button>' +
+          '</div>' +
+        '</div>' +
+        // Sub-Tabs Bar
+        '<div class="kd-page-subtabs">' +
+          '<div class="kd-subtab active">基本信息</div>' +
+          '<div class="kd-subtab">客户信息</div>' +
+          '<div class="kd-subtab">财务信息</div>' +
+          '<div class="kd-subtab">明细信息</div>' +
+        '</div>' +
+        // Scroll Container
+        '<div class="kd-content-scroll" style="flex: 1; overflow-y: auto;">' +
+          // Basic info Card
+          '<div class="kd-section-accordion">' +
+            '<div class="kd-accordion-head"><span class="kd-accordion-arrow">▼</span>基本信息</div>' +
+            '<div class="kd-accordion-body">' +
+              '<div class="kd-grid-form-5">' +
+                kdField('单据类型', '标准销售订单', true, true) +
+                kdField('销售类型', '产品类销售', true, true) +
+                kdField('销售部门', h(deptName), true, true) +
+                kdField('销售项目', '', false, true) +
+                kdField('收货国家', '', false, true) +
+
+                kdField('单据编号', billNoHtml, false, false, false, '', isBillNoErr) +
+                kdField('销售组织', orgHtml, true, true, false, '', isOrgErr) +
+                kdField('销售组', '', false, true) +
+                kdField('有无风险', '', false, true) +
+                kdField('收货国家简称', '', false, false) +
+
+                kdField('日期', dateHtml, true, false, true) +
+                kdField('客户', customerHtml, true, true, false, '', isCustErr) +
+                kdField('销售员', h(salesperson), true, true) +
+                kdField('订单编号', orderNoHtml, false, false) +
+                kdField('(美国) 州', '', false, true) +
+
+                kdField('业务类型', '普通销售', true, true) +
+                kdField('结算币别', currencyHtml, true, true) +
+                kdField('单据状态', h(billStatus), false, true) +
+                kdField('网店订单号', '', false, false) +
+                kdField('(美国) 州简称', '', false, false) +
+
+                kdField('交货方式', '', false, true) +
+                kdField('价目表', '', false, true) +
+                kdField('变更原因', '', false, true) +
+                kdField('终端网店单号', '', false, false) +
+                '<div class="kd-field-row"></div>' +
+
+                kdField('交货地点', '', false, true) +
+                kdField('收款条件', '', false, true) +
+                kdField('备注', '中台订单 ' + orderNoHtml + ' | ' + customerHtml, false, false) +
+                kdField('销售渠道', '', false, true) +
+                '<div class="kd-field-row"></div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          
+          // Customer info collapsed
+          '<div class="kd-section-accordion">' +
+            '<div class="kd-accordion-head collapsed"><span class="kd-accordion-arrow">▶</span>客户信息</div>' +
+          '</div>' +
+          
+          // Detail list Card
+          '<div class="kd-section-accordion">' +
+            '<div class="kd-accordion-head"><span class="kd-accordion-arrow">▼</span>明细信息</div>' +
+            '<div class="kd-accordion-body">' +
+              '<div class="kd-table-toolbar">' +
+                '<button class="kd-table-btn" disabled>新增行</button>' +
+                '<button class="kd-table-btn" disabled>删除行</button>' +
+                '<button class="kd-table-btn" disabled>批量填充</button>' +
+                '<button class="kd-table-btn" style="color: #004ea2; font-weight: bold;">附件</button>' +
+              '</div>' +
+              '<div class="kd-table-wrap">' +
+                '<table class="kd-table">' +
+                  '<thead>' +
+                    '<tr>' +
+                      '<th>序号</th>' +
+                      '<th>产品类型</th>' +
+                      '<th>物料编码 <span style="color:#ef4444;">*</span></th>' +
+                      '<th>物料名称</th>' +
+                      '<th>规格型号</th>' +
+                      '<th>父项产品</th>' +
+                      '<th>销售数量 <span style="color:#ef4444;">*</span></th>' +
+                      '<th>销售单位</th>' +
+                      '<th>计价数量</th>' +
+                      '<th>计价单位</th>' +
+                      '<th>单价</th>' +
+                      '<th>含税单价 <span style="color:#ef4444;">*</span></th>' +
+                      '<th>是否赠品</th>' +
+                      '<th>税率%</th>' +
+                      '<th>税额</th>' +
+                      '<th>金额</th>' +
+                      '<th>价税合计</th>' +
+                    '</tr>' +
+                  '</thead>' +
+                  '<tbody>' + itemsHtml + '</tbody>' +
+                '</table>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+        // Footer navigation
+        '<div style="background: #f5f5f5; padding: 12px 20px; text-align: right; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 10px;">' +
+          '<button type="button" class="button secondary cancel-btn">取消</button>' +
+          '<button type="button" class="button primary next-btn" style="background: #2b579a; border: none; color: #fff;">下一步：金蝶制单</button>' +
+        '</div>' +
+      '</section>';
+
+      d.querySelector('.cancel-btn').addEventListener('click', close);
+      d.querySelector('.close-btn').addEventListener('click', close);
+      d.querySelector('.next-btn').addEventListener('click', function() {
+        currentStep = 2;
+        renderStep();
+      });
+  }
+
+  // 第二步：金蝶制单确认页
+  function renderStep2() {
+    var statusHtml = "";
+    var actionBtnHtml = "";
+    var icon = '⚙️';
+    
+    if (erpBillNo) {
+      icon = '🎉';
+      statusHtml = 
+        '<div style="color: #2e7d32; font-weight: bold; font-size: 16px; margin-bottom: 12px;">✓ 金蝶销售订单制单并提交成功！</div>' +
+        '<div style="background: #f9f9f9; padding: 15px; border-radius: 4px; border: 1px solid #e2e8f0; text-align: left; width: 100%; box-sizing: border-box; font-size: 13px; color: #475569; margin-bottom: 15px; line-height: 1.6;">' +
+          '• <strong>系统单号：</strong>' + h(detailData.order_no || '-') + '<br>' +
+          '• <strong>金蝶销售订单编号 (FBillNo)：</strong><span style="color: #1e3a8a; font-weight: bold;">' + h(erpBillNo || '-') + '</span><br>' +
+          '• <strong>核算主体 (组织)：</strong>' + h(detailData.fulfillment_entity || detailData.entity_code || '-') + '<br>' +
+          '• <strong>金蝶单据状态：</strong>已保存 ➡️ 已提交 (待财务审核)<br>' +
+          '• <strong>制单执行人：</strong>' + h(erpUsername || 'System') + '<br>' +
+          '• <strong>制单完成时间：</strong>' + h(erpCompletedAt || '-') + '<br>' +
+          '• <strong>制单执行状态：</strong>成功 (Success)' +
+        '</div>';
+      actionBtnHtml = 
+        '<button type="button" class="button secondary delete-erp-btn" style="background: #ef4444; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">删除订单</button>' +
+        '<button type="button" class="button primary next-btn" style="background: #2e7d32; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer;">下一步：邮件预览</button>';
+    } else {
+      icon = '⚙️';
+      statusHtml = '<div style="color: #555; margin-bottom: 20px; font-size: 14px;">准备向金蝶 ERP 系统中写入并提交销售订单，请确认无误后点击下方【开始制单】。</div>';
+      actionBtnHtml = '<button type="button" class="button primary start-erp-btn" style="background: #2b579a; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer;">开始制单</button>';
+    }
+      
+    d.innerHTML = 
+      '<section class="modal-panel" role="dialog" aria-modal="true" style="max-width: 600px; width: 90%; padding: 0; border-radius: 8px; overflow: hidden; background: #fff; box-shadow: 0 10px 25px rgba(0,0,0,0.15); display: flex; flex-direction: column;">' +
+        // Steps Bar
+        '<div style="background: #f5f5f5; border-bottom: 1px solid #ddd; padding: 10px 20px; display: flex; justify-content: space-between; font-size: 12px;">' +
+          '<span style="color: #666;">1. 金蝶预览</span>' +
+          '<span style="font-weight: bold; color: #2b579a;">2. 金蝶制单 (当前)</span>' +
+          '<span style="color: #999;">3. 邮件预览</span>' +
+          '<span style="color: #999;">4. 发货推送</span>' +
+        '</div>' +
+        // Header
+        '<div style="background: #2b579a; color: #fff; padding: 12px 20px; font-weight: bold; font-size: 16px; display: flex; justify-content: space-between; align-items: center;">' +
+          '<span>🚀 制单并推送向导 - 第二步：金蝶自动制单</span>' +
+          '<button type="button" class="close-btn" style="background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0; line-height: 1;">✕</button>' +
+        '</div>' +
+        '<div style="padding: 40px 30px; text-align: center; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 200px;">' +
+          '<div style="font-size: 48px; margin-bottom: 15px;">' + icon + '</div>' +
+          '<div id="erp-status-container">' + statusHtml + '</div>' +
+          '<div id="erp-loading-spinner" style="display: none; margin-bottom: 15px;">' +
+            '<div style="border: 4px solid #f3f3f3; border-top: 4px solid #2b579a; border-radius: 50%; width: 36px; height: 36px; animation: spin 1s linear infinite; margin: 0 auto 15px;"></div>' +
+            '<div style="color: #666; font-size: 13px;">正在与金蝶 ERP 系统对接，请稍候...</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="background: #f5f5f5; padding: 12px 20px; text-align: right; border-top: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">' +
+          '<button type="button" class="button secondary prev-btn">上一步</button>' +
+          '<div style="display: flex; gap: 10px;" id="erp-action-panel">' +
+            actionBtnHtml +
+          '</div>' +
+        '</div>' +
+      '</section>';
+      
+      d.querySelector('.close-btn').addEventListener('click', close);
+      d.querySelector('.prev-btn').addEventListener('click', function() {
+        currentStep = 1;
+        renderStep();
+      });
+      
+      bindStep2Actions();
+  }
+
+  function bindStep2Actions() {
+    var nextBtn = d.querySelector('.next-btn');
+    if (nextBtn) {
+      nextBtn.addEventListener('click', function() {
+        goToStep3();
+      });
+    }
+    
+    var startBtn = d.querySelector('.start-erp-btn');
+    if (startBtn) {
+      startBtn.addEventListener('click', function() {
+        isProcessing = true;
+        d.querySelector('.prev-btn').disabled = true;
+        d.querySelector('.close-btn').disabled = true;
+        startBtn.style.display = 'none';
+        document.getElementById('erp-status-container').style.display = 'none';
+        document.getElementById('erp-loading-spinner').style.display = 'block';
+        
+        api('/api/v2/orders/' + orderId + '/wizard-create-erp-bill', { method: 'POST' }).then(function(res) {
+          isProcessing = false;
+          erpBillNo = res.erp_bill_no;
+          erpUsername = res.erp_username;
+          erpCompletedAt = res.erp_completed_at;
+          renderStep2();
+        }).catch(function(err) {
+          isProcessing = false;
+          d.querySelector('.prev-btn').disabled = false;
+          d.querySelector('.close-btn').disabled = false;
+          document.getElementById('erp-loading-spinner').style.display = 'none';
+          document.getElementById('erp-status-container').style.display = 'block';
+          document.getElementById('erp-status-container').innerHTML = 
+            '<div style="color: #ef4444; font-weight: bold; margin-bottom: 20px; font-size: 14px;">✗ 制单失败：' + h(err.message || err) + '</div>';
+          startBtn.style.display = 'inline-block';
+        });
+      });
+    }
+    
+    var deleteBtn = d.querySelector('.delete-erp-btn');
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', function() {
+        if (!confirm("确认要在金蝶 ERP 中删除订单 " + erpBillNo + " 吗？\n该操作将对该订单执行反审核并删除。")) return;
+        
+        isProcessing = true;
+        d.querySelector('.prev-btn').disabled = true;
+        d.querySelector('.close-btn').disabled = true;
+        deleteBtn.disabled = true;
+        var nextBtn = d.querySelector('.next-btn');
+        if (nextBtn) nextBtn.disabled = true;
+        
+        document.getElementById('erp-status-container').style.display = 'none';
+        document.getElementById('erp-loading-spinner').style.display = 'block';
+        document.getElementById('erp-loading-spinner').querySelector('div:last-child').innerText = '正在从金蝶中删除该订单，请稍候...';
+        
+        api('/api/v2/orders/' + orderId + '/wizard-delete-erp-bill', { method: 'POST' }).then(function() {
+          isProcessing = false;
+          erpBillNo = null;
+          toast("金蝶订单已成功反审核并删除！");
+          renderStep2();
+        }).catch(function(err) {
+          isProcessing = false;
+          d.querySelector('.prev-btn').disabled = false;
+          d.querySelector('.close-btn').disabled = false;
+          if (deleteBtn) deleteBtn.disabled = false;
+          if (nextBtn) nextBtn.disabled = false;
+          document.getElementById('erp-loading-spinner').style.display = 'none';
+          document.getElementById('erp-status-container').style.display = 'block';
+          toast("删除失败：" + (err.message || err), "error");
+          renderStep2();
+        });
+      });
+    }
+  }
+
+  function goToStep3() {
+    toast("正在加载发货通知邮件预览...");
+    api('/api/v2/orders/' + orderId + '/mail-preview').then(function(mail) {
+      mailData = mail;
+      currentStep = 3;
+      renderStep();
+    }).catch(function(err) {
+      notifyError(err, ["制单并推送向导", "加载邮件预览失败"]);
+    });
+  }
+
+  // 第三步：邮件预览（支持用户二次编辑）
+  function renderStep3() {
+    var toStr = (mailData.to || []).join(', ');
+    var ccStr = (mailData.cc || []).join(', ');
+    var subjectStr = mailData.subject || '';
+    var bodyStr = mailData.body || '';
+
+    d.innerHTML =
+      '<section class="modal-panel" role="dialog" aria-modal="true" style="max-width: 850px; width: 95%; padding: 0; border-radius: 8px; overflow: hidden; background: #fff; box-shadow: 0 10px 25px rgba(0,0,0,0.15); display: flex; flex-direction: column; max-height: 90vh;">' +
+        // Steps Bar
+        '<div style="background: #f5f5f5; border-bottom: 1px solid #ddd; padding: 10px 20px; display: flex; justify-content: space-between; font-size: 12px;">' +
+          '<span style="color: #666;">1. 金蝶预览</span>' +
+          '<span style="color: #666;">2. 金蝶制单</span>' +
+          '<span style="font-weight: bold; color: #2b579a;">3. 邮件预览 (当前)</span>' +
+          '<span style="color: #999;">4. 发货推送</span>' +
+        '</div>' +
+        // Header
+        '<div style="background: #2b579a; color: #fff; padding: 12px 20px; font-weight: bold; font-size: 16px; display: flex; justify-content: space-between; align-items: center;">' +
+          '<span>🚀 制单并推送向导 - 第三步：邮件内容编辑</span>' +
+          '<button type="button" class="close-btn" style="background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0; line-height: 1;">✕</button>' +
+        '</div>' +
+        '<div style="padding: 20px; font-size: 14px; line-height: 1.5; color: #333; overflow-y: auto; flex: 1;">' +
+          '<div style="margin-bottom: 10px; display: flex; align-items: flex-start;">' +
+            '<strong style="width: 80px; color: #666; padding-top: 6px;">收件人：</strong>' +
+            '<div style="flex: 1;"><input id="mail-to-input" type="text" value="' + h(toStr) + '" placeholder="多个邮箱用逗号分隔" style="width: 100%; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; box-sizing: border-box;" />' +
+            '<div id="mail-to-error" style="color: #ef4444; font-size: 12px; margin-top: 4px; display: none;"></div></div>' +
+          '</div>' +
+          '<div style="margin-bottom: 10px; display: flex; align-items: flex-start;">' +
+            '<strong style="width: 80px; color: #666; padding-top: 6px;">抄送：</strong>' +
+            '<div style="flex: 1;"><input id="mail-cc-input" type="text" value="' + h(ccStr) + '" placeholder="多个邮箱用逗号分隔" style="width: 100%; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; box-sizing: border-box;" />' +
+            '<div id="mail-cc-error" style="color: #ef4444; font-size: 12px; margin-top: 4px; display: none;"></div></div>' +
+          '</div>' +
+          '<div style="margin-bottom: 16px; display: flex; align-items: flex-start;">' +
+            '<strong style="width: 80px; color: #666; padding-top: 6px;">主题：</strong>' +
+            '<div style="flex: 1;"><input id="mail-subject-input" type="text" value="' + h(subjectStr) + '" style="width: 100%; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-weight: bold; box-sizing: border-box;" /></div>' +
+          '</div>' +
+          '<div style="display: flex; align-items: flex-start;">' +
+            '<strong style="width: 80px; color: #666; padding-top: 6px;">内容：</strong>' +
+            '<div style="flex: 1;"><textarea id="mail-body-input" rows="14" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: monospace; white-space: pre-wrap; line-height: 1.6; box-sizing: border-box; resize: vertical;">' + h(bodyStr) + '</textarea></div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="background: #f5f5f5; padding: 12px 20px; text-align: right; border-top: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">' +
+          '<button type="button" class="button secondary prev-btn">上一步</button>' +
+          '<button type="button" class="button primary next-btn" style="background: #2b579a; border: none; color: #fff;">下一步：发货推送确认</button>' +
+        '</div>' +
+      '</section>';
+
+      d.querySelector('.close-btn').addEventListener('click', close);
+      d.querySelector('.prev-btn').addEventListener('click', function() {
+        currentStep = 2;
+        renderStep();
+      });
+      d.querySelector('.next-btn').addEventListener('click', function() {
+        // 收集编辑后的值
+        var toVal = document.getElementById('mail-to-input').value.trim();
+        var ccVal = document.getElementById('mail-cc-input').value.trim();
+        var subjectVal = document.getElementById('mail-subject-input').value.trim();
+        var bodyVal = document.getElementById('mail-body-input').value.trim();
+
+        // 邮箱格式校验
+        var emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        var toError = document.getElementById('mail-to-error');
+        var ccError = document.getElementById('mail-cc-error');
+        toError.style.display = 'none';
+        ccError.style.display = 'none';
+
+        var invalidTo = [];
+        if (toVal) {
+          toVal.split(',').forEach(function(addr) {
+            addr = addr.trim();
+            if (addr && !emailRegex.test(addr)) invalidTo.push(addr);
+          });
+        }
+        if (invalidTo.length) {
+          toError.textContent = '以下邮箱格式不正确：' + invalidTo.join(', ');
+          toError.style.display = 'block';
+          return;
+        }
+
+        if (!toVal) {
+          toError.textContent = '收件人不能为空';
+          toError.style.display = 'block';
+          return;
+        }
+
+        var invalidCc = [];
+        if (ccVal) {
+          ccVal.split(',').forEach(function(addr) {
+            addr = addr.trim();
+            if (addr && !emailRegex.test(addr)) invalidCc.push(addr);
+          });
+        }
+        if (invalidCc.length) {
+          ccError.textContent = '以下抄送邮箱格式不正确：' + invalidCc.join(', ');
+          ccError.style.display = 'block';
+          return;
+        }
+
+        if (!subjectVal) {
+          toast('邮件主题不能为空');
+          return;
+        }
+        if (!bodyVal) {
+          toast('邮件内容不能为空');
+          return;
+        }
+
+        // 保存编辑后的值
+        mailData.to = toVal.split(',').map(function(a) { return a.trim(); }).filter(Boolean);
+        mailData.cc = ccVal.split(',').map(function(a) { return a.trim(); }).filter(Boolean);
+        mailData.subject = subjectVal;
+        mailData.body = bodyVal;
+
+        currentStep = 4;
+        renderStep();
+      });
+  }
+
+  // 第四步：推送确认与提示完成
+  function renderStep4() {
+    d.innerHTML = 
+      '<section class="modal-panel" role="dialog" aria-modal="true" style="max-width: 600px; width: 90%; padding: 0; border-radius: 8px; overflow: hidden; background: #fff; box-shadow: 0 10px 25px rgba(0,0,0,0.15); display: flex; flex-direction: column;">' +
+        // Steps Bar
+        '<div style="background: #f5f5f5; border-bottom: 1px solid #ddd; padding: 10px 20px; display: flex; justify-content: space-between; font-size: 12px;">' +
+          '<span style="color: #666;">1. 金蝶预览</span>' +
+          '<span style="color: #666;">2. 金蝶制单</span>' +
+          '<span style="color: #666;">3. 邮件预览</span>' +
+          '<span style="font-weight: bold; color: #2b579a;">4. 发货推送 (当前)</span>' +
+        '</div>' +
+        // Header
+        '<div style="background: #2b579a; color: #fff; padding: 12px 20px; font-weight: bold; font-size: 16px; display: flex; justify-content: space-between; align-items: center;">' +
+          '<span>🚀 制单并推送向导 - 第四步：发货下推与通知</span>' +
+          '<button type="button" class="close-btn" style="background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0; line-height: 1;">✕</button>' +
+        '</div>' +
+        '<div style="padding: 40px 30px; text-align: center; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 200px;">' +
+          '<div id="push-icon" style="font-size: 48px; margin-bottom: 15px;">📦</div>' +
+          '<div id="push-status-container">' +
+            '<div style="color: #555; margin-bottom: 20px; font-size: 14px;">准备正式下推发货单至 OMS 系统并发送物流发货通知邮件。请确认。</div>' +
+          '</div>' +
+          '<div id="push-loading-spinner" style="display: none; margin-bottom: 15px;">' +
+            '<div style="border: 4px solid #f3f3f3; border-top: 4px solid #2b579a; border-radius: 50%; width: 36px; height: 36px; animation: spin 1s linear infinite; margin: 0 auto 15px;"></div>' +
+            '<div style="color: #666; font-size: 13px;">正在将订单下推并发送通知，请稍候...</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="background: #f5f5f5; padding: 12px 20px; text-align: right; border-top: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">' +
+          '<button type="button" class="button secondary prev-btn">上一步</button>' +
+          '<div style="display: flex; gap: 10px;" id="push-action-panel">' +
+            '<button type="button" class="button primary start-push-btn" style="background: #2b579a; border: none; color: #fff;">确认推送</button>' +
+          '</div>' +
+        '</div>' +
+      '</section>';
+      
+      d.querySelector('.close-btn').addEventListener('click', close);
+      d.querySelector('.prev-btn').addEventListener('click', function() {
+        currentStep = 3;
+        renderStep();
+      });
+      
+      var startPushBtn = d.querySelector('.start-push-btn');
+      if (startPushBtn) {
+        startPushBtn.addEventListener('click', function() {
+          isProcessing = true;
+          d.querySelector('.prev-btn').disabled = true;
+          d.querySelector('.close-btn').disabled = true;
+          startPushBtn.style.display = 'none';
+          document.getElementById('push-status-container').style.display = 'none';
+          document.getElementById('push-loading-spinner').style.display = 'block';
+          
+          api('/api/v2/orders/' + orderId + '/wizard-confirm-delivery-and-email', {
+            method: 'POST',
+            body: JSON.stringify({
+              to: mailData.to,
+              cc: mailData.cc,
+              subject: mailData.subject,
+              body: mailData.body,
+            }),
+          }).then(function(res) {
+            isProcessing = false;
+            document.getElementById('push-loading-spinner').style.display = 'none';
+            document.getElementById('push-icon').innerHTML = '🎉';
+            document.getElementById('push-status-container').style.display = 'block';
+            document.getElementById('push-status-container').innerHTML = 
+              '<div style="color: #2e7d32; font-weight: bold; font-size: 16px; margin-bottom: 12px;">制单及发货推送完成！</div>' +
+              '<div style="color: #555; font-size: 13px; line-height: 1.6;">金蝶销售订单已成功写入并完成审核；<br>发货指令已成功下推至仓储系统 (OMS)；<br>物流发货通知邮件已进入发送队列。</div>';
+            
+            d.querySelector('.prev-btn').style.display = 'none';
+            d.querySelector('.close-btn').disabled = false;
+            document.getElementById('push-action-panel').innerHTML = 
+              '<button type="button" class="button primary close-wizard-btn" style="background: #2b579a; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer;">关闭</button>';
+            d.querySelector('.close-wizard-btn').addEventListener('click', close);
+          }).catch(function(err) {
+            isProcessing = false;
+            d.querySelector('.prev-btn').disabled = false;
+            d.querySelector('.close-btn').disabled = false;
+            document.getElementById('push-loading-spinner').style.display = 'none';
+            document.getElementById('push-status-container').style.display = 'block';
+            document.getElementById('push-status-container').innerHTML = 
+              '<div style="color: #ef4444; font-weight: bold; margin-bottom: 20px; font-size: 14px;">✗ 推送失败：' + h(err.message || err) + '</div>';
+            startPushBtn.style.display = 'inline-block';
+          });
+        });
+      }
+  }
 }
 
 // —— 主数据页面 ——
