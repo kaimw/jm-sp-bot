@@ -8546,7 +8546,7 @@ function openAliasEditor(spuUuid, spuId, name, aliases) {
           return '<div class="ae-alias-row" style="display:flex;gap:6px;align-items:center;margin-bottom:4px;padding:4px 6px;background:var(--surface);border-radius:4px;">' +
             '<span style="flex:1;font-size:13px;">' + h(a) + '</span>' +
             '<button type="button" class="icon-button ae-remove-btn" style="color:#dc2626;font-size:14px;">删除</button></div>';
-        }).join('') : '<div style="color:var(--muted);font-size:12px;padding:8px;">暂无别名</div>')
+        }).join('') : '<div style="color:var(--muted);font-size:12px;padding:8px;">暂无别名</div>') +
       '</div>' +
       '<div style="display:flex;gap:6px;margin-bottom:10px;">' +
         '<input id="ae-new-input" type="text" placeholder="输入新别名..." style="flex:1;padding:6px 10px;border:1px solid var(--line);border-radius:4px;font-size:13px;" />' +
@@ -8765,12 +8765,31 @@ function renderCBTTable(items) {
 
 function loadMR() {
   api('/api/config/mail-receivers').then(function(data) {
+    var sceneMap = {
+      'domestic_delivery': '国内仓发货',
+      'overseas_delivery': '海外仓发货',
+      'replenishment_domestic': '备货武汉',
+      'replenishment_overseas': '备货海外',
+      'TaskIssue': '推进：生产任务下发',
+      'ProductionConfirmed': '推进：已确认排产',
+      'ProductionRejected': '驳回：需补充确认',
+      'SalesReplyTaskReissue': '再次：业务重新下发',
+      'SalesDemandWithdrawn': '回退：业务撤回需求',
+      'LogisticsTaskIssue': '推进：物流任务下发',
+      'LogisticsShipped': '推进：物流已发货',
+      'RequirementSupplementRequest': '推进：订单信息待补充',
+      'ProductionQuestionForward': '推进：生产提问转发',
+      'SalesReplyNoOpenQuestion': '推进：业务回复无疑问',
+      'ProductionTerminateSalesNotice': '终止：生产终止通知',
+      'DuplicateSubmissionNotice': '警示：重复提交提醒'
+    };
     var items = data.items || [];
     var html = '<table class="data-table"><thead><tr><th>场景</th><th>收件人</th><th>操作</th></tr></thead><tbody>';
     items.forEach(function(r) {
       var toArr = r.to || [];
       try { if (typeof toArr === 'string') toArr = JSON.parse(toArr); } catch(e) {}
-      html += '<tr><td>' + r.scene + '</td><td>' + (Array.isArray(toArr) ? toArr.join(', ') : toArr) + '</td>' +
+      var displayScene = sceneMap[r.scene] || r.scene;
+      html += '<tr><td>' + displayScene + '</td><td>' + (Array.isArray(toArr) ? toArr.join(', ') : toArr) + '</td>' +
         '<td><a href="#" class="mr-edit" data-scene="' + r.scene + '" data-to="' + (Array.isArray(toArr) ? toArr.join(',') : '') + '">编辑</a></td></tr>';
     });
     html += '</tbody></table>';
@@ -8819,23 +8838,26 @@ function showModal(type, data) {
         '<input class="ew-wh-name" placeholder="仓库名称" value="' + h(whName) + '" style="flex:2;min-width:0;" />' +
         '<button type="button" class="icon-button ew-wh-remove" style="color:#dc2626;">×</button></div>';
     }).join('');
+    var isEdit = !!(data && data.entity_code);
+    var entitySelectHtml = '';
+    if (!isEdit) {
+      entitySelectHtml = '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
+        '<span>选择主体</span><select id="mew-select-entity" style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;"><option value="">正在从金蝶同步主体列表...</option></select></label>';
+    }
     html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box" style="min-width:520px;"><h3>' + (isEdit ? '编辑主体-仓库关联' : '新增主体') + '</h3>' +
       '<datalist id="wh-suggestions"></datalist>' +
+      entitySelectHtml +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>主体编码</span><input id="mew-code" value="' + h(data.entity_code || '') + '" ' + (isEdit ? 'readonly style="background:#f3f4f6;"' : '') + ' placeholder="如 SZ / HK / LU" /></label>' +
+        '<span>主体编码</span><input id="mew-code" value="' + h((data && data.entity_code) || '') + '" readonly style="background:#f3f4f6;" placeholder="选择主体后自动填充" /></label>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>主体名称</span>' + (isEdit
-          ? '<span style="padding:6px 10px;background:#f3f4f6;border-radius:4px;color:#666;">' + h(data.entity_name || '') + '</span>'
-          : '<input id="mew-name" value="' + h(data.entity_name || '') + '" placeholder="如 深圳积木易搭科技技术有限公司" />') + '</label>' +
+        '<span>主体名称</span><input id="mew-name" value="' + h((data && data.entity_name) || '') + '" readonly style="background:#f3f4f6;" placeholder="选择主体后自动填充" /></label>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>ERP 组织ID</span>' + (isEdit
-          ? '<span style="padding:6px 10px;background:#f3f4f6;border-radius:4px;color:#666;">' + h(data.erp_org_id || '') + '</span>'
-          : '<input id="mew-org" value="' + h(data.erp_org_id || '') + '" placeholder="如 100" />') + '</label>' +
+        '<span>ERP 组织ID</span><input id="mew-org" value="' + h((data && data.erp_org_id) || '') + '" readonly style="background:#f3f4f6;" placeholder="选择主体后自动填充" /></label>' +
       '<div style="margin-bottom:8px;"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">' +
         '<strong style="font-size:13px;">关联仓库</strong><button type="button" class="button ghost mini" id="mew-wh-add">+ 添加</button></div>' +
         '<div id="mew-wh-list">' + (whRows || '<div style="color:var(--muted);font-size:12px;">暂无仓库，点击"添加"新增，输入时可从已有仓库下拉选择</div>') + '</div></div>' +
       '<label style="display:grid;grid-template-columns:100px 1fr;gap:6px;align-items:center;margin-bottom:8px;">' +
-        '<span>状态</span><select id="mew-active"><option value="true"' + (data.is_active !== false ? ' selected' : '') + '>启用</option><option value="false"' + (data.is_active === false ? ' selected' : '') + '>禁用</option></select></label>' +
+        '<span>状态</span><select id="mew-active"><option value="true"' + (!data || data.is_active !== false ? ' selected' : '') + '>启用</option><option value="false"' + (data && data.is_active === false ? ' selected' : '') + '>禁用</option></select></label>' +
       '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-entitywh">保存</button></div></div></div>';
     } else if (type === 'materialEntity') {
     var entityOpts = ['SZ','HK','LU','US','WH','GZ'].map(function(e) { return '<option value="' + e + '"' + (e === (data.ent||'') ? ' selected' : '') + '>' + e + '</option>'; }).join('');
@@ -8844,8 +8866,29 @@ function showModal(type, data) {
       '<label><span>出货主体</span><select id="mme-ent">' + entityOpts + '</select></label>' +
       '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-materialEntity">保存</button></div></div></div>';
   } else if (type === 'receiver') {
+    var sceneMap = {
+      'domestic_delivery': '国内仓发货',
+      'overseas_delivery': '海外仓发货',
+      'replenishment_domestic': '备货武汉',
+      'replenishment_overseas': '备货海外',
+      'TaskIssue': '推进：生产任务下发',
+      'ProductionConfirmed': '推进：已确认排产',
+      'ProductionRejected': '驳回：需补充确认',
+      'SalesReplyTaskReissue': '再次：业务重新下发',
+      'SalesDemandWithdrawn': '回退：业务撤回需求',
+      'LogisticsTaskIssue': '推进：物流任务下发',
+      'LogisticsShipped': '推进：物流已发货',
+      'RequirementSupplementRequest': '推进：订单信息待补充',
+      'ProductionQuestionForward': '推进：生产提问转发',
+      'SalesReplyNoOpenQuestion': '推进：业务回复无疑问',
+      'ProductionTerminateSalesNotice': '终止：生产终止通知',
+      'DuplicateSubmissionNotice': '警示：重复提交提醒'
+    };
+    var sceneOptions = Object.keys(sceneMap).map(function(k) {
+      return '<option value="' + k + '"' + (k === (data.scene || '') ? ' selected' : '') + '>' + sceneMap[k] + '</option>';
+    }).join('');
     html = '<div class="modal-overlay" id="' + id + '"><div class="modal-box"><h3>编辑收件人</h3>' +
-      '<label><span>场景</span><select id="m-scene"><option value="domestic_delivery">国内仓发货</option><option value="overseas_delivery">海外仓发货</option><option value="replenishment_domestic">备货武汉</option><option value="replenishment_overseas">备货海外</option></select></label>' +
+      '<label><span>场景</span><select id="m-scene">' + sceneOptions + '</select></label>' +
       '<label><span>收件人（逗号分隔）</span><input id="m-to" value="' + ((data.to || '').replace(/,/g, ', ')) + '" /></label>' +
       '<div class="modal-actions"><button class="button ghost" onclick="this.closest(\'.modal-overlay\').remove()">取消</button><button class="button" data-act="save-receiver">保存</button></div></div></div>';
   } else if (type === 'crmBusinessType') {
@@ -8878,6 +8921,30 @@ function showModal(type, data) {
 
   // 主体-仓库动态行添加
   if (type === 'entitywh') {
+    if (!isEdit) {
+      api('/api/config/kingdee-organizations').then(function(res) {
+        var select = document.getElementById('mew-select-entity');
+        if (!select) return;
+        var orgs = res.items || [];
+        var shtml = '<option value="">请选择主体...</option>';
+        orgs.forEach(function(o) {
+          shtml += '<option value="' + o.entity_code + '" data-name="' + h(o.entity_name) + '" data-org="' + h(o.erp_org_id) + '">' + o.entity_code + ' - ' + o.entity_name + '</option>';
+        });
+        select.innerHTML = shtml;
+        select.addEventListener('change', function() {
+          var opt = this.options[this.selectedIndex];
+          var code = this.value;
+          var name = opt ? (opt.dataset.name || '') : '';
+          var org = opt ? (opt.dataset.org || '') : '';
+          document.getElementById('mew-code').value = code;
+          document.getElementById('mew-name').value = name;
+          document.getElementById('mew-org').value = org;
+        });
+      }).catch(function() {
+        var select = document.getElementById('mew-select-entity');
+        if (select) select.innerHTML = '<option value="">同步失败，请重试</option>';
+      });
+    }
     // 加载已有仓库列表供自动填充
     var _warehouseMap = {};
     api('/api/products/inventory/warehouses?limit=100').then(function(whData) {
@@ -8912,7 +8979,9 @@ function showModal(type, data) {
       row.innerHTML = '<input class="ew-wh-code" list="wh-suggestions" placeholder="仓库编码（可选）" style="flex:1;min-width:0;" />' +
         '<input class="ew-wh-name" placeholder="仓库名称" style="flex:2;min-width:0;" />' +
         '<button type="button" class="icon-button ew-wh-remove" style="color:#dc2626;">×</button>';
-      list.querySelector('div:first-child')?.remove(); // remove placeholder
+      if (!list.querySelector('.ew-wh-row')) {
+        list.querySelector('div')?.remove(); // remove placeholder
+      }
       list.appendChild(row);
       // 新加行的移除按钮
       var removeBtn = row.querySelector('.icon-button');
@@ -8944,10 +9013,14 @@ function showModal(type, data) {
       var eorg = eorgEl ? (eorgEl.value || eorgEl.textContent || '').trim() : '';
       var eactive = document.getElementById('mew-active').value === 'true';
       var warehouses = [];
+      var seenCodes = {};
       document.querySelectorAll('#' + modal.id + ' .ew-wh-row').forEach(function(row) {
-        var wc = (row.querySelector('.ew-wh-code') || {}).value || '';
-        var wn = (row.querySelector('.ew-wh-name') || {}).value || '';
-        if (wc) warehouses.push({warehouse_code: wc, warehouse_name: wn || wc});
+        var wc = ((row.querySelector('.ew-wh-code') || {}).value || '').trim();
+        var wn = ((row.querySelector('.ew-wh-name') || {}).value || '').trim();
+        if (wc && !seenCodes[wc]) {
+          seenCodes[wc] = true;
+          warehouses.push({warehouse_code: wc, warehouse_name: wn || wc});
+        }
       });
       apiPost('/api/config/entity-mappings', {
         entity_code: ecode, entity_name: ename, erp_org_id: eorg,
@@ -9000,8 +9073,32 @@ function initInventoryPage() {
   if (search) search.addEventListener('keydown', function(e) { if (e.key === 'Enter') { _invPage = 1; loadInv(); } });
   var wh = document.getElementById('inv-wh-filter');
   if (wh) wh.addEventListener('change', function() { _invPage = 1; loadInv(); });
-  var outOfStock = document.getElementById('inv-out-of-stock');
-  if (outOfStock) outOfStock.addEventListener('change', function() { _invPage = 1; loadInv(); });
+  var inStock = document.getElementById('inv-in-stock');
+  if (inStock) inStock.addEventListener('change', function() { _invPage = 1; loadInv(); });
+  var finishedToggle = document.getElementById('inv-finished-toggle');
+  if (finishedToggle) finishedToggle.addEventListener('change', function() { _invPage = 1; loadInv(); });
+  var syncErpBtn = document.getElementById('inv-sync-erp');
+  if (syncErpBtn) {
+    syncErpBtn.addEventListener('click', function() {
+      var btn = this;
+      btn.textContent = '同步中...';
+      btn.disabled = true;
+      fetch('/api/products/inventory/erp-sync', { method: 'POST', credentials: 'same-origin' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          toast(data.ok ? ('国内库存同步完成: ' + (data.total || 0) + ' 条') : '国内库存同步失败');
+          btn.textContent = '同步国内库存';
+          btn.disabled = false;
+          _invPage = 1;
+          loadInv();
+        })
+        .catch(function(err) {
+          toast('同步国内库存失败: ' + err.message, true);
+          btn.textContent = '同步国内库存';
+          btn.disabled = false;
+        });
+    });
+  }
   var drop = document.getElementById('inv-drop-zone');
   if (drop) drop.addEventListener('click', function() { var fi = document.getElementById('inv-file-input'); if (fi) fi.click(); });
   var fi = document.getElementById('inv-file-input');
@@ -9036,7 +9133,9 @@ function loadInvWarehouses() {
     if (!sel) return;
     var html = '<option value="">全部仓库</option>';
     (data.warehouses || []).forEach(function(w) {
-      html += '<option value="' + w + '">' + w + '</option>';
+      var code = w.warehouse_code || w;
+      var name = w.warehouse_name || code;
+      html += '<option value="' + code + '">' + name + '</option>';
     });
     sel.innerHTML = html;
   }).catch(function() {});
@@ -9048,11 +9147,14 @@ function loadInv(opts) {
   _invPage = page;
   var wh = (document.getElementById('inv-wh-filter') || {}).value || '';
   var q = (document.getElementById('inv-search') || {}).value || '';
-  var onlyOutOfStock = Boolean((document.getElementById('inv-out-of-stock') || {}).checked);
+  var onlyInStock = Boolean((document.getElementById('inv-in-stock') || {}).checked);
+  var finishedToggle = document.getElementById('inv-finished-toggle');
+  var finishedOnly = finishedToggle ? finishedToggle.checked : true;
   var url = '/api/inventory/snapshots?page=' + page + '&page_size=50';
   if (wh) url += '&warehouse=' + encodeURIComponent(wh);
   if (q) url += '&q=' + encodeURIComponent(q);
-  if (onlyOutOfStock) url += '&stock_status=out_of_stock';
+  if (onlyInStock) url += '&stock_status=in_stock';
+  if (finishedOnly) url += '&inventory_scope=finished';
   api(url).then(function(data) {
     var items = data.items || [];
     var total = data.total || 0;
@@ -9062,7 +9164,7 @@ function loadInv(opts) {
     items.forEach(function(s) {
       var qty = parseFloat(s.qty) || 0;
       var style = qty <= 0 ? ' style="color:#dc2626;font-weight:600;"' : '';
-      html += '<tr' + style + '><td>' + s.warehouse_code + '</td><td>' + s.material_code + '</td><td>' + (s.material_name || '').slice(0, 40) + '</td><td>' + qty + '</td><td>' + (s.synced_at || '').slice(0, 10) + '</td></tr>';
+      html += '<tr' + style + '><td>' + (s.warehouse_name || s.warehouse_code) + '</td><td>' + s.material_code + '</td><td>' + (s.material_name || '').slice(0, 40) + '</td><td>' + qty + '</td><td>' + (s.synced_at || '').slice(0, 10) + '</td></tr>';
     });
     html += '</tbody></table>';
     var w = document.getElementById('inv-table-wrap');

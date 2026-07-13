@@ -8,9 +8,29 @@ V2 已从"邮件驱动的任务单工作台"升级为"以 CRM 审批完成订单
 
 ## 本地运行
 
+要求 **Python ≥ 3.10**（`pyproject.toml` 中声明 `requires-python = ">=3.10"`）。项目根目录已配置 `.python-version`（pyenv），进入目录后 pyenv 会自动切换到 3.10。
+
+推荐使用虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test]"
+```
+
+如果直接使用系统 pip（不推荐）：
+
 ```bash
 python3 -m pip install -e ".[test]"
 ```
+
+启动服务：
+
+```bash
+uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+或通过 python3 模块方式：
 
 ```bash
 python3 -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
@@ -351,6 +371,9 @@ pytest tests/test_order_middle_platform.py -v
 ## 测试
 
 ```bash
+# 确保已激活虚拟环境
+source .venv/bin/activate
+
 python3 -m pytest
 ```
 
@@ -372,6 +395,9 @@ npm run test:e2e:reuse
 ### V2 订单中台测试
 
 ```bash
+# 确保已激活虚拟环境
+source .venv/bin/activate
+
 # 全流程端到端模拟（5 个业务场景，SQLite 内存库 + 全 Mock，不碰外部系统）
 python3 scripts/v2_e2e_simulation.py
 

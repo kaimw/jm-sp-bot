@@ -374,9 +374,20 @@ def import_inventory_excel(file_path: str, session: Session) -> dict[str, Any]:
     data_rows = rows[1:]
     synced_at = now_utc()
     
-    # Delete existing inventory snapshots before importing new ones
-    session.query(ProductInventorySnapshot).delete()
-    
+    # Delete existing inventory snapshots for warehouses present in the import data
+    # (instead of deleting ALL warehouses, to avoid clearing other warehouses' data)
+    warehouses_in_file = set()
+    for row in data_rows:
+        if len(row) > wh_idx and row[wh_idx] is not None:
+            wh_val = str(row[wh_idx]).strip()
+            if wh_val:
+                warehouses_in_file.add(wh_val)
+    if warehouses_in_file:
+        for wh_code in warehouses_in_file:
+            session.query(ProductInventorySnapshot).filter(
+                ProductInventorySnapshot.warehouse_code == wh_code
+            ).delete()
+
     # Aggregate by (material_code, warehouse_code) to prevent UniqueConstraint violations
     aggregated = {}
     for row in data_rows:

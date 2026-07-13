@@ -2655,21 +2655,36 @@ label,
 }
 
 .inventory-query-toolbar {
-  display: grid;
-  grid-template-columns: minmax(150px, 210px) minmax(220px, 1fr) auto auto;
+  display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 8px;
   margin-bottom: 12px;
 }
 
-.inventory-query-toolbar select,
-.inventory-query-toolbar input[type="search"] {
-  width: 100%;
+.inventory-query-toolbar select {
+  width: 180px;
+  flex-shrink: 0;
   min-height: 36px;
   padding: 6px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #ffffff;
+}
+
+.inventory-query-toolbar input[type="search"] {
+  flex: 1;
+  min-width: 200px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.inventory-query-toolbar label {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .inventory-shortage-toggle {
@@ -2679,6 +2694,7 @@ label,
   min-height: 36px;
   white-space: nowrap;
   color: var(--ink);
+  flex-shrink: 0;
 }
 
 .inventory-shortage-toggle input {
@@ -2689,11 +2705,14 @@ label,
 
 @media (max-width: 760px) {
   .inventory-query-toolbar {
-    grid-template-columns: 1fr;
+    flex-wrap: wrap;
   }
 
+  .inventory-query-toolbar select,
+  .inventory-query-toolbar input[type="search"],
   .inventory-query-toolbar .button {
     width: 100%;
+    flex: none;
   }
 }
 

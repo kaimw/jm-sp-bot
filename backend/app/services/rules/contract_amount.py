@@ -21,6 +21,9 @@ class ContractAmountConsistencyRule:
         return "RULE_CONTRACT_AMOUNT_CONSISTENCY"
 
     def supports(self, context: OrderContext) -> bool:
+        # 备货订单跳过合同金额一致性检查
+        if context.order.order_type == "STOCK_REPLENISHMENT":
+            return False
         return bool(context.order.order_amount) and context.order.order_amount > 0
 
     def validate(self, context: OrderContext) -> ValidationResult:

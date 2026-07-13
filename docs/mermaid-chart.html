@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>商务 AI Agent 订单中台 — 主流程总图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js"></script>
+<style>
+body { margin: 20px; background: white; display: flex; justify-content: center; }
+.mermaid { max-width: 1500px; }
+</style>
+</head>
+<body>
+<div class="mermaid">
+flowchart TD
+    classDef crm fill:#e1f5fe,stroke:#0288d1,color:#01579b
+    classDef platform fill:#e8f5e9,stroke:#388e3c,color:#1b5e20
+    classDef rule fill:#fff3e0,stroke:#f57c00,color:#e65100
+    classDef exception fill:#fce4ec,stroke:#d32f2f,color:#b71c1c
+    classDef oms fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
+    classDef kingdee fill:#e0f2f1,stroke:#00796b,color:#004d40
+    classDef notify fill:#fff8e1,stroke:#f9a825,color:#f57f17
+    classDef done fill:#e8eaf6,stroke:#3949ab,color:#1a237e
+    classDef new fill:#fbe9e7,stroke:#d84315,color:#bf360c
+    classDef ai fill:#f1f8e9,stroke:#558b2f,color:#33691e
+    classDef phase fill:#f5f5f5,stroke:#9e9e9e,color:#424242,stroke-dasharray: 5 5
+
+    subgraph P1["① 感知层：CRM 订单同步"]
+        A["🔁 定时轮询/手动触发<br/>纷享销客 CDP 接口"]:::crm --> B["获取销售订单列表<br/>详情 + 附件 + 快照"]:::crm
+        B --> C["CRM 订单入库<br/>CrmSalesOrder<br/>幂等去重(payload_hash)"]:::crm
+        C --> D{"一期范围检查?"}:::rule
+        D -->|InScope| E["入队处理<br/>enqueue_crm_order_parsed_event"]:::notify
+        D -->|OutOfScope| F["标记 OutOfScope<br/>跳过中台"]:::exception
+    end
+
+    subgraph P2["② 认知层：中台建单与预审"]
+        E --> G["process_crm_order_parsed_event<br/>(变更检测 + 幂等判断)"]:::platform
+        G --> H{"订单变更检测?<br/>payload_hash 对比"}:::rule
+        H -->|新单/无变更| I["附件字段提取<br/>收货人/地址/日期<br/>enrich_order_from_attachments"]:::platform
+        H -->|有变更| J["▶ 变更处理链条<br/>handle_crm_snapshot_changed<br/>> 标记 CHANGED<br/>> 保留旧快照<br/>> 新建快照重审"]:::exception
+        J --> I
+        I --> K["upsert_middle_platform_order<br/>生成 MP-中台单号<br/>同步明细(OrderItems)"]:::platform
+        K --> L["状态: CRM_APPROVED → IMPORTED<br/>transition_order"]:::platform
+    end
+
+    subgraph Rules["▼ 11条预审规则链 (责任链模式+熔断) ▼"]
+        R1["① RequiredHeadFieldsRule<br/>必填字段校验"]:::rule
+        R2["② PhaseOneCompletenessRule<br/>一期完整性"]:::rule
+        R3["③ CustomerMappingRule<br/>客户主数据映射"]:::rule
+        R4["④ PositiveAmountRule<br/>金额正数"]:::rule
+        R5["⑤ AmountConsistencyRule<br/>金额一致性"]:::rule
+        R6["⑥ HasOrderItemsRule<br/>明细存在性"]:::rule
+        R7["⑦ KnownSkuRule<br/>已知SKU匹配"]:::rule
+        R8["⑧ SkuBomMatchRule<br/>BOM匹配"]:::rule
+        R9["⑨ ContractAmountConsistencyRule<br/>合同金额一致"]:::rule
+        R10["⑩ AttachmentProductConsistencyRule<br/>附件一致性"]:::rule
+        R11["⑪ LocalInventoryAvailableRule<br/>本地库存可用"]:::rule
+        L --> R1
+        R1 -.- R2 -.- R3 -.- R4 -.- R5 -.- R6 -.- R7 -.- R8 -.- R9 -.- R10 -.- R11
+    end
+
+    R11 --> N{"责任链结果?"}:::rule
+
+    N -->|阻断 CRITICAL/HIGH| O["❌ VALIDATION_BLOCKED"]:::exception
+    O --> P["创建 ExceptionCase<br/>+ AI 诊断入队<br/>+ 邮件通知"]:::exception
+    P --> Q["商务/销售补正<br/>→ 重新预审"]:::exception
+
+    N -->|全部通过| S["✅ VALIDATED<br/>RULES_PASSED"]:::done
+
+    subgraph Kingdee["②⑤ 金蝶ERP制单与提交 （新增 N-007）"]
+        S --> K1["ERP 制单 (Save)<br/>构建销售订单JSON<br/>客户/物料/部门/金额"]:::kingdee
+        K1 --> K2["ERP 提交 (Submit)"]:::kingdee
+        K2 --> K3["ERP 审核 (Audit)"]:::kingdee
+        K3 --> K4{"制单结果?"}:::rule
+        K4 -->|成功| K5["→ 继续发货流程"]:::kingdee
+        K4 -->|失败| K6["❌ 制单异常<br/>→ ExceptionCase"]:::exception
+    end
+
+    subgraph P3["③ 执行层：发货通知与 OMS 下推"]
+        K5 --> T["create_delivery_notice<br/>生成发货通知单"]:::platform
+        T --> U{"平台履约订单?"}:::rule
+        U -->|是| V["archive_platform_fulfilled_order<br/>直接归档"]:::done
+        U -->|否| W["状态: DELIVERY_NOTICE_READY"]:::platform
+        W --> X{"自动确认?"}:::rule
+        X -->|自动| Y["confirm_delivery_notice"]:::oms
+        X -->|人工| Z["管理台预览拆单<br/>人工确认"]:::platform
+        Z --> Y
+        Y --> AA["enqueue_oms_push<br/>入队 OMS 下推"]:::oms
+        AA --> AB["调用吉客云 API<br/>wms.order.create"]:::oms
+        AB --> AC{"下推结果?"}:::rule
+        AC -->|成功| AD["OMS_ACCEPTED"]:::done
+        AC -->|重试耗尽| AE["OMS_BLOCKED<br/>死信队列 + AI 诊断"]:::exception
+    end
+
+    subgraph P4["④ 履约追踪"]
+        AD --> AF["poll_oms_status_updates<br/>轮询 OMS 执行状态"]:::oms
+        AF --> AG["PICKING(拣货)"]:::oms
+        AG --> AH["SHIPPED(发货)"]:::oms
+        AH --> AI{"平台回传?"}:::rule
+        AI -->|是| AJ["process_platform_fulfillment_sync<br/>回传平台履约"]:::oms
+        AI -->|否| AK["FULFILLMENT_ARCHIVED"]:::done
+        AJ --> AK
+    end
+
+    subgraph P5["⑤ 归档与下一期"]
+        AK --> AL["下一期: 物流轨迹/签收<br/>(物流平台API)"]:::new
+        AL --> AM["下一期: 财务核验<br/>(金蝶ERP回款/发票)"]:::kingdee
+        AM --> AN["下一期: 订单CLOSED"]:::done
+    end
+
+    subgraph NEW["🆕 2026-06-27 调研新增 （红色标注）"]
+        N1["🆕 N-001 物料别名匹配<br/>CRM名称 → 金蝶料号"]:::new
+        N2["🆕 N-002 一单多收货人<br/>附件清单 → 拆单预览  → 多发货通知"]:::new
+        N3["🆕 N-003 订单变更跟踪<br/>payload_hash → CHANGED → 重审"]:::new
+        N4["🆕 N-004 特殊需求分类<br/>物流类/生产类/报关类 → 部门分流"]:::new
+        N5["🆕 N-005 分批发货<br/>部分发货/剩余跟踪/多次下推"]:::new
+        N6["🆕 N-006 国内仓库存<br/>一期仅海外仓可用"]:::new
+        N7["🟢 N-007 金蝶自动制单<br/>✅ 已测试通过<br/>Save→Submit→Audit"]:::done
+        N8["🆕 N-008 备货订单<br/>一期不纳入"]:::new
+        N9["🆕 N-009 商务审核前置<br/>合同审批状态检查"]:::new
+        N10["🆕 N-010 变更检测机制<br/>crm_order_id+payload_hash"]:::new
+    end
+
+    N7 -..->|待集成到预审通过后| S
+    N1 -..->|别名映射| R7
+    N9 -..->|前置检查| R9
+    N6 -..->|数据源| R11
+</div>
+</body>
+</html>

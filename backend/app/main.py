@@ -7837,6 +7837,66 @@ def toggle_promotion_api(rule_id: str, is_active: bool = Query(...), session: Se
 # V2 Phase 1 — 管理台 CRUD API
 # ═══════════════════════════════════════
 
+# ── 金蝶组织同步 ──
+
+@app.get("/api/config/kingdee-organizations")
+def get_kingdee_organizations(session: Session = Depends(get_session)) -> dict:
+    from backend.app.services.erp.kingdee_client import KingdeeClient, kingdee_config_from_session
+    try:
+        config = kingdee_config_from_session(session)
+        client = KingdeeClient(config)
+        client.login()
+        rows = client.execute_bill_query(
+            form_id="ORG_Organizations",
+            field_keys="FNumber,FName"
+        )
+        orgs = []
+        code_map = {
+            "深圳积木易搭科技技术有限公司武汉分公司": "SZ_WH",
+            "深圳积木易搭科技技术有限公司": "SZ",
+            "武汉尺子科技有限公司": "WH",
+            "深圳积木三维科技有限公司武汉分公司": "SZ_3D_WH",
+            "深圳积木三维科技有限公司": "SZ_3D",
+            "武汉睿数信息技术有限公司": "WH_RX",
+            "积木易搭（香港）有限公司": "HK",
+            "广州积木易搭数字科技有限公司": "GZ",
+            "深圳积木数智软件技术有限公司武汉分公司": "SZ_SZ_WH",
+            "深圳积木数智软件技术有限公司": "SZ_SZ",
+            "积木易搭（卢森堡）有限公司": "LU",
+            "积木易搭（美国）有限公司": "US",
+        }
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 2:
+                num = str(row[0]).strip()
+                name = str(row[1]).strip()
+                code = code_map.get(name, num)
+                orgs.append({
+                    "entity_code": code,
+                    "entity_name": name,
+                    "erp_org_id": num
+                })
+        if not orgs:
+            raise ValueError("No organizations found")
+        return {"items": orgs}
+    except Exception as e:
+        logger.warning(f"Failed to fetch organizations from Kingdee: {e}")
+        fallback = [
+            {"entity_code": "SZ", "entity_name": "深圳积木易搭科技技术有限公司", "erp_org_id": "100"},
+            {"entity_code": "SZ_WH", "entity_name": "深圳积木易搭科技技术有限公司武汉分公司", "erp_org_id": "101"},
+            {"entity_code": "WH", "entity_name": "武汉尺子科技有限公司", "erp_org_id": "102"},
+            {"entity_code": "SZ_3D", "entity_name": "深圳积木三维科技有限公司", "erp_org_id": "103"},
+            {"entity_code": "WH_RX", "entity_name": "武汉睿数信息技术有限公司", "erp_org_id": "104"},
+            {"entity_code": "SZ_3D_WH", "entity_name": "深圳积木三维科技有限公司武汉分公司", "erp_org_id": "105"},
+            {"entity_code": "HK", "entity_name": "积木易搭（香港）有限公司", "erp_org_id": "106"},
+            {"entity_code": "GZ", "entity_name": "广州积木易搭数字科技有限公司", "erp_org_id": "107"},
+            {"entity_code": "SZ_SZ", "entity_name": "深圳积木数智软件技术有限公司", "erp_org_id": "108"},
+            {"entity_code": "LU", "entity_name": "积木易搭（卢森堡）有限公司", "erp_org_id": "109"},
+            {"entity_code": "US", "entity_name": "积木易搭（美国）有限公司", "erp_org_id": "110"},
+            {"entity_code": "SZ_SZ_WH", "entity_name": "深圳积木数智软件技术有限公司武汉分公司", "erp_org_id": "111"}
+        ]
+        return {"items": fallback}
+
+
 # ── 主体-仓库映射 ──
 
 @app.get("/api/config/entity-mappings")
@@ -8114,6 +8174,7 @@ def list_raw_inventory_snapshots(
     warehouse: str = "",
     q: str = "",
     stock_status: str = "",
+    inventory_scope: str = "",
     page: int = 1,
     page_size: int = 50,
     include_total: bool = False,
@@ -8123,9 +8184,14 @@ def list_raw_inventory_snapshots(
         page = max(1, page)
         page_size = max(1, min(page_size, 200))
         q_obj = session.query(ProductInventorySnapshot)
+        if inventory_scope:
+            from backend.app.services.erp.business_queries import apply_inventory_object_scope_filter
+            q_obj = apply_inventory_object_scope_filter(q_obj, inventory_scope=inventory_scope)
         if warehouse:
             q_obj = q_obj.filter(ProductInventorySnapshot.warehouse_code == warehouse)
-        if stock_status == "out_of_stock":
+        if stock_status == "in_stock":
+            q_obj = q_obj.filter(ProductInventorySnapshot.qty > 0)
+        elif stock_status == "out_of_stock":
             q_obj = q_obj.filter(ProductInventorySnapshot.qty <= 0)
         if q.strip():
             pattern = f"%{q.strip()}%"
@@ -8143,6 +8209,7 @@ def list_raw_inventory_snapshots(
                 ProductInventorySnapshot.material_code,
                 ProductInventorySnapshot.material_name,
                 ProductInventorySnapshot.warehouse_code,
+                ProductInventorySnapshot.warehouse_name,
                 ProductInventorySnapshot.qty,
                 ProductInventorySnapshot.synced_at,
             )
@@ -8163,7 +8230,7 @@ def list_raw_inventory_snapshots(
             total_estimated = has_more
         return {
             "items": [{"id": s.id, "material_code": s.material_code, "material_name": s.material_name or "",
-                       "warehouse_code": s.warehouse_code, "qty": s.qty, "synced_at": s.synced_at.isoformat() if s.synced_at else None} for s in items],
+                       "warehouse_code": s.warehouse_code, "warehouse_name": s.warehouse_name or s.warehouse_code, "qty": s.qty, "synced_at": s.synced_at.isoformat() if s.synced_at else None} for s in items],
             "total": total,
             "total_estimated": total_estimated,
             "has_more": has_more,
@@ -8179,7 +8246,10 @@ def list_raw_inventory_snapshots(
 @app.get("/api/inventory/warehouses")
 def list_inventory_warehouses(session: Session = Depends(get_session)) -> dict:
     try:
-        rows = session.query(ProductInventorySnapshot.warehouse_code).distinct().order_by(ProductInventorySnapshot.warehouse_code).all()
-        return {"warehouses": [r[0] for r in rows if r[0]]}
+        rows = session.query(
+            ProductInventorySnapshot.warehouse_code,
+            ProductInventorySnapshot.warehouse_name
+        ).distinct().order_by(ProductInventorySnapshot.warehouse_code).all()
+        return {"warehouses": [{"warehouse_code": r[0], "warehouse_name": r[1] or r[0]} for r in rows if r[0]]}
     except Exception as e:
         return {"warehouses": []}

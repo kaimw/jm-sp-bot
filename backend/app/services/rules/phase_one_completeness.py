@@ -5,6 +5,7 @@ from backend.app.services.rules import BlockerLevel, OrderContext, ValidationRes
 from backend.app.services.rules.helpers import config_bool, is_approved_status
 from backend.app.services.address_quality import is_detailed_receipt_address
 from backend.app.services.jsonutil import loads
+from backend.app.services.order_region import DOMESTIC_SETTLEMENT_METHOD, is_overseas_order_payload
 
 
 PO_HINT = re.compile(r"(采购订单|采购单|客户\s*PO|\bPO\b|purchase\s+order)", re.IGNORECASE)
@@ -62,17 +63,25 @@ class PhaseOneCompletenessRule:
         attachments = loads(crm.attachment_files_json, [])
         if not isinstance(attachments, list):
             attachments = []
+        raw_payload = raw if isinstance(raw, dict) else {}
+        is_overseas = is_overseas_order_payload(raw_payload)
+        if not is_overseas and not str(crm.settlement_method or "").strip():
+            crm.settlement_method = DOMESTIC_SETTLEMENT_METHOD
+        if not is_overseas and str(crm.settlement_method or "").strip() == DOMESTIC_SETTLEMENT_METHOD:
+            crm.currency = crm.currency or "CNY"
+            context.order.currency = context.order.currency or "CNY"
 
         required = [
             ("sales_user_name", "销售负责人"),
             ("sales_user_email", "销售邮箱"),
             ("owner_department", "归属部门"),
             ("order_date", "订单日期"),
-            ("settlement_method", "结算方式"),
             ("receipt_contact", "收货联系人"),
             ("receipt_phone", "收货联系电话"),
             ("receipt_address", "收货地址"),
         ]
+        if is_overseas:
+            required.append(("settlement_method", "结算方式"))
         for field, label in required:
             if not str(getattr(crm, field, "") or "").strip():
                 missing.append(f"{label}({field})")

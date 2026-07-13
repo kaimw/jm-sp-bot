@@ -34,6 +34,9 @@ class AttachmentProductConsistencyRule:
         return "ATTACHMENT_PRODUCT_CONSISTENCY"
 
     def supports(self, context: OrderContext) -> bool:
+        # 备货订单跳过附件一致性检查
+        if context.order.order_type == "STOCK_REPLENISHMENT":
+            return False
         return bool(context.items)
 
     def validate(self, context: OrderContext) -> ValidationResult:

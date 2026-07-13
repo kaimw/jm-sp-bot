@@ -279,13 +279,26 @@ async function main() {
 
     console.log(JSON.stringify({ ok: true, checked: ["list", "detail", "owner", "enum_labels", "attachments"], jsonPath: summary.jsonPath }, null, 2));
   } finally {
-    chrome.kill();
-    await new Promise((resolve) => mockServer.close(resolve));
-    await fs.rm(tempDir, { recursive: true, force: true });
+    if (chrome) {
+      try {
+        chrome.kill();
+      } catch (e) {}
+    }
+    if (mockServer) {
+      try {
+        if (typeof mockServer.closeAllConnections === "function") {
+          mockServer.closeAllConnections();
+        }
+        mockServer.close();
+      } catch (e) {}
+    }
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (e) {}
   }
 }
 
 main().catch((error) => {
   console.error(JSON.stringify({ ok: false, error: String(error), stdout: error.stdout, stderr: error.stderr }, null, 2));
-  process.exitCode = 1;
+  process.exit(1);
 });

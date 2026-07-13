@@ -499,6 +499,62 @@ class OutboundMailJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
+from sqlalchemy import event
+
+@event.listens_for(OutboundMailJob, 'before_insert')
+def before_insert_outbound_mail_job(mapper, connection, target: OutboundMailJob):
+    from sqlalchemy.orm import Session
+    session = Session.object_session(target)
+    if session is not None:
+        try:
+            from backend.app.models import MailReceiverConfig
+            import json
+            config = session.query(MailReceiverConfig).filter(
+                MailReceiverConfig.scene == target.mail_type,
+                MailReceiverConfig.is_active == True
+            ).first()
+            if config:
+                try:
+                    to_list = json.loads(target.to_json) if target.to_json else []
+                except Exception:
+                    to_list = []
+                try:
+                    cc_list = json.loads(target.cc_json) if target.cc_json else []
+                except Exception:
+                    cc_list = []
+
+                try:
+                    cfg_to = json.loads(config.to_json) if config.to_json else []
+                except Exception:
+                    cfg_to = []
+                try:
+                    cfg_cc = json.loads(config.cc_json) if config.cc_json else []
+                except Exception:
+                    cfg_cc = []
+
+                # Merge lists preserving uniqueness
+                seen_to = set(to_list)
+                for email in cfg_to:
+                    if email and email.strip() and email not in seen_to:
+                        to_list.append(email)
+                        seen_to.add(email)
+
+                seen_cc = set(cc_list)
+                for email in cfg_cc:
+                    if email and email.strip() and email not in seen_cc:
+                        cc_list.append(email)
+                        seen_cc.add(email)
+
+                target.to_json = json.dumps(to_list, ensure_ascii=False)
+                target.cc_json = json.dumps(cc_list, ensure_ascii=False)
+        except Exception as e:
+            import logging
+            logging.getLogger("sqlalchemy.engine").warning(
+                f"Error merging mail receivers config for type {target.mail_type}: {e}"
+            )
+
+
+
 class ExceptionCase(Base):
     __tablename__ = "exception_cases"
 

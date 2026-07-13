@@ -57,6 +57,17 @@ MIGRATION_TABLE_ORDER = [
     "channel_pricings",
     "promotion_rules",
     "users",
+    "entity_mappings",
+    "customer_entity_mappings",
+    "crm_business_type_mappings",
+    "inter_entity_transfers",
+    "mail_receiver_configs",
+    "order_sequences",
+    "product_prices",
+    "warehouse_entity_mappings",
+    "material_entity_exceptions",
+    "inventory_import_records",
+    "inventory_snapshot_histories",
 ]
 
 DEFERRED_COLUMN_UPDATES = {

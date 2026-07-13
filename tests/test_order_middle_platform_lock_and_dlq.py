@@ -46,7 +46,7 @@ def seed_inventory(session, sku_id: str = "SKU-3D-SCANNER-PRO", quantity: int = 
         ProductInventorySnapshot(
             material_code=sku_id,
             material_name="3D Scanner",
-            warehouse_code="A1",
+            warehouse_code="WH01",
             warehouse_name="武汉工厂仓",
             base_qty=quantity,
             qty=quantity,

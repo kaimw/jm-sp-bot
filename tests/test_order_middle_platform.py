@@ -60,7 +60,7 @@ def seed_inventory(session, sku_id: str = "SKU-3D-SCANNER-PRO", quantity: int = 
         ProductInventorySnapshot(
             material_code=sku_id,
             material_name="3D Scanner",
-            warehouse_code="A1",
+            warehouse_code="WH01",
             warehouse_name="武汉工厂仓",
             base_qty=quantity,
             qty=quantity,
@@ -2244,6 +2244,8 @@ def test_crm_browser_default_start_ignores_saved_headed_mode(monkeypatch):
     set_config(session, "crm_cdp_browser_mode", "headed")
     monkeypatch.setattr(main_app, "_crm_browser_process", None)
     monkeypatch.setattr(main_app, "_crm_browser_meta", {})
+    monkeypatch.setattr(main_app, "crm_external_browser_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main_app, "crm_cdp_version", lambda *args, **kwargs: {})
     monkeypatch.setattr(main_app.subprocess, "Popen", fake_popen)
 
     result = main_app.start_crm_browser_process(session)
@@ -2271,6 +2273,8 @@ def test_crm_browser_manual_login_explicitly_uses_headed(monkeypatch):
     session = make_session()
     monkeypatch.setattr(main_app, "_crm_browser_process", None)
     monkeypatch.setattr(main_app, "_crm_browser_meta", {})
+    monkeypatch.setattr(main_app, "crm_external_browser_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main_app, "crm_cdp_version", lambda *args, **kwargs: {})
     monkeypatch.setattr(main_app.subprocess, "Popen", fake_popen)
 
     result = main_app.start_crm_browser_process(session, requested_mode="headed")
@@ -2899,7 +2903,7 @@ def test_inventory_rule_blocks_when_available_quantity_is_short():
         ProductInventorySnapshot(
             material_code="SKU-3D-SCANNER-PRO",
             material_name="3D Scanner",
-            warehouse_code="A1",
+            warehouse_code="WH01",
             warehouse_name="武汉工厂仓",
             base_qty=1,
             qty=1,
@@ -2943,7 +2947,7 @@ def test_inventory_rule_blocks_when_available_quantity_is_short():
     order = session.query(MiddlePlatformOrder).one()
     assert order.status == OrderStatus.VALIDATION_BLOCKED.value
     detail = loads(session.query(ExceptionCase).one().detail, {})
-    assert detail["validation"]["failed_rules"][0]["rule_code"] == "LOCAL_INVENTORY_AVAILABLE"
+    assert detail["validation"]["failed_rules"][0]["rule_code"] == "INVENTORY_THREE_STEP"
 
 
 def test_phase_one_missing_fields_interrupts_and_notifies_stakeholders():
@@ -3016,6 +3020,75 @@ def test_phase_one_completeness_does_not_require_approval_status():
     result = PhaseOneCompletenessRule().validate(OrderContext(order=order, crm_order=crm, items=list(order.items), session=session))
 
     assert result.passed is True
+
+
+def test_domestic_order_defaults_settlement_method_to_cny_for_phase_one_review():
+    session = make_session()
+    upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                customer_name="测试公司北京百度",
+                country_region="中国",
+                settlement_method="",
+                receipt_contact="赵物流",
+                receipt_phone="18612345678",
+                receipt_address="广东省深圳市南山区科技园测试路 8 号",
+                attachment_files="盖章采购订单.pdf",
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 1, "unit_price": "100.00", "line_amount": "100.00"}],
+            )
+        ],
+    )
+    session.commit()
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_001").one()
+    crm.receipt_contact = "赵物流"
+    crm.receipt_phone = "18612345678"
+    crm.receipt_address = "广东省深圳市南山区科技园测试路 8 号"
+    session.commit()
+    order = upsert_middle_platform_order(session, crm)
+    from backend.app.services.rules import OrderContext
+    from backend.app.services.rules.phase_one_completeness import PhaseOneCompletenessRule
+
+    result = PhaseOneCompletenessRule().validate(OrderContext(order=order, crm_order=crm, items=list(order.items), session=session))
+
+    assert crm.settlement_method == "人民币结算"
+    assert crm.currency == "CNY"
+    assert order.currency == "CNY"
+    assert result.passed is True
+
+
+def test_overseas_order_requires_explicit_settlement_method_for_phase_one_review():
+    session = make_session()
+    upsert_crm_sales_orders(
+        session,
+        [
+            valid_crm_order_row(
+                customer_name="InovaMetrics LLC",
+                country_region="美国",
+                settlement_method="",
+                receipt_contact="John",
+                receipt_phone="18000000000",
+                receipt_address="美国 CA 94016 Market Street 100",
+                attachment_files="盖章采购订单.pdf",
+                order_items=[{"sku_code": "SKU-3D-SCANNER-PRO", "quantity": 1, "unit_price": "100.00", "line_amount": "100.00"}],
+            )
+        ],
+    )
+    session.commit()
+    crm = session.query(CrmSalesOrder).filter_by(crm_order_id="crm_obj_001").one()
+    crm.receipt_contact = "John"
+    crm.receipt_phone = "18000000000"
+    crm.receipt_address = "美国 CA 94016 Market Street 100"
+    session.commit()
+    order = upsert_middle_platform_order(session, crm)
+    from backend.app.services.rules import OrderContext
+    from backend.app.services.rules.phase_one_completeness import PhaseOneCompletenessRule
+
+    result = PhaseOneCompletenessRule().validate(OrderContext(order=order, crm_order=crm, items=list(order.items), session=session))
+
+    assert crm.settlement_method in (None, "")
+    assert result.passed is False
+    assert "结算方式" in result.reason
 
 
 def test_v2_review_rule_config_lists_registered_rules_only():

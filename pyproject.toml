@@ -12,16 +12,23 @@ dependencies = [
   "httpx>=0.26.0",
   "openpyxl>=3.1.0",
   "python-docx>=1.1.0",
-  "pypdf>=4.0.0"
+  "pypdf>=4.0.0",
+  "cryptography>=41.0.0",
+  "pillow>=10.0.0",
+  "pandas>=2.0.0",
+  "python-multipart>=0.0.9",
+  "aiofiles>=23.0.0"
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=7.4.0"]
 ocr = [
   "paddleocr>=2.7.0",
-  "pymupdf>=1.23.0",
-  "pillow>=10.0.0"
+  "pymupdf>=1.23.0"
 ]
+
+[tool.setuptools.packages]
+find = { include = ["backend*"] }
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

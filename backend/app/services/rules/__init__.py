@@ -73,10 +73,13 @@ from .sku_bom_match import SkuBomMatchRule
 from .contract_amount import ContractAmountConsistencyRule
 from .attachment_product_consistency import AttachmentProductConsistencyRule
 from .local_inventory import LocalInventoryAvailableRule
+from .inventory_three_step import InventoryThreeStepRule
+from .contract_approval import ContractApprovalRule
 
 DEFAULT_RULES: list[OrderValidationRule] = [
     RequiredHeadFieldsRule(),
     PhaseOneCompletenessRule(),
+    ContractApprovalRule(),
     CustomerMappingRule(),
     PositiveAmountRule(),
     AmountConsistencyRule(),
@@ -85,7 +88,7 @@ DEFAULT_RULES: list[OrderValidationRule] = [
     SkuBomMatchRule(),
     ContractAmountConsistencyRule(),
     AttachmentProductConsistencyRule(),
-    LocalInventoryAvailableRule(),
+    InventoryThreeStepRule(),
 ]
 
 V2_REVIEW_RULE_STATES_KEY = "v2_review_rule_states_json"
@@ -98,7 +101,7 @@ RULE_METADATA: dict[str, dict[str, str]] = {
     },
     "PHASE1_COMPLETE_PRE_REVIEW_FIELDS": {
         "name": "一期完整性预审",
-        "description": "检查销售、归属部门、订单日期、结算方式、收货三要素、币种、附件和商品明细等一期必备信息。",
+        "description": "检查销售、归属部门、订单日期、收货三要素、币种、附件和商品明细等一期必备信息；国内订单结算方式默认人民币结算，海外订单必须填写结算方式。",
         "default_blocker_level": "CRITICAL",
     },
     "CUSTOMER_MAPPING": {
@@ -142,9 +145,19 @@ RULE_METADATA: dict[str, dict[str, str]] = {
         "default_blocker_level": "CRITICAL",
     },
     "LOCAL_INVENTORY_AVAILABLE": {
-        "name": "本地库存可用量",
-        "description": "检查本地库存快照是否满足订单发货数量。",
+        "name": "本地库存可用量（已废弃，由 INVENTORY_THREE_STEP 替代）",
+        "description": "已废弃。请启用 inventory_three_step_enabled 配置使用库存三步判断。",
         "default_blocker_level": "HIGH",
+    },
+    "INVENTORY_THREE_STEP": {
+        "name": "库存三步判断",
+        "description": "Step1 查主体仓库→Step2 查其他仓库(非阻断)→Step3 全缺阻断",
+        "default_blocker_level": "CRITICAL",
+    },
+    "CONTRACT_APPROVAL": {
+        "name": "商务审核前置条件",
+        "description": "检查 CRM 合同审批状态，备货订单跳过",
+        "default_blocker_level": "CRITICAL",
     },
 }
 

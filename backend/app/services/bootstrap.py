@@ -126,6 +126,8 @@ def seed_defaults(session: Session) -> None:
     ensure_config(session, "erp_enabled", "false", is_secret=False)
     ensure_config(session, "erp_readonly", "true", is_secret=False)
     ensure_config(session, "erp_write_enabled", "false", is_secret=False)
+    ensure_config(session, "erp_default_org_id", "100", is_secret=False)
+    ensure_config(session, "erp_failed_retry_max", "3", is_secret=False)
     ensure_config(session, "erp_server_url", "", is_secret=False)
     ensure_config(session, "erp_acct_id", "", is_secret=False)
     ensure_config(session, "erp_username", "", is_secret=False)
@@ -327,3 +329,42 @@ def seed_defaults(session: Session) -> None:
             role="it_ops",
             department="Logistics"
         ))
+
+    # Seed default CRM Business Type mappings
+    from backend.app.models import CrmBusinessTypeMapping
+    if session.query(CrmBusinessTypeMapping).count() == 0:
+        default_mappings = [
+            CrmBusinessTypeMapping(business_type_code="record_hnH91__c", business_type_name="深圳积木易搭订单", entity_code="SZ"),
+            CrmBusinessTypeMapping(business_type_code="default__c", business_type_name="家e搭软件订单", entity_code="SZ"),
+            CrmBusinessTypeMapping(business_type_code="record_s417r__c", business_type_name="香港积木易搭订单", entity_code="HK"),
+            CrmBusinessTypeMapping(business_type_code="record_ltF03__c", business_type_name="美国积木易搭订单", entity_code="US"),
+            CrmBusinessTypeMapping(business_type_code="record_a60d1__c", business_type_name="武汉睿数订单", entity_code="WH_RX"),
+            CrmBusinessTypeMapping(business_type_code="record_3fYB1__c", business_type_name="武汉尺子订单", entity_code="WH"),
+            CrmBusinessTypeMapping(business_type_code="record_UqY5M__c", business_type_name="积木三维订单", entity_code="SZ_3D"),
+            CrmBusinessTypeMapping(business_type_code="record_ib3Iw__c", business_type_name="广州积木易搭订单", entity_code="GZ"),
+        ]
+        session.add_all(default_mappings)
+
+    # Seed default EntityMapping (主体-仓库映射)
+    from backend.app.models import EntityMapping
+    if session.query(EntityMapping).count() == 0:
+        session.add_all([
+            EntityMapping(entity_code="SZ", entity_name="深圳积木易搭科技技术有限公司", erp_org_id="100",
+                          warehouses_json='[{"warehouse_code":"WH01","warehouse_name":"武汉仓"},{"warehouse_code":"WH02","warehouse_name":"美西仓库"}]',
+                          finance_notify_json='[]'),
+            EntityMapping(entity_code="HK", entity_name="积木易搭（香港）有限公司", erp_org_id="200",
+                          warehouses_json='[{"warehouse_code":"EU01","warehouse_name":"欧洲仓"}]',
+                          finance_notify_json='[]'),
+            EntityMapping(entity_code="LU", entity_name="积木易搭（卢森堡）有限公司", erp_org_id="300",
+                          warehouses_json='[]',
+                          finance_notify_json='[]'),
+            EntityMapping(entity_code="US", entity_name="积木易搭（美国）有限公司", erp_org_id="400",
+                          warehouses_json='[{"warehouse_code":"US01","warehouse_name":"美国仓"}]',
+                          finance_notify_json='[]'),
+            EntityMapping(entity_code="WH", entity_name="武汉尺子科技有限公司", erp_org_id="500",
+                          warehouses_json='[{"warehouse_code":"DE01","warehouse_name":"德国仓库"}]',
+                          finance_notify_json='[]'),
+            EntityMapping(entity_code="GZ", entity_name="广州积木易搭数字科技有限公司", erp_org_id="600",
+                          warehouses_json='[]',
+                          finance_notify_json='[]'),
+        ])

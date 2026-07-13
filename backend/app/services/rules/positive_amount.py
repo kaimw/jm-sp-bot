@@ -8,7 +8,8 @@ class PositiveAmountRule:
         return "POSITIVE_ORDER_AMOUNT"
 
     def supports(self, context: OrderContext) -> bool:
-        return True
+        # 备货订单跳过金额检查
+        return context.order.order_type != "STOCK_REPLENISHMENT"
 
     def validate(self, context: OrderContext) -> ValidationResult:
         if context.order.order_amount is None:
