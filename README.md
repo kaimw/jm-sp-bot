@@ -77,9 +77,41 @@ cp .env.example .env
 docker compose up --build
 ```
 
----
-
 ## 生产环境部署
+
+### 🚀 运维部署关键步骤（TL;DR 一键部署指南）
+
+请运维同事参考以下流程快速拉起生产服务：
+
+1. **拉取最新代码**：
+   ```bash
+   git clone https://github.com/kaimw/jm-sp-bot.git
+   cd jm-sp-bot
+   git checkout main
+   ```
+
+2. **配置生产环境变量**：
+   ```bash
+   cp .env.production.example .env.production
+   # 编辑 .env.production，必须修改以下核心变量：
+   # - CONFIG_ENCRYPTION_KEY (必须通过 openssl rand -base64 32 生成，用于中台数据库密钥字段加密)
+   # - ADMIN_PASSWORD (管理台管理员登录密码)
+   # - MODEL_API_KEY (AI 异常诊断大语言模型 API Key)
+   # - BOT_EMAIL_PASSWORD (收发邮件机器人的腾讯企业邮箱授权码)
+   ```
+
+3. **使用 Docker Compose 启动容器**：
+   ```bash
+   docker compose -f docker-compose.prod.yml --env-file .env.production up --build -d
+   ```
+
+4. **服务连通性检查**：
+   ```bash
+   curl http://127.0.0.1:8000/health
+   # 正常运行时应返回: {"status":"ok"}
+   ```
+
+---
 
 ### 部署前必读
 
