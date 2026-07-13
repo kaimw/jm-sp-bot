@@ -565,11 +565,15 @@
               <option value="">全部仓库</option>
             </select>
             <input id="inv-search" type="search" placeholder="搜索仓库/物料编码/品名（回车搜索）..." />
+            <label style="display:flex;align-items:center;gap:4px;font-size:13px;white-space:nowrap;cursor:pointer;">
+              <input id="inv-finished-toggle" type="checkbox" checked /> 只看成品
+            </label>
             <label class="inventory-shortage-toggle">
-              <input id="inv-out-of-stock" type="checkbox" />
-              <span>只看缺货</span>
+              <input id="inv-in-stock" type="checkbox" />
+              <span>只看有货</span>
             </label>
             <button id="inv-refresh" class="button ghost">刷新</button>
+            <button id="inv-sync-erp" class="button" style="white-space:nowrap;">同步国内库存</button>
           </div>
           <div id="inv-table-wrap" style="overflow-x:auto;"></div>
           <div id="inv-pagination" class="pagination"></div>
@@ -1886,6 +1890,6 @@
     </div>
 
     <div id="toast" role="status"></div>
-    <script src="/static/app.js?v=20260701-status-labels"></script>
+    <script src="/static/app.js?v=20260713-inv-wh"></script>
   </body>
 </html>
